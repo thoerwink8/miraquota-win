@@ -1,18 +1,43 @@
 <h1 align="center">MiraQuota for Windows</h1>
 
 <p align="center">
-把 <b>Mirasim 桌面客户端</b>的 5 小时 / 7 天额度窗口，折算成美元口径显示在客户端界面上。<br>
-经 CDP 注入渲染进程，<b>不修改 Mirasim 的任何文件</b>，客户端升级后依然有效。
+<b>Mirasim 的额度监控</b>：5 小时 / 7 天额度窗口折算成美元口径。<br>
+主形态是<b>独立桌面应用</b>（托盘常驻）——Mirasim 关闭时也能按窗口锚点推算剩余。
 </p>
 
 <p align="center">
 <img src="https://img.shields.io/badge/Windows-10%2F11-0078d4" alt="Windows 10/11">
-<img src="https://img.shields.io/badge/Node-22%2B-5fa04e" alt="Node 22+">
-<img src="https://img.shields.io/badge/host%20files-untouched-2ea043" alt="host files untouched">
+<img src="https://img.shields.io/badge/Electron-app-47848f" alt="Electron">
+<img src="https://img.shields.io/badge/pnpm-dist-f69220" alt="pnpm">
 <img src="https://img.shields.io/badge/token-auto%20discovery-8957e5" alt="token auto discovery">
 </p>
 
-<p align="center"><img src="docs/preview-dark-speed.png" width="760" alt="额度控件（暗色，展开）"></p>
+<p align="center">
+<img src="docs/app-packed.png" width="330" alt="桌面应用（在线·精确）">
+<img src="docs/app-offline.png" width="330" alt="桌面应用（离线·锚点推算）">
+</p>
+<p align="center"><sub>左：Mirasim 在线，/v1/limits 精确点数。右：Mirasim 关闭，按锚点推算（数字带 ≈，橙色「推算」徽章）。</sub></p>
+
+## 桌面应用（主形态）
+
+```powershell
+pnpm install        # 依赖只有 electron / electron-builder（.npmrc 已配 npmmirror）
+pnpm dev            # 开发运行（终端若带 ELECTRON_RUN_AS_NODE 需先清掉）
+pnpm dist           # 打包：dist/MiraQuota Setup 0.2.0.exe（安装版）+ MiraQuota 0.2.0.exe（免安装）
+```
+
+- **托盘常驻**：关窗即收到托盘，悬停看摘要，右键可设开机自启；
+- **独立于 Mirasim**：Mirasim 在线时走 `/v1/limits` 精确点数（会话令牌 PEB 自动发现）；
+  关闭时按落盘的窗口锚点滚动推算，剩余额度仍可读（标 ≈，他人占用不可见故为下界）；
+- **美元口径**：本机账本（Claude Code transcript + Mirasim 网关）折算，满额自标定，
+  跨窗口自洽核验，详见 [docs/QUOTA-ESTIMATION.md](docs/QUOTA-ESTIMATION.md)。
+
+## 注入控件（副形态，可选）
+
+同一套数据引擎也可作 CLI provider 跑，把上游的控件经 CDP 注入 Mirasim 界面
+（需 Mirasim 带 `--remote-debugging-port` 启动）：
+
+<p align="center"><img src="docs/preview-dark-speed.png" width="700" alt="注入控件形态"></p>
 
 这是 macOS 版 [MiraQuota](https://github.com/Heartcoolman/MiraQuota) 的 **Windows 实现**。
 界面控件与它的数据契约本就与平台无关，故控件（`widget/miraquota-widget.js`）**原样复用**；

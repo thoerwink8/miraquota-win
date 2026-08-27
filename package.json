@@ -1,13 +1,67 @@
 {
   "name": "miraquota-win",
-  "version": "0.1.0",
-  "description": "Windows 版 Mirasim 额度控件：CDP 注入客户端界面，账本折算美元口径，会话令牌 PEB 自动发现",
+  "version": "0.2.0",
+  "description": "Mirasim 额度监控（Windows）：独立桌面应用（托盘常驻），Mirasim 关闭时按锚点推算剩余；另含注入 Mirasim 界面的控件形态",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=22" },
+  "main": "app/main.mjs",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "start": "node provider/miraquota-provider.mjs",
-    "once": "node provider/miraquota-provider.mjs --once"
+    "dev": "electron .",
+    "dev:offline": "electron . --offline",
+    "icons": "node scripts/gen-icon.mjs",
+    "once": "node provider/miraquota-provider.mjs --once",
+    "provider": "node provider/miraquota-provider.mjs",
+    "dist": "electron-builder --win",
+    "postinstall": "node scripts/gen-icon.mjs"
+  },
+  "devDependencies": {
+    "electron": "^38.1.0",
+    "electron-builder": "25.1.8"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "electron-winstaller",
+      "@electron/rebuild"
+    ]
+  },
+  "build": {
+    "appId": "local.miraquota.win",
+    "productName": "MiraQuota",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "app/**",
+      "provider/**",
+      "widget/**",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    }
   },
   "license": "MIT"
 }
