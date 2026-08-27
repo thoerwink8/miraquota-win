@@ -394,7 +394,11 @@ export class SpeedStats {
       if (row) rows.push(row);
     }
     rows.sort((a, b) => b.latestAt - a.latestAt);
-    const top = rows.slice(0, 3).map(pruneRow);
+    // 卡片按最近使用排序展示；软上限只防极端情况（同时活跃很多模型），
+    // 不是「只看最近 3 个」——旧版硬编 3 会把仍在 fresh 窗口内的模型悄悄顶掉
+    // （用户 2026-08-28 发现 Sonnet 5 用了却不显示）。
+    const ROW_CAP = 8;
+    const top = rows.slice(0, ROW_CAP).map(pruneRow);
 
     const sampleTotal = pool.filter((s) => s.at >= fresh).length;
     const inflightSince = [...this.flights.values()].sort((a, b) => a - b);
@@ -405,6 +409,7 @@ export class SpeedStats {
       sampleTotal,
       inflightSince,
       measuredTurnTTFB: null,
+      ...(rows.length > ROW_CAP ? { truncatedCount: rows.length - ROW_CAP } : {}),
     };
   }
 }

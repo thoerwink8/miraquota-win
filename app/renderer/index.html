@@ -196,9 +196,14 @@
       <div class="card"><div class="hint" id="specPrice"></div></div>
       <div class="card"><div class="hint" id="specState"></div></div>
       <div class="card"><div class="hint">
-        <b>美元口径</b>：按官方 API 价折算的等价估值，不是订阅账单；点数/百分比才是账号权威口径。<br>
-        <b>已用美元</b> = 标定满额 × 点数百分比；<b>满额</b>由回归标定：逐对「Δ本机账本$ ÷ Δ已用点数」取按点数加权的中位数反推。<br>
-        <b>多机说明</b>：本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本。标定对此有两道防线——检测到他机活跃段整段剔除，聚合取中位数。
+        界面上的数字分两类，标记区分：<br>
+        <b>精确（无标记）</b>——① 点数/百分比：来自 Mirasim <code>/v1/limits</code>，账号级权威；② 美元主行：本机账本 token × 官方 API 价直接求和，可与 Mirasim「设置 → 流量监控 → 估算成本」列逐笔核对（同一份账本、同一张价目表）。<br>
+        <b>推算（带 ≈）</b>——满额$ / 余$ / 账号级已用$。额度上限以「点」计价，云端不提供点→美元的官方汇率（<code>/v1/limits</code> 是唯一接口，无成本端点），只能反推。满额给出<b>两个口径对照</b>：<br>
+        　·「<b>标定</b>」逐对「Δ本机账本$ ÷ Δ已用点数」取按点数加权的中位数，抗单点失真与他机污染；<br>
+        　·「<b>官方口径</b>」直接用官方百分比反推：本机账本$ ÷ 官方已用点数 × 预算点，公式最简、无平滑。<br>
+        　两者接近＝账本与点数自洽，可放心用；分歧大＝至少一侧失真（多机同时用、或账本尚未回填）。带 ⁻ 号表示该窗口是模型档位窗，分桶自档位声明起才累积，此口径系统性偏低。<br>
+        <b>美元性质</b>：按官方 API 价折算的等价估值，不是订阅账单——订阅按窗口额度计费，不按 token 扣款。<br>
+        <b>多机</b>：本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本。标定对此有两道防线——检测到他机活跃段整段剔除，聚合取中位数。
       </div></div>
     </div>
   </div>
@@ -271,27 +276,38 @@
       ? (w.resetAt != null && w.etaSeconds > w.resetAt - Date.now() / 1000 ? '到重置不满' : `≈${(w.etaSeconds / 86400 >= 1 ? (w.etaSeconds / 86400).toFixed(1) + ' 天' : (w.etaSeconds / 3600).toFixed(1) + ' 小时')}后打满`)
       : '';
 
-    let mainText, fullText, remainText, subBits;
+    let mainText, fullText, remainText, subBits, mainTitle;
     if (MODE === 'pts' && w.points) {
-      // 点数口径：主行原始额度点（账号权威），账本美元退到副行。
+      // 点数口径：主行原始额度点（/v1/limits 权威），美元退到副行。
       mainText = Math.round(w.points.used).toLocaleString();
       fullText = ` / ${fmtK(w.points.budget)} 点`;
       remainText = `余 ${Math.round(w.points.budget - w.points.used).toLocaleString()} 点`;
-      subBits = [money(w.spentUSD ?? 0)];
-      if (w.scaledSpentUSD != null) subBits.push(`折算 ${mark}${money(w.scaledSpentUSD)}`);
+      mainTitle = '原始额度点，来自 Mirasim /v1/limits，账号级权威口径';
+      subBits = [`本机花费 ${money(w.spentUSD ?? 0)}`];
+      if (w.scaledSpentUSD != null) subBits.push(`账号折算 ≈${money(w.scaledSpentUSD)}`);
     } else {
-      const main = w.scaledSpentUSD ?? (w.fullUSD != null ? w.spentUSD : null);
-      mainText = main != null ? money(main) : (w.points ? `${Math.round(w.points.used)} 点` : '—');
-      fullText = w.fullUSD != null ? ` / ${mark}${money(w.fullUSD, 0)}` : ' / 标定中';
-      remainText = w.remainingUSD != null ? `余 ${mark}${money(w.remainingUSD, 0)}` : '';
-      subBits = [money(w.spentUSD ?? 0)];
-      if (w.points) subBits.push(`${Math.round(w.points.used)}/${fmtK(w.points.budget)} 点`);
+      // 美元口径：主行放**精确值**——本机账本 token × 官方价直接求和，
+      // 与 Mirasim「流量监控 → 估算成本」列同源可逐笔核对，零推断。
+      // 「满额/余」由汇率反推，属推断值，一律带 ≈ 并降到副行（用户 2026-08-28 指出主次颠倒）。
+      mainText = money(w.spentUSD ?? 0);
+      fullText = w.points ? ` / ${w.usedPercent.toFixed(1)}% 已用` : '';
+      mainTitle = '本机实际花费：账本 token × 官方 API 价直接求和，可与 Mirasim「流量监控」的估算成本列逐笔核对';
+      const infer = [];
+      if (w.remainingUSD != null) infer.push(`余 ≈${money(w.remainingUSD, 0)}`);
+      if (w.scaledSpentUSD != null) infer.push(`账号级已用 ≈${money(w.scaledSpentUSD)}`);
+      remainText = infer.length ? `推算 ${infer.join(' · ')}` : '标定中';
+      // 两个口径并排：标定法（逐对增量加权中位数）与官方口径法（账本$ ÷ 官方已用点数）。
+      // 接近＝账本与点数自洽；分歧大＝至少一侧失真（用户 2026-08-28 要求两口径同屏对照）。
+      const cals = [];
+      if (w.fullUSD != null) cals.push(`标定 ≈${money(w.fullUSD, 0)}`);
+      if (w.fullUSDOfficial != null) cals.push(`官方口径 ≈${money(w.fullUSDOfficial, 0)}${w.officialBiasedLow ? '⁻' : ''}`);
+      subBits = cals.length ? [`满额 ${cals.join(' / ')}`] : [];
     }
 
     return `<div class="card">
       <div class="head">
         <span class="label">${name}</span>
-        <span class="money" title="已用美元 = 满额 × 点数百分比（${w.usedPercent.toFixed(1)}%）；满额由回归标定：逐对「Δ本机账本$ ÷ Δ已用点数」取加权中位数反推（${w.sampleCount ?? 0} 组观测，${CONF[w.confidence] ?? ''}）">${mark}${mainText}<span class="full">${fullText}</span></span>
+        <span class="money" title="${mainTitle}">${mainText}<span class="full">${fullText}</span></span>
         <span class="pct">${mark}${w.usedPercent.toFixed(1)}%</span>
       </div>
       <div class="bar">
@@ -303,7 +319,7 @@
         <span class="r">${fmtReset(w.resetAt)}</span>
       </div>
       <div class="row">
-        <span>账本 ${subBits.join(' · ')}</span>
+        <span>${subBits.join(' · ')}</span>
         <span class="r">${w.paceDelta != null ? '均速 ' + (w.paceDelta >= 0 ? '+' : '') + w.paceDelta.toFixed(1) + '%' : ''} ${CONF[w.confidence] ?? ''}</span>
       </div>
     </div>`;
@@ -324,6 +340,12 @@
 
   const fmtDur = (sec) => sec >= 86400 ? `${(sec / 86400).toFixed(1)} 天` : `${(sec / 3600).toFixed(1)} 小时`;
 
+  // 「每天用 N 小时」这个框架只对跨天的窗口（7d/7d_fable）有意义；5h 窗自己的重置
+  // 周期（5 小时）比一天短得多，套用「每天」推演几乎总是显示「到期耗不尽」，不携带
+  // 有效信息，用户 2026-08-28 指出，这里按窗口自身时长做门槛，不是拍脑袋定的阈值。
+  const DAILY_FRAME_MIN_DUR = 86400;
+  const THIN_SAMPLE_HOURS = 2;
+
   function simWindow(w, unitPrice) {
     const e = w.exhaust;
     if (!e || !w.points) return '';
@@ -335,12 +357,17 @@
       const a = cap(e.avgSeconds);
       lines.push(`<div class="sim-line"><span class="k">照最近节奏（均速外推）</span><span class="v ${a.cls}">${a.text}</span></div>`);
     }
-    if (e.rate?.pointsPerActiveHour > 0) {
+    const dailyFrameFits = w.durationSeconds == null || w.durationSeconds >= DAILY_FRAME_MIN_DUR;
+    if (e.rate?.pointsPerActiveHour > 0 && dailyFrameFits) {
       const sec = (w.points.budget - w.points.used) / (e.rate.pointsPerActiveHour * hoursPerDay()) * 86400;
       const c = cap(sec);
       lines.push(`<div class="sim-line"><span class="k">每天用 ${hoursPerDay()} 小时</span><span class="v ${c.cls}">${c.text}</span></div>`);
       const usd = unitPrice != null ? ` ≈ ${money(e.rate.pointsPerActiveHour * unitPrice, 1)}/活跃小时` : '';
-      lines.push(`<div class="sim-line"><span class="k">强度${e.rate.basis === 'window' ? '（近 3 天样本不足，退用本窗口期）' : ''}</span><span class="k">${Math.round(e.rate.pointsPerActiveHour)} 点/活跃小时${usd}</span></div>`);
+      const thin = e.rate.activeHours3d < THIN_SAMPLE_HOURS ? '（样本较薄，仅供参考）' : '';
+      const basis = e.rate.basis === 'window' ? '（近 3 天样本不足，退用本窗口期）' : thin;
+      lines.push(`<div class="sim-line"><span class="k">强度${basis}</span><span class="k">${Math.round(e.rate.pointsPerActiveHour)} 点/活跃小时${usd}</span></div>`);
+    } else if (e.rate?.pointsPerActiveHour > 0 && !dailyFrameFits) {
+      lines.push(`<div class="hint" style="margin:2px 0 0">窗口周期不到一天，「每天用 N 小时」预演不适用于此窗；仅参考上面的均速外推。</div>`);
     }
     if (!lines.length) return '';
     return `<div class="sim-win">

@@ -291,12 +291,18 @@ export class Engine {
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
       const { fullUSD, confidence, sampleCount, dropped } = this.#fullOf(w.label, w.budget, group, rate);
       calibDropped += dropped;
+      // 第二个口径：直接用官方百分比反推满额（本机账本$ ÷ 官方已用点数 × 预算点）。
+      // 与上面的回归标定互为交叉验证——两者接近说明账本与点数自洽。
+      // modelScoped 窗口的分桶自档位声明起才累积，此口径会系统性偏低，故标注出来。
+      const fullUSDOfficial = spent > 0 && w.used > 0 ? spent / w.used * w.budget : null;
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
       const eta = this.#eta(w, now);
       const exhaust = this.#exhaust(w, start, now, group);
       return {
         label: w.label, usedPercent, inferred: false, confidence, sampleCount,
         spentUSD: spent,
+        ...(dur != null ? { durationSeconds: dur } : {}),
+        ...(fullUSDOfficial != null ? { fullUSDOfficial, officialBiasedLow: !!group } : {}),
         ...(exhaust ? { exhaust } : {}),
         ...(fullUSD != null ? {
           fullUSD,
