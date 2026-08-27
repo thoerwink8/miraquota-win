@@ -1,0 +1,324 @@
+/**
+ * 成本账本：增量扫描 Claude Code 的 transcript 与 Mirasim 的网关账本，
+ * 把每次调用的 token 折算成 API 等价美元，按分钟聚合。移植自 Swift 版 CostLedger.swift。
+ *
+ * 两个来源都不完备，故取并集，用 Anthropic 的 request id 跨源去重
+ * （transcript 的 `requestId` 即网关账本的 `providerCallId`）：
+ *  - transcript：token 完整、可回溯全部历史，但只记录写回会话的助手消息；
+ *  - 网关账本：记下每一次经中继的请求，但 token 由 relay 事后回填、只重扫尾部窗口。
+ *
+ * 与 Swift 版的差异（为道日损，还原口径而不照抄性能工程）：
+ *  - transcript 用「文件大小 + 字节偏移」增量读（追加型，游标有效）；
+ *  - 网关账本每轮重扫尾部窗口（回填原地改写，游标会漏），按 id 记账、回填到达补差额；
+ *  - 分钟桶查询用惰性前缀和，标定的成百上千次 spent 调用不退化成平方级。
+ */
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+const HOME = homedir();
+const CLAUDE_PROJECTS = join(HOME, '.claude', 'projects');
+const INSIGHTS = join(HOME, '.mirasim', 'insights');
+const STATE_DIR = join(HOME, '.miraquota');
+const STATE_FILE = join(STATE_DIR, 'ledger.json');
+
+const RETENTION = 8 * 86400;          // 覆盖 7d 窗口并留余量
+const GATEWAY_RESCAN = 1 << 20;       // 网关账本尾部重扫窗口
+
+const num = (v) => {
+  const n = typeof v === 'string' ? Number(v) : v;
+  return typeof n === 'number' && Number.isFinite(n) ? n : 0;
+};
+
+/** 递归收集 .jsonl，标出 nested（子代理会话在 <项目> 更深一层）。 */
+function walkTranscripts(dir, depth, out) {
+  let items;
+  try { items = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const it of items) {
+    const p = join(dir, it.name);
+    if (it.isDirectory()) walkTranscripts(p, depth + 1, out);
+    else if (it.name.endsWith('.jsonl')) out.push({ path: p, nested: depth > 1 });
+  }
+}
+
+export class CostLedger {
+  constructor(pricing) {
+    this.pricing = pricing;
+    this.cursors = {};        // transcript 文件 → { size, offset }
+    this.buckets = {};        // unix 分钟 → 美元
+    this.scoped = {};         // "组|分钟" → 美元
+    this.seen = {};           // 账目键 → 入桶分钟
+    this.booked = {};         // 账目键 → 已计金额（见更大值补差额）
+    this.scopedSince = {};    // 组 → 起始分钟
+    this.scopedGroups = [];
+    this.gatewayScanned = {}; // 网关文件 → 上次 mtimeMs
+    this.fullGatewayScanDone = false;
+    this.transcriptRecords = 0;
+    this.ledgerRecords = 0;
+    this.unpricedRecords = 0;
+    this.countedLedger = new Set();
+    this.#index = null;
+    this.#scopedIndex = {};
+    this.#load();
+  }
+
+  #index; #scopedIndex;
+
+  #load() {
+    try {
+      const p = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+      this.cursors = p.cursors ?? {};
+      this.buckets = p.buckets ?? {};
+      this.scoped = p.scoped ?? {};
+      this.seen = p.seen ?? {};
+      this.booked = p.booked ?? {};
+      this.scopedSince = p.scopedSince ?? {};
+    } catch { /* 首次运行 */ }
+  }
+
+  #save() {
+    try {
+      mkdirSync(STATE_DIR, { recursive: true });
+      writeFileSync(STATE_FILE, JSON.stringify({
+        cursors: this.cursors, buckets: this.buckets, scoped: this.scoped,
+        seen: this.seen, booked: this.booked, scopedSince: this.scopedSince,
+      }));
+    } catch { /* 落盘失败不阻断 */ }
+  }
+
+  /** 声明需要单独分桶的模型档位组（`7d_fable` → `fable`）。 */
+  adoptScopedGroups(groups) {
+    const norm = [...new Set(groups.map((g) => g.toLowerCase()).filter(Boolean))].sort();
+    if (norm.join(',') === this.scopedGroups.join(',')) return;
+    this.scopedGroups = norm;
+    const nowMin = Math.floor(Date.now() / 60000);
+    let dirty = false;
+    for (const g of norm) if (this.scopedSince[g] == null) { this.scopedSince[g] = nowMin; dirty = true; }
+    if (dirty) this.#save();
+  }
+
+  /** 该组分桶是否已覆盖到给定时刻。未覆盖时其支出偏低，展示需据此让位。 */
+  scopedComplete(group, fromSec) {
+    const since = this.scopedSince[group.toLowerCase()];
+    return since != null && since <= Math.floor(fromSec / 60);
+  }
+
+  #add(minute, usd, model = '') {
+    const key = String(minute);
+    this.buckets[key] = (this.buckets[key] ?? 0) + usd;
+    this.#index = null;
+    if (!this.scopedGroups.length || !model) return;
+    const lower = model.toLowerCase();
+    for (const g of this.scopedGroups) if (lower.includes(g)) {
+      const k = g + '|' + key;
+      this.scoped[k] = (this.scoped[k] ?? 0) + usd;
+      this.#scopedIndex[g] = null;
+    }
+  }
+
+  refresh(now = Date.now()) {
+    const cutoff = Math.floor((now - RETENTION * 1000) / 1000);
+    let changed = false;
+    changed = this.#scanTranscripts(cutoff) || changed;
+    changed = this.#scanGateway(cutoff) || changed;
+    this.#prune(cutoff);
+    if (changed) this.#save();
+    return changed;
+  }
+
+  #scanTranscripts(cutoff) {
+    const files = [];
+    walkTranscripts(CLAUDE_PROJECTS, 0, files);
+    let changed = false;
+    for (const { path } of files) {
+      let st;
+      try { st = statSync(path); } catch { continue; }
+      if (st.mtimeMs / 1000 < cutoff) continue;      // 整个文件早于保留窗口
+      const size = st.size;
+      let cur = this.cursors[path] ?? { size: 0, offset: 0 };
+      if (size < cur.size) cur = { size: 0, offset: 0 };  // 被截断，游标归零
+      if (size <= cur.offset) { this.cursors[path] = { size, offset: cur.offset }; continue; }
+      const text = readRange(path, cur.offset, size);
+      if (!text) continue;
+      let consumed = 0, nl;
+      let start = 0;
+      while ((nl = text.indexOf('\n', start)) >= 0) {
+        const line = text.slice(start, nl);
+        if (line.includes('"usage"')) this.#parseTranscript(line, cutoff);
+        start = nl + 1; consumed = start;
+      }
+      this.cursors[path] = { size, offset: cur.offset + Buffer.byteLength(text.slice(0, consumed), 'utf8') };
+      if (consumed > 0) changed = true;
+    }
+    return changed;
+  }
+
+  #parseTranscript(line, cutoff) {
+    let root;
+    try { root = JSON.parse(line); } catch { return; }
+    const ts = root.timestamp;
+    const epoch = ts ? Math.floor(Date.parse(ts) / 1000) : NaN;
+    const usage = root.message?.usage;
+    if (!Number.isFinite(epoch) || epoch < cutoff || !usage) return;
+    const minute = Math.floor(epoch / 60);
+    const rid = root.requestId ?? root.message?.id;
+    // 已计过且知道金额：一次响应写成多行（思考/工具调用/正文各一行），取最大值补差额。
+    if (rid && this.booked[rid] == null && this.seen[rid] != null) return;
+
+    const model = root.message?.model ?? '';
+    const usd = this.pricing.cost(model, num(usage.input_tokens), num(usage.output_tokens),
+      num(usage.cache_read_input_tokens), num(usage.cache_creation_input_tokens));
+    if (usd == null) { this.unpricedRecords++; return; }
+    if (!rid) { this.#add(minute, usd, model); this.transcriptRecords++; return; }
+    const prior = this.booked[rid];
+    if (prior != null) {
+      if (usd <= prior) return;
+      this.#add(this.seen[rid] ?? minute, usd - prior, model);
+      this.booked[rid] = usd;
+      return;
+    }
+    this.seen[rid] = minute;
+    this.booked[rid] = usd;
+    this.#add(minute, usd, model);
+    this.transcriptRecords++;
+  }
+
+  #scanGateway(cutoff) {
+    let files;
+    try { files = readdirSync(INSIGHTS); } catch { return false; }
+    // 每次启动先整读一遍补齐停机期记录，之后按尾部窗口重扫。重复入账由账目键拦下。
+    const window = this.fullGatewayScanDone ? GATEWAY_RESCAN : Infinity;
+    this.fullGatewayScanDone = true;
+    let changed = false;
+    for (const name of files) {
+      if (!name.startsWith('usage-') || !name.endsWith('.ndjson')) continue;
+      const path = join(INSIGHTS, name);
+      let st;
+      try { st = statSync(path); } catch { continue; }
+      if (this.gatewayScanned[path] === st.mtimeMs) continue;  // 未变（回填不改长度，判 mtime）
+      this.gatewayScanned[path] = st.mtimeMs;
+      const offset = window >= st.size ? 0 : st.size - window;
+      const text = readRange(path, offset, st.size);
+      if (!text) continue;
+      const lines = text.split('\n');
+      const from = offset > 0 ? 1 : 0;   // 起点可能落在半行，跳过第一行
+      for (let i = from; i < lines.length; i++) {
+        if (lines[i].includes('"anthropic"') && this.#parseGateway(lines[i], cutoff)) changed = true;
+      }
+    }
+    return changed;
+  }
+
+  #parseGateway(line, cutoff) {
+    let root;
+    try { root = JSON.parse(line); } catch { return false; }
+    if (root.provider !== 'anthropic') return false;
+    const epoch = root.ts ? Math.floor(Date.parse(root.ts) / 1000) : NaN;
+    if (!Number.isFinite(epoch) || epoch < cutoff) return false;
+    const id = root.id;
+    if (!id) return false;
+
+    const providerCallId = root.providerCallId;
+    const key = this.seen[id] != null ? id : (providerCallId ?? id);
+    const prior = this.booked[key];
+    if (prior == null) {
+      if (this.seen[key] != null) return false;   // 旧版按游标入过账，无从补差
+      const agent = root.agent ?? '';
+      // 缺 providerCallId 的行无法与 transcript 对齐；claude/codex 另有 transcript 覆盖，宁漏勿重。
+      if (providerCallId == null && (agent === 'claude' || agent === 'codex')) return false;
+    }
+    const model = root.model ?? '';
+    const usd = model ? this.pricing.cost(model, num(root.input), num(root.output),
+      num(root.cacheRead), num(root.cacheWrite)) : null;
+    // cost 对零 token 的已知模型返回 0——token 未回填的行此刻不入账，等回填后重读。
+    if (usd == null || usd <= 0) { this.unpricedRecords++; return false; }
+    if (prior != null) {
+      if (usd <= prior) return false;
+      this.#add(this.seen[key] ?? Math.floor(epoch / 60), usd - prior, model);
+      this.booked[key] = usd;
+    } else {
+      const minute = Math.floor(epoch / 60);
+      this.seen[key] = minute;
+      this.booked[key] = usd;
+      this.#add(minute, usd, model);
+      if (!this.countedLedger.has(id)) { this.countedLedger.add(id); this.ledgerRecords++; }
+    }
+    return true;
+  }
+
+  #prune(cutoff) {
+    const minCut = Math.floor(cutoff / 60);
+    const before = Object.keys(this.buckets).length;
+    for (const k of Object.keys(this.buckets)) if (Number(k) < minCut) delete this.buckets[k];
+    for (const k of Object.keys(this.scoped)) {
+      const m = Number(k.split('|').pop());
+      if (m < minCut) delete this.scoped[k];
+    }
+    for (const k of Object.keys(this.seen)) if (this.seen[k] < minCut) { delete this.seen[k]; delete this.booked[k]; }
+    for (const k of Object.keys(this.cursors)) {
+      try { statSync(k); } catch { delete this.cursors[k]; }
+    }
+    if (Object.keys(this.buckets).length !== before) this.#index = null;
+    if (Object.keys(this.scoped).length) this.#scopedIndex = {};
+  }
+
+  // MARK: 查询
+
+  /** 半开区间 [fromSec, toSec) 内的等价支出（秒为单位的时间戳）。 */
+  spent(fromSec, toSec, { includeOpenMinute = false, group = null } = {}) {
+    let table;
+    if (group) {
+      const g = group.toLowerCase();
+      if (!this.#scopedIndex[g]) this.#buildScopedIndex(g);
+      table = this.#scopedIndex[g];
+    } else {
+      if (!this.#index) this.#buildIndex();
+      table = this.#index;
+    }
+    if (!table || !table.minutes.length) return 0;
+    const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
+    const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + (includeOpenMinute ? 1 : 0));
+    return table.prefix[hi] - table.prefix[lo];
+  }
+
+  #buildIndex() {
+    this.#index = prefixSums(Object.entries(this.buckets).map(([k, v]) => [Number(k), v]));
+  }
+
+  #buildScopedIndex(g) {
+    const head = g + '|';
+    this.#scopedIndex[g] = prefixSums(Object.entries(this.scoped)
+      .filter(([k]) => k.startsWith(head))
+      .map(([k, v]) => [Number(k.slice(head.length)), v]));
+  }
+
+  get totalRecords() { return this.transcriptRecords + this.ledgerRecords; }
+  get bucketCount() { return Object.keys(this.buckets).length; }
+}
+
+function prefixSums(entries) {
+  const sorted = entries.sort((a, b) => a[0] - b[0]);
+  const prefix = new Array(sorted.length + 1).fill(0);
+  for (let i = 0; i < sorted.length; i++) prefix[i + 1] = prefix[i] + sorted[i][1];
+  return { minutes: sorted.map((e) => e[0]), prefix };
+}
+
+function lowerBound(a, target) {
+  let lo = 0, hi = a.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (a[mid] < target) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+/** 从 byteFrom 读到 byteTo 的 UTF-8 文本。尾部不完整行由调用方按换行处理。 */
+function readRange(path, byteFrom, byteTo) {
+  const len = byteTo - byteFrom;
+  if (len <= 0) return '';
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.allocUnsafe(len);
+    const read = readSync(fd, buf, 0, len, byteFrom);
+    return buf.toString('utf8', 0, read);
+  } catch { return ''; }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ } }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "miraquota-win",
+  "version": "0.1.0",
+  "description": "Windows 版 Mirasim 额度控件：CDP 注入客户端界面，账本折算美元口径，会话令牌 PEB 自动发现",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node provider/miraquota-provider.mjs",
+    "once": "node provider/miraquota-provider.mjs --once"
+  },
+  "license": "MIT"
+}
