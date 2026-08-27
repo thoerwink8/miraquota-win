@@ -22,7 +22,8 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - run: pnpm run dist
+      # CI 环境下 electron-builder 默认尝试发 GitHub Release，产物走 Artifacts 分发，禁掉
+      - run: pnpm run dist --publish never
 
       - uses: actions/upload-artifact@v4
         with:
