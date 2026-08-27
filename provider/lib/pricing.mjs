@@ -1,5 +1,7 @@
 /**
- * 价目表。优先读 Mirasim 的 models.dev 缓存，缺失时回退内置表。
+ * 价目表。内置表为权威（Anthropic 官方 API 价，核对于 2026-08-28），
+ * Mirasim 的 models.dev 缓存只补内置表没有的模型；与内置表冲突时以内置表为准并打日志，
+ * 防止缓存漂移导致价格来源不可审计。
  * 绝对金额受未建模的长上下文溢价影响，但标定与计量共用同一张表，比例一致，
  * 故占比结论不受该偏差影响。移植自 Swift 版 Pricing.swift。
  */
@@ -9,7 +11,9 @@ import { join } from 'node:path';
 
 const MODELS_CACHE = join(homedir(), '.mirasim', 'models-dev-cache.json');
 
-// 美元 / 百万 token：[input, output, cacheRead, cacheWrite]
+// 美元 / 百万 token：[input, output, cacheRead(=10% input), cacheWrite(=125% input)]
+// 官方价来源：Anthropic API 价目（2026-08 核对）。注意 $15/$75 是上代 Opus 4/4.1 的旧价，
+// Opus 5/4.8 官方价即 $5/$25，Fable 5 即 $10/$50——勿按旧价"纠正"本表。
 const BUILTIN = {
   'claude-opus-5':     [5, 25, 0.5, 6.25],
   'claude-opus-4-8':   [5, 25, 0.5, 6.25],
@@ -30,13 +34,15 @@ const FAMILY = [
 
 export class Pricing {
   constructor() {
-    const loaded = Pricing.#loadCache();
-    if (loaded && Object.keys(loaded).length >= 5) {
-      this.table = { ...BUILTIN, ...loaded };
-      this.source = 'models.dev cache';
-    } else {
-      this.table = { ...BUILTIN };
-      this.source = 'builtin';
+    const loaded = Pricing.#loadCache() ?? {};
+    // 内置官方价权威；缓存只补充未收录模型。冲突仅记录，不覆盖。
+    this.table = { ...loaded, ...BUILTIN };
+    this.source = Object.keys(loaded).length ? 'builtin(official) + cache补充' : 'builtin(official)';
+    for (const [id, p] of Object.entries(loaded)) {
+      const b = BUILTIN[id];
+      if (b && (b[0] !== p[0] || b[1] !== p[1])) {
+        console.error(`[pricing] 缓存价 ${id} [${p[0]},${p[1]}] 与官方内置 [${b[0]},${b[1]}] 不一致，采用内置`);
+      }
     }
   }
 

@@ -218,6 +218,7 @@
     if (p.unitPriceNotice) bits.push(`<b>单价</b> ${p.unitPriceNotice}`);
     if (p.accountNotice) bits.push(`<b>账号</b> ${p.accountNotice}`);
     bits.push(`<b>账本</b> ${p.buckets ?? 0} 分钟桶 · ${p.pricing ?? '-'}`);
+    bits.push(`<b>美元</b> 按官方 API 价折算的等价估值，非订阅账单；点数/百分比为账号权威口径`);
     bits.push(`<b>采集</b> ${ago(p.capturedAt)}`);
     $('foot').innerHTML = bits.join('　');
   }
