@@ -7,23 +7,15 @@
  *   契约 B  CDP 巡检注入 widget.js
  *   --once  取一次并打印
  */
-import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
 
 import { Engine } from './lib/engine.mjs';
 import { CONFIDENCE_LABEL } from './lib/calibrator.mjs';
+import { startFeed, Injector, FEED_LO, FEED_HI } from './lib/injector.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const STATE_DIR = join(homedir(), '.miraquota');
-const TOKEN_FILE = join(STATE_DIR, 'feed.token');
-
-const FEED_LO = 4988, FEED_HI = 4995;
 const POLL_MS = 15_000;
-const SWEEP_MS = 10_000, SWEEP_IDLE_MS = 30_000, STEADY_ROUNDS = 3;
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes('--' + name);
@@ -57,123 +49,6 @@ const engine = new Engine({
   forceOffline: flag('offline'),
 });
 await engine.loadSpeed();
-
-/* ---------------- 契约 A：feed ---------------- */
-
-function feedToken() {
-  try { const e = readFileSync(TOKEN_FILE, 'utf8').trim(); if (e.length >= 16) return e; } catch { /* 首次 */ }
-  const fresh = randomBytes(16).toString('hex');
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(TOKEN_FILE, fresh);
-  return fresh;
-}
-
-function startFeed(onQuit) {
-  const token = feedToken();
-  const server = createServer((req, res) => {
-    const path = (req.url || '').split('?')[0];
-    const head = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'X-MiraQuota-Token',
-      'Cache-Control': 'no-store',
-    };
-    if (req.method === 'OPTIONS') { res.writeHead(204, head); return res.end(); }
-    if (path === '/quota.json' && req.method === 'GET') {
-      res.writeHead(200, { ...head, 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(engine.payload()));
-    }
-    if (path === '/quit' && req.method === 'POST') {
-      if (req.headers['x-miraquota-token'] !== token) { res.writeHead(403, head); return res.end(); }
-      res.writeHead(200, { ...head, 'Content-Type': 'application/json' });
-      res.end('{"ok":true}');
-      return setTimeout(onQuit, 200);
-    }
-    res.writeHead(404, head); res.end();
-  });
-  return new Promise((resolve, reject) => {
-    const explicit = Number(opt('feed-port', 0));
-    let port = explicit || FEED_LO;
-    server.on('error', (e) => {
-      if (e.code === 'EADDRINUSE' && !explicit && port < FEED_HI) server.listen(++port, '127.0.0.1');
-      else reject(e);
-    });
-    server.on('listening', () => resolve({ server, port }));
-    server.listen(port, '127.0.0.1');
-  });
-}
-
-/* ---------------- 契约 B：注入 ---------------- */
-
-const getJSON = async (url, ms = 2500) => {
-  try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(ms) });
-    return r.ok ? await r.json() : null;
-  } catch { return null; }
-};
-
-const widgetPath = opt('widget', join(HERE, '..', 'widget', 'miraquota-widget.js'));
-const widgetSource = existsSync(widgetPath) ? readFileSync(widgetPath, 'utf8') : null;
-const widgetVersion = widgetSource ? Number((widgetSource.match(/const VERSION = (\d+)/) || [])[1] || 0) : 0;
-
-const registered = new Set();
-let steady = 0, sweepTimer = null;
-
-function cdp(socketUrl, commands, wantId) {
-  return new Promise((resolve) => {
-    let ws;
-    const done = (v) => { try { ws && ws.close(); } catch { /* closed */ } resolve(v); };
-    const timer = setTimeout(() => done(null), 6000);
-    try { ws = new WebSocket(socketUrl); } catch { clearTimeout(timer); return resolve(null); }
-    ws.addEventListener('error', () => { clearTimeout(timer); done(null); });
-    ws.addEventListener('open', () => { for (const c of commands) ws.send(JSON.stringify(c)); });
-    ws.addEventListener('message', (ev) => {
-      let msg; try { msg = JSON.parse(String(ev.data)); } catch { return; }
-      if (msg.id === wantId) { clearTimeout(timer); done(msg); }
-    });
-  });
-}
-
-async function sweep(feedPort) {
-  if (!widgetSource) return;
-  let targets = null, cdpPort = null;
-  for (const p of CDP_PORTS) {
-    const list = await getJSON(`http://127.0.0.1:${p}/json`);
-    if (Array.isArray(list)) { targets = list; cdpPort = p; break; }
-  }
-  if (!targets) { steady = 0; return reschedule(feedPort, SWEEP_MS, `找不到调试端口（试过 ${CDP_PORTS.join('、')}）`); }
-
-  const pages = targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-  const prelude = `window.__MIRAQUOTA_FEED__="http://127.0.0.1:${feedPort}";\n`;
-  const script = prelude + widgetSource;
-  let hits = 0, injected = 0;
-
-  for (const t of pages) {
-    const probe = await cdp(t.webSocketDebuggerUrl, [{
-      id: 1, method: 'Runtime.evaluate',
-      params: { expression: 'window.__miraquotaVersion||0', returnByValue: true },
-    }], 1);
-    const seen = Number(probe?.result?.result?.value || 0);
-    if (seen >= widgetVersion) { hits++; continue; }
-    const commands = [{ id: 1, method: 'Page.enable' }];
-    if (!registered.has(t.id)) {
-      commands.push({ id: 2, method: 'Page.addScriptToEvaluateOnNewDocument', params: { source: script } });
-    }
-    commands.push({ id: 3, method: 'Runtime.evaluate',
-      params: { expression: script, awaitPromise: false, returnByValue: false } });
-    const reply = await cdp(t.webSocketDebuggerUrl, commands, 3);
-    if (reply && !reply.result?.exceptionDetails) { registered.add(t.id); injected++; hits++; }
-  }
-
-  steady = injected === 0 && hits === pages.length && pages.length > 0 ? steady + 1 : 0;
-  const wait = steady >= STEADY_ROUNDS ? SWEEP_IDLE_MS : SWEEP_MS;
-  reschedule(feedPort, wait, `cdp ${cdpPort} · 页面 ${pages.length} · 已带控件 ${hits} · 本轮注入 ${injected}`);
-}
-
-function reschedule(feedPort, wait, note) {
-  log(`注入 ${note}`);
-  sweepTimer = setTimeout(() => sweep(feedPort), wait);
-}
 
 /* ---------------- 打印与主流程 ---------------- */
 
@@ -221,19 +96,28 @@ if (flag('once')) {
   process.exit(engine.last || engine.anchors.usable ? 0 : 1);
 }
 
-const { server, port: feedPort } = await startFeed(() => shutdown(0));
+const { server, port: feedPort } = await startFeed({
+  payload: () => engine.payload(),
+  onQuit: () => shutdown(0),
+  explicitPort: Number(opt('feed-port', 0)),
+});
 log(`feed http://127.0.0.1:${feedPort}/quota.json`);
-if (widgetSource) log(`控件 v${widgetVersion} ${widgetPath}`);
-else log(`控件脚本不存在，注入跳过：${widgetPath}`);
+
+const injector = new Injector({
+  widgetPath: opt('widget', join(HERE, '..', 'widget', 'miraquota-widget.js')),
+  cdpPorts: CDP_PORTS,
+  log,
+});
+if (injector.hasWidget) log(`控件 v${injector.version} ${injector.widgetPath}`);
 
 await engine.poll();
 printSnapshot(engine.payload());
 const pollTimer = setInterval(() => engine.poll().catch(() => {}), POLL_MS);
-if (!flag('no-inject')) sweep(feedPort).catch((e) => log('注入异常 ' + e.message));
+if (!flag('no-inject')) injector.start(feedPort);
 
 function shutdown(code) {
   clearInterval(pollTimer);
-  if (sweepTimer) clearTimeout(sweepTimer);
+  injector.stop();
   server.close();
   process.exit(code);
 }

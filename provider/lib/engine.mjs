@@ -263,13 +263,15 @@ export class Engine {
     const coherence = evaluateCoherence(limits.windows, this.ledger, now);
     const rate = coherence.perPoint;
 
+    let calibDropped = 0;
     const windows = limits.windows.map((w) => {
       const usedPercent = Math.min(100, w.used / w.budget * 100);
       const group = w.modelScoped ? modelGroup(w.label) : null;
       const dur = windowDuration(w.label);
       const start = dur ? w.resetAt - dur : null;
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
-      const { fullUSD, confidence, sampleCount } = this.#fullOf(w.label, w.budget, group, rate);
+      const { fullUSD, confidence, sampleCount, dropped } = this.#fullOf(w.label, w.budget, group, rate);
+      calibDropped += dropped;
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
       const eta = this.#eta(w, now);
       const exhaust = this.#exhaust(w, start, now, group);
@@ -302,6 +304,7 @@ export class Engine {
       if (coherence.spread != null) out.unitPriceSpread = coherence.spread;
     } else { const n = coherenceNotice(coherence); if (n) out.unitPriceNotice = n; }
     if (notice) out.accountNotice = notice;
+    if (calibDropped > 0) out.calibDropped = calibDropped;
     if (stale) out.detail = `接口已 ${Math.round(age / 60)} 分钟未回传，显示最后一次实测值`;
     return out;
   }
@@ -372,12 +375,13 @@ export class Engine {
 
   #fullOf(label, budget, group, rate) {
     const est = this.calibrator.estimate(label, this.ledger, budget, group);
+    const dropped = est?.foreignDropped ?? 0;
     if (est && (est.confidence === 'high' || est.confidence === 'medium')) {
-      return { fullUSD: est.fullUSD, confidence: est.confidence, sampleCount: est.observations };
+      return { fullUSD: est.fullUSD, confidence: est.confidence, sampleCount: est.observations, dropped };
     }
-    if (rate != null) return { fullUSD: rate * budget, confidence: 'low', sampleCount: est?.observations ?? 0 };
-    if (est) return { fullUSD: est.fullUSD, confidence: est.confidence, sampleCount: est.observations };
-    return { fullUSD: null, confidence: 'none', sampleCount: 0 };
+    if (rate != null) return { fullUSD: rate * budget, confidence: 'low', sampleCount: est?.observations ?? 0, dropped };
+    if (est) return { fullUSD: est.fullUSD, confidence: est.confidence, sampleCount: est.observations, dropped };
+    return { fullUSD: null, confidence: 'none', sampleCount: 0, dropped };
   }
 
   #base(level, capturedAt, windows) {

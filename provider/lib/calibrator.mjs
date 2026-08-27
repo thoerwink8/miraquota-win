@@ -7,6 +7,12 @@
  *
  * 支出与增量两侧都会挂起到对面也非零时才成为一次观测：只挂起支出会低估满额，
  * 只挂起增量会高估（有请求在途时增量先涨、美元后落）。
+ *
+ * 抗他机污染（点数是账号级、账本是本机级，另一台机器同时在用会把观测单价拉低）：
+ * 1. 挂起的点数增量超时仍等不到本机支出 ⇒ 判定该时段他机活跃，前后 FOREIGN_PAD
+ *    内的观测一并剔除（对面在跑，相邻分钟大概率也在跑）；
+ * 2. 聚合用「按点数加权的隐含单价中位数」而非 Σ$/Σ点：污染样本单价系统性偏低、
+ *    堆在一侧，中位数最多容忍近半污染。
  */
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -20,6 +26,7 @@ const POINT_RETENTION = 3 * 86400;    // 点数样本保留时长
 const MAX_POINT_SAMPLES = 12000;
 const POINT_MIN_INTERVAL = 30;        // 两条点数样本的最小间隔（秒）
 const CARRY_TIMEOUT = 600;            // 挂起增量等待支出的上限（秒）
+const FOREIGN_PAD = 300;              // 他机活跃段向两侧扩散剔除的半径（秒）
 
 const CONFIDENCE = { none: 0, low: 1, medium: 2, high: 3 };
 const CONFIDENCE_LABEL = { none: '无样本', low: '标定中', medium: '收敛中', high: '高置信' };
@@ -78,54 +85,69 @@ export class Calibrator {
     const useBudget = budget ?? samples[samples.length - 1]?.budget;
     if (samples.length < 2 || !(useBudget > 0)) return null;
 
-    const obs = this.#observe(samples, ledger, group);
+    const { obs, dropped } = this.#observe(samples, ledger, group);
     if (!obs.length) return null;
-    const used = trimOutliers(obs);
-    const totalCost = used.reduce((s, o) => s + o.cost, 0);
-    const totalUnit = used.reduce((s, o) => s + o.unit, 0);
-    if (totalUnit <= 0 || totalCost <= 0) return null;
+    const price = weightedMedianPrice(obs);
+    if (!(price > 0)) return null;
 
+    const totalUnit = obs.reduce((s, o) => s + o.unit, 0);
     const covered = totalUnit / useBudget * 100;
     return {
-      fullUSD: totalCost / totalUnit * useBudget,
-      confidence: confidenceOf(used.length, covered),
-      observations: used.length,
+      fullUSD: price * useBudget,
+      confidence: confidenceOf(obs.length, covered),
+      observations: obs.length,
       coveredPercent: covered,
+      foreignDropped: dropped,
     };
   }
 
-  /** 逐对配对出 (cost, unit) 观测。两侧挂起，窗口滚动或回落即清挂起。 */
+  /**
+   * 逐对配对出 (cost, unit, from, to) 观测。两侧挂起，窗口滚动或回落即清挂起。
+   * 挂起增量超时 ⇒ 记一段他机活跃，与其（含 FOREIGN_PAD 扩散）相交的观测剔除。
+   */
   #observe(samples, ledger, group) {
     const obs = [];
-    let pendingCost = 0, pendingUnit = 0, unitSince = null;
+    const foreign = [];   // 他机活跃时段 [from, to]
+    let pendingCost = 0, pendingUnit = 0, unitSince = null, spanStart = null;
     for (let i = 0; i + 1 < samples.length; i++) {
       const a = samples[i], b = samples[i + 1];
       if (b.resetAt !== a.resetAt || b.used < a.used) {
-        pendingCost = 0; pendingUnit = 0; unitSince = null; continue;
+        pendingCost = 0; pendingUnit = 0; unitSince = null; spanStart = null; continue;
       }
       const cost = ledger.spent(a.at, b.at, { group });
-      if (unitSince != null && b.at - unitSince > CARRY_TIMEOUT) { pendingUnit = 0; unitSince = null; }
+      if (unitSince != null && b.at - unitSince > CARRY_TIMEOUT) {
+        foreign.push([unitSince, b.at]);
+        pendingUnit = 0; unitSince = null;
+      }
+      if (spanStart == null && (cost > 0 || b.used > a.used)) spanStart = a.at;
       pendingCost += cost;
       pendingUnit += b.used - a.used;
       if (pendingCost > 0 && pendingUnit > 0) {
-        obs.push({ cost: pendingCost, unit: pendingUnit });
-        pendingCost = 0; pendingUnit = 0; unitSince = null;
+        obs.push({ cost: pendingCost, unit: pendingUnit, from: spanStart ?? a.at, to: b.at });
+        pendingCost = 0; pendingUnit = 0; unitSince = null; spanStart = null;
       } else if (pendingUnit > 0 && unitSince == null) {
         unitSince = b.at;
       }
     }
-    return obs;
+    const kept = foreign.length
+      ? obs.filter((o) => !foreign.some(([f, t]) => o.to >= f - FOREIGN_PAD && o.from <= t + FOREIGN_PAD))
+      : obs;
+    return { obs: kept, dropped: obs.length - kept.length };
   }
 
   pointSampleCount(label) { return (this.points[label] ?? []).length; }
 }
 
-/** 按逐对隐含单价裁掉两端各 10%，剔除上游重算配额造成的畸低样本。 */
-function trimOutliers(obs) {
-  if (obs.length < 10) return obs;
+/** 按点数加权的隐含单价中位数：污染/畸变样本堆在一侧，中位数最多容忍近半污染。 */
+function weightedMedianPrice(obs) {
   const sorted = [...obs].sort((a, b) => a.cost / a.unit - b.cost / b.unit);
-  const drop = Math.max(1, Math.floor(sorted.length / 10));
-  return sorted.slice(drop, sorted.length - drop);
+  const half = sorted.reduce((s, o) => s + o.unit, 0) / 2;
+  let acc = 0;
+  for (const o of sorted) {
+    acc += o.unit;
+    if (acc >= half) return o.cost / o.unit;
+  }
+  return null;
 }
 
 function confidenceOf(observations, covered) {

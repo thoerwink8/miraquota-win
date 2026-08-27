@@ -6,8 +6,11 @@ import electron from 'electron';
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, shell } = electron;
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 
 import { Engine } from '../provider/lib/engine.mjs';
+import { startFeed, Injector } from '../provider/lib/injector.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HEARTBEAT_MS = 5_000;    // 界面心跳：账本增量 + 倒计时
@@ -26,10 +29,20 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('second-instance', () => { if (win) { win.show(); win.focus(); } });
 
+  const BOUNDS_FILE = join(homedir(), '.miraquota', 'ui.json');
+  function savedBounds() {
+    try { return JSON.parse(readFileSync(BOUNDS_FILE, 'utf8')).bounds ?? null; }
+    catch { return null; }
+  }
+
   function createWindow() {
+    // 首开高度按内容取（三卡+预演+速度+页脚 ≈ 990px），封顶到工作区；此后记住用户调的尺寸。
+    const work = electron.screen.getPrimaryDisplay().workAreaSize;
+    const saved = savedBounds();
     win = new BrowserWindow({
-      width: 440,
-      height: 720,
+      width: saved?.width ?? 440,
+      height: saved?.height ?? Math.min(990, work.height - 60),
+      ...(saved?.x != null ? { x: saved.x, y: saved.y } : {}),
       minWidth: 380,
       minHeight: 520,
       frame: false,
@@ -44,6 +57,18 @@ if (!app.requestSingleInstanceLock()) {
     });
     win.loadFile(join(HERE, 'renderer', 'index.html'));
     win.once('ready-to-show', () => win.show());
+    let saveTimer = null;
+    const persistBounds = () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        try {
+          mkdirSync(join(homedir(), '.miraquota'), { recursive: true });
+          writeFileSync(BOUNDS_FILE, JSON.stringify({ bounds: win.getBounds() }));
+        } catch { /* ignore */ }
+      }, 500);
+    };
+    win.on('resize', persistBounds);
+    win.on('move', persistBounds);
     // 关窗即隐藏到托盘，进程常驻继续记账与标定。
     win.on('close', (e) => {
       if (!app.isQuittingForReal) { e.preventDefault(); win.hide(); }
@@ -101,6 +126,20 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.on('app:quit', () => { app.isQuittingForReal = true; app.quit(); });
     await tick();
     setInterval(() => tick().catch(() => {}), HEARTBEAT_MS);
+
+    // 内嵌形态与桌面形态合一：feed + CDP 注入随桌面版常驻。
+    // Mirasim 带 --remote-debugging-port=9333 启动时，控件自动出现在其标题栏；没带就静默巡检。
+    try {
+      const { server, port } = await startFeed({ payload: () => engine.payload() });
+      const injector = new Injector({
+        widgetPath: join(HERE, '..', 'widget', 'miraquota-widget.js'),
+        log: () => {},
+      });
+      injector.start(port);
+      app.on('will-quit', () => { injector.stop(); server.close(); });
+    } catch (e) {
+      console.error('feed/注入启动失败（面板不受影响）：' + e.message);
+    }
   });
 
   // 所有窗口关闭也不退出——托盘常驻。
