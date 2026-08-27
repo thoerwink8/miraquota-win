@@ -33,6 +33,7 @@
   }
   .titlebar .logo { width: 16px; height: 16px; }
   .titlebar .name { font-weight: 600; font-size: 13px; letter-spacing: .2px; }
+  .titlebar .ver { font-size: 10.5px; color: var(--fg-faint); margin-left: -2px; }
   .badge {
     font-size: 10.5px; padding: 2px 8px; border-radius: 99px; font-weight: 600;
     background: rgba(63,185,110,.14); color: var(--ok);
@@ -109,6 +110,7 @@
   <div class="titlebar">
     <svg class="logo" viewBox="0 0 32 32"><circle cx="16" cy="16" r="11" fill="none" stroke="#464c5a" stroke-width="6"/><path id="logoArc" d="" fill="none" stroke="#4c8dff" stroke-width="6" stroke-linecap="round"/></svg>
     <span class="name">MiraQuota</span>
+    <span class="ver" id="ver"></span>
     <span class="badge" id="state">连接中</span>
     <span class="sp"></span>
     <button class="tbtn" id="btnMin" title="最小化">–</button>
@@ -285,6 +287,7 @@
   let latest = null;
   window.miraquota.onQuota((p) => { latest = p; render(p); });
   window.miraquota.get().then((p) => { latest = p; render(p); });
+  window.miraquota.version?.().then((v) => { if (v) $('ver').textContent = 'v' + v; }).catch(() => {});
   // 倒计时与「N 秒前」每秒走动，数据本身由主进程心跳推送。
   setInterval(() => { if (latest) render(latest); }, 1000);
 </script>

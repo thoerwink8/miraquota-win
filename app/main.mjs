@@ -95,6 +95,7 @@ if (!app.requestSingleInstanceLock()) {
     createWindow();
     createTray();
     ipcMain.handle('quota:get', () => engine.payload());
+    ipcMain.handle('app:version', () => app.getVersion());
     ipcMain.on('win:min', () => win.minimize());
     ipcMain.on('win:hide', () => win.hide());
     ipcMain.on('app:quit', () => { app.isQuittingForReal = true; app.quit(); });
