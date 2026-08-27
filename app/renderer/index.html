@@ -93,6 +93,16 @@
   .foot { font-size: 11px; color: var(--fg-faint); line-height: 1.7; padding: 2px 2px 0; }
   .foot b { color: var(--fg-dim); font-weight: 600; }
   .empty { text-align: center; color: var(--fg-faint); padding: 48px 0 32px; font-size: 12.5px; }
+
+  .exhaust table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  .exhaust td { padding: 3px 0; font-size: 11.5px; color: var(--fg-dim); }
+  .exhaust td.m { font-weight: 600; color: var(--fg); white-space: nowrap; padding-right: 10px; }
+  .exhaust td.t { text-align: right; color: var(--fg-faint); white-space: nowrap; }
+  .exhaust .hint { font-size: 10.5px; color: var(--fg-faint); margin-top: 6px; line-height: 1.5; }
+  .exhaust input {
+    width: 44px; font: inherit; color: var(--fg); background: var(--card-hi);
+    border: 1px solid var(--line); border-radius: 6px; padding: 1px 4px; text-align: center;
+  }
 </style>
 </head>
 <body>
@@ -107,6 +117,12 @@
   <div class="scroll">
     <div class="detail" id="detail"></div>
     <div id="cards"><div class="empty">正在读取额度……</div></div>
+    <div class="card exhaust" id="exhaustCard" style="display:none">
+      <div class="head"><span class="label">耗尽预演</span><span class="sp" style="flex:1"></span>
+        <span class="label">每天用 <input id="hoursIn" type="number" min="0.5" max="24" step="0.5" value="8"> 小时</span></div>
+      <table id="exhaustRows"></table>
+      <div class="hint">「均速」照最近几天的整体节奏外推（空闲摊薄在内）；「每天 N 小时」按每活跃小时的实测点数消耗推演。超过重置时间即到期耗不尽。</div>
+    </div>
     <div class="card speed" id="speedCard" style="display:none">
       <div class="head"><span class="label">速度</span><span class="sp" style="flex:1"></span><span class="label" id="speedNote"></span></div>
       <table id="speedRows"></table>
@@ -161,7 +177,7 @@
     return `<div class="card">
       <div class="head">
         <span class="label">${name}</span>
-        <span class="money">${mark}${mainText}<span class="full">${fullText}</span></span>
+        <span class="money" title="已用美元 = 满额 × 点数百分比（${w.usedPercent.toFixed(1)}%）；满额由回归标定：对每对「Δ本机账本$ ÷ Δ已用点数」求和反推（${w.sampleCount ?? 0} 组观测，${CONF[w.confidence] ?? ''}）">${mark}${mainText}<span class="full">${fullText}</span></span>
         <span class="pct">${mark}${w.usedPercent.toFixed(1)}%</span>
       </div>
       <div class="bar">
@@ -180,6 +196,39 @@
   }
   const fmtK = (n) => n >= 10000 ? Math.round(n / 1000) + 'k' : String(Math.round(n));
 
+  // ---- 耗尽预演 ----
+  const HOURS_KEY = 'miraquota.hoursPerDay';
+  function hoursPerDay() {
+    const v = parseFloat($('hoursIn').value);
+    return Number.isFinite(v) && v > 0 ? Math.min(24, v) : 8;
+  }
+  try { const saved = parseFloat(localStorage.getItem(HOURS_KEY)); if (Number.isFinite(saved) && saved > 0) $('hoursIn').value = saved; } catch {}
+  $('hoursIn').addEventListener('input', () => {
+    try { localStorage.setItem(HOURS_KEY, String(hoursPerDay())); } catch {}
+    if (latest) render(latest);
+  });
+
+  const fmtDur = (sec) => sec >= 86400 ? `${(sec / 86400).toFixed(1)} 天` : `${(sec / 3600).toFixed(1)} 小时`;
+
+  function exhaustRow(w) {
+    const e = w.exhaust;
+    if (!e || !w.points) return '';
+    const untilReset = w.resetAt != null ? w.resetAt - Date.now() / 1000 : null;
+    const cap = (sec) => untilReset != null && sec > untilReset ? '到期耗不尽' : `≈${fmtDur(sec)}`;
+    const avg = e.avgSeconds != null ? cap(e.avgSeconds) : '—';
+    let custom = '—';
+    if (e.perActiveHourPoints > 0) {
+      const remainDays = (w.points.budget - w.points.used) / (e.perActiveHourPoints * hoursPerDay());
+      custom = cap(remainDays * 86400);
+    }
+    return `<tr>
+      <td class="m">${WINDOW_NAME[w.label] ?? w.label}</td>
+      <td>均速 ${avg}</td>
+      <td>每天 ${hoursPerDay()}h ${custom}</td>
+      <td class="t">${e.activeHours != null ? '已活跃 ' + e.activeHours.toFixed(1) + 'h' : ''}</td>
+    </tr>`;
+  }
+
   function render(p) {
     if (!p) return;
     const st = $('state');
@@ -190,6 +239,10 @@
     const ws = p.windows ?? [];
     $('cards').innerHTML = ws.length ? ws.map(windowCard).join('') : '<div class="empty">暂无额度数据</div>';
     drawArc(ws.find((w) => w.label === '5h')?.usedPercent ?? 0);
+
+    const exRows = ws.map(exhaustRow).filter(Boolean);
+    $('exhaustCard').style.display = exRows.length ? '' : 'none';
+    $('exhaustRows').innerHTML = exRows.join('');
 
     const sp = p.speed;
     const hasRows = sp && sp.rows && sp.rows.length;
@@ -214,11 +267,17 @@
     }
 
     const bits = [];
-    if (p.unitPriceUSD != null) bits.push(`<b>单价</b> ${p.unitPriceUSD.toFixed(6)} $/点`);
+    if (p.unitPriceUSD != null) {
+      const c = p.unitPriceCalc;
+      let t = `<b>单价</b> ${p.unitPriceUSD.toFixed(6)} $/点`;
+      if (c) t += ` ＝ ${WINDOW_NAME[c.label] ?? c.label}窗本机账本 ${money(c.usd)} ÷ 同期已用 ${Math.round(c.points)} 点`;
+      if (p.unitPriceSpread != null) t += `（5h/7d 跨窗校验离散 ${p.unitPriceSpread.toFixed(2)}×，>4× 停用美元）`;
+      bits.push(t);
+    }
     if (p.unitPriceNotice) bits.push(`<b>单价</b> ${p.unitPriceNotice}`);
     if (p.accountNotice) bits.push(`<b>账号</b> ${p.accountNotice}`);
     bits.push(`<b>账本</b> ${p.buckets ?? 0} 分钟桶 · ${p.pricing ?? '-'}`);
-    bits.push(`<b>美元</b> 按官方 API 价折算的等价估值，非订阅账单；点数/百分比为账号权威口径`);
+    bits.push(`<b>美元</b> 按官方 API 价折算的等价估值，非订阅账单；点数/百分比为账号权威口径。本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本，会拉低单价`);
     bits.push(`<b>采集</b> ${ago(p.capturedAt)}`);
     $('foot').innerHTML = bits.join('　');
   }

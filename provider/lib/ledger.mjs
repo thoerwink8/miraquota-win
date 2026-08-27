@@ -266,19 +266,30 @@ export class CostLedger {
 
   /** 半开区间 [fromSec, toSec) 内的等价支出（秒为单位的时间戳）。 */
   spent(fromSec, toSec, { includeOpenMinute = false, group = null } = {}) {
-    let table;
-    if (group) {
-      const g = group.toLowerCase();
-      if (!this.#scopedIndex[g]) this.#buildScopedIndex(g);
-      table = this.#scopedIndex[g];
-    } else {
-      if (!this.#index) this.#buildIndex();
-      table = this.#index;
-    }
+    const table = this.#table(group);
     if (!table || !table.minutes.length) return 0;
     const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
     const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + (includeOpenMinute ? 1 : 0));
     return table.prefix[hi] - table.prefix[lo];
+  }
+
+  /** 半开区间内有支出的分钟数（活跃分钟）：分钟桶只在有消费时才存在，计数即活跃。 */
+  activeMinutes(fromSec, toSec, { group = null } = {}) {
+    const table = this.#table(group);
+    if (!table || !table.minutes.length) return 0;
+    const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
+    const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + 1);
+    return Math.max(0, hi - lo);
+  }
+
+  #table(group) {
+    if (group) {
+      const g = group.toLowerCase();
+      if (!this.#scopedIndex[g]) this.#buildScopedIndex(g);
+      return this.#scopedIndex[g];
+    }
+    if (!this.#index) this.#buildIndex();
+    return this.#index;
   }
 
   #buildIndex() {

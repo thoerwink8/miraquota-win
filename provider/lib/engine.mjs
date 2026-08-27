@@ -200,6 +200,26 @@ export class Engine {
     return (w.budget - last.used) / rate;
   }
 
+  /**
+   * 耗尽预演素材。两个口径：
+   * - avgSeconds：整窗均速（含空闲时间摊薄），「照这几天的节奏继续」还有多久打满；
+   * - perActiveHourPoints：每活跃小时消耗的点数（账本活跃分钟计时），供「每天用 N 小时」推演。
+   */
+  #exhaust(w, start, now, group) {
+    if (start == null || !(w.used > 0)) return null;
+    const elapsed = now - start;
+    if (elapsed < 600) return null;
+    const out = {};
+    const avgRate = w.used / elapsed;
+    if (avgRate > 0) out.avgSeconds = (w.budget - w.used) / avgRate;
+    const activeHours = this.ledger.activeMinutes(start, now, { group }) / 60;
+    if (activeHours >= 0.25) {
+      out.perActiveHourPoints = w.used / activeHours;
+      out.activeHours = activeHours;
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
   /** 一轮采集。返回是否拿到实测。 */
   async poll() {
     if (!this.opts.forceOffline) {
@@ -252,9 +272,11 @@ export class Engine {
       const { fullUSD, confidence, sampleCount } = this.#fullOf(w.label, w.budget, group, rate);
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
       const eta = this.#eta(w, now);
+      const exhaust = this.#exhaust(w, start, now, group);
       return {
         label: w.label, usedPercent, inferred: false, confidence, sampleCount,
         spentUSD: spent,
+        ...(exhaust ? { exhaust } : {}),
         ...(fullUSD != null ? {
           fullUSD,
           scaledSpentUSD: fullUSD * usedPercent / 100,
@@ -273,8 +295,12 @@ export class Engine {
       : limits.degraded ? '上游降级运行中' : null;
 
     const out = this.#base(level, this.last.at, windows);
-    if (rate != null) out.unitPriceUSD = rate;
-    else { const n = coherenceNotice(coherence); if (n) out.unitPriceNotice = n; }
+    if (rate != null) {
+      out.unitPriceUSD = rate;
+      // 公式素材：单价 = 基准窗账本支出 ÷ 同期已用点数；spread 是跨窗交叉校验的离散倍数
+      out.unitPriceCalc = { usd: coherence.basis.usd, points: coherence.basis.points, label: coherence.basis.label };
+      if (coherence.spread != null) out.unitPriceSpread = coherence.spread;
+    } else { const n = coherenceNotice(coherence); if (n) out.unitPriceNotice = n; }
     if (notice) out.accountNotice = notice;
     if (stale) out.detail = `接口已 ${Math.round(age / 60)} 分钟未回传，显示最后一次实测值`;
     return out;
