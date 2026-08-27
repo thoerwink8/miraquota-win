@@ -1,36 +1,40 @@
-# 注册登录触发的计划任务，让 provider 随登录常驻。
-#   install.ps1              注册
-#   install.ps1 -Uninstall   注销
+# 安装登录自启：在用户「启动」文件夹放一个隐藏窗口启动器（免管理员权限）。
+#   install.ps1              安装并立即启动
+#   install.ps1 -Uninstall   卸载（删启动器并停掉在跑的 provider）
 param([switch]$Uninstall)
 
 $ErrorActionPreference = 'Stop'
-$TaskName = 'MiraQuota'
+$startup = [Environment]::GetFolderPath('Startup')
+$launcher = Join-Path $startup 'MiraQuota.vbs'
 
 if ($Uninstall) {
-  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-  Write-Host "已注销计划任务 $TaskName。"
+  Remove-Item $launcher -ErrorAction SilentlyContinue
+  # 停掉在跑的 provider（按命令行识别，不误杀别的 node）。
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+    Where-Object { $_.CommandLine -like '*miraquota-provider.mjs*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Write-Host "已卸载：删除启动器并停止 provider。状态目录 ~/.miraquota 保留，需要可手动删。"
   exit 0
 }
 
-# provider 绝对路径（本脚本在 scripts\ 下，provider 在 ..\provider\）。
 $provider = Join-Path (Split-Path $PSScriptRoot -Parent) 'provider\miraquota-provider.mjs'
 if (-not (Test-Path $provider)) { Write-Error "找不到 $provider"; exit 1 }
-
 $node = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $node) { Write-Error "PATH 里找不到 node，请先装 Node 22+。"; exit 1 }
 
-# 无窗口后台运行。计划任务会在崩溃时不自动拉起——provider 自身足够稳，
-# 需要看门狗时另配；这里保持最小。
-$action = New-ScheduledTaskAction -Execute $node `
-  -Argument "`"$provider`"" -WorkingDirectory (Split-Path $provider -Parent)
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-  -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+# VBS 以隐藏窗口起 node，登录后无黑框常驻。
+$vbs = "CreateObject(""WScript.Shell"").Run """"""$node"""" """"$provider"""""", 0, False"
+Set-Content -Path $launcher -Value $vbs -Encoding ASCII
+Write-Host "已安装启动器：$launcher"
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-  -Settings $settings -Principal $principal -Force | Out-Null
-
-Write-Host "已注册计划任务 $TaskName（登录自启）。"
-Write-Host "立即启动一次： Start-ScheduledTask -TaskName $TaskName"
+# 立即启动一份（已在跑则跳过）。
+$running = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -like '*miraquota-provider.mjs*' }
+if ($running) {
+  Write-Host "provider 已在运行（PID $($running.ProcessId -join ', ')），跳过启动。"
+} else {
+  Start-Process -FilePath 'wscript.exe' -ArgumentList "`"$launcher`""
+  Write-Host "provider 已在后台启动。"
+}
+Write-Host "验证： curl http://127.0.0.1:4988/quota.json"
 Write-Host "注意：控件出现还需 Mirasim 带调试端口启动，见 scripts\mirasim-debug.ps1"
