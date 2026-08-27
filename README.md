@@ -69,6 +69,18 @@ node provider\miraquota-provider.mjs --once
 
 控件随即出现在 Mirasim 标题栏最右侧的空白段，点击展开。
 
+### 桌面图标（免敲命令）
+
+控件是嵌进 Mirasim 界面的，**没有独立窗口，也不该有托盘图标**。为免每次敲命令，
+可在桌面放两个快捷方式：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\make-shortcuts.ps1
+```
+
+- **Mirasim 带额度控件启动**：带调试端口重启 Mirasim（控件随即出现）
+- **额度控件 provider**：启动后台供数进程（无窗口）
+
 ### 登录自启
 
 ```powershell
