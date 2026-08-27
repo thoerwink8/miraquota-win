@@ -36,12 +36,12 @@ if (!app.requestSingleInstanceLock()) {
   }
 
   function createWindow() {
-    // 首开高度按内容取（三卡+预演+速度+页脚 ≈ 990px），封顶到工作区；此后记住用户调的尺寸。
+    // 首开高度按总览页一屏取（tab 化后各页自滚动），封顶到工作区；此后记住用户调的尺寸。
     const work = electron.screen.getPrimaryDisplay().workAreaSize;
     const saved = savedBounds();
     win = new BrowserWindow({
       width: saved?.width ?? 440,
-      height: saved?.height ?? Math.min(990, work.height - 60),
+      height: saved?.height ?? Math.min(760, work.height - 60),
       ...(saved?.x != null ? { x: saved.x, y: saved.y } : {}),
       minWidth: 380,
       minHeight: 520,

@@ -203,7 +203,10 @@ export class Engine {
   /**
    * 耗尽预演素材。两个口径：
    * - avgSeconds：整窗均速（含空闲时间摊薄），「照这几天的节奏继续」还有多久打满；
-   * - perActiveHourPoints：每活跃小时消耗的点数（账本活跃分钟计时），供「每天用 N 小时」推演。
+   * - rate：活跃强度（每活跃小时消耗的点数），供「每天用 N 小时」推演。
+   *   强度统一取近 3 天滚动，而非各自窗口期——5h 窗按窗口期采样会退化成
+   *   「当前时段的瞬时速度」，样本又少又新（用户 2026-08-28 指出）。
+   *   近 3 天不足半小时活跃时回退窗口期口径，basis 注明。
    */
   #exhaust(w, start, now, group) {
     if (start == null || !(w.used > 0)) return null;
@@ -212,10 +215,26 @@ export class Engine {
     const out = {};
     const avgRate = w.used / elapsed;
     if (avgRate > 0) out.avgSeconds = (w.budget - w.used) / avgRate;
-    const activeHours = this.ledger.activeMinutes(start, now, { group }) / 60;
-    if (activeHours >= 0.25) {
-      out.perActiveHourPoints = w.used / activeHours;
-      out.activeHours = activeHours;
+
+    const HORIZON = 72 * 3600;
+    const active3d = this.ledger.activeMinutes(now - HORIZON, now, { group }) / 60;
+    const pts3d = this.calibrator.consumedPoints(w.label, now - HORIZON);
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const activeToday = this.ledger.activeMinutes(midnight.getTime() / 1000, now, { group }) / 60;
+
+    if (active3d >= 0.5 && pts3d > 0) {
+      out.rate = {
+        pointsPerActiveHour: pts3d / active3d,
+        activeHours3d: active3d, activeHoursToday: activeToday, basis: '3d',
+      };
+    } else {
+      const activeWin = this.ledger.activeMinutes(start, now, { group }) / 60;
+      if (activeWin >= 0.25) {
+        out.rate = {
+          pointsPerActiveHour: w.used / activeWin,
+          activeHours3d: active3d, activeHoursToday: activeToday, basis: 'window',
+        };
+      }
     }
     return Object.keys(out).length ? out : null;
   }

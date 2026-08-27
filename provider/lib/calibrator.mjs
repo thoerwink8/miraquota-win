@@ -136,6 +136,20 @@ export class Calibrator {
   }
 
   pointSampleCount(label) { return (this.points[label] ?? []).length; }
+
+  /**
+   * sinceSec 以来该窗口实际消耗的点数：逐对正增量求和（跨重置的回落不计）。
+   * 停机期的消耗由停机前后两条样本的差值一次性补上（resetAt 未变时）。
+   */
+  consumedPoints(label, sinceSec) {
+    const samples = (this.points[label] ?? []).filter((s) => s.at >= sinceSec);
+    let sum = 0;
+    for (let i = 0; i + 1 < samples.length; i++) {
+      const a = samples[i], b = samples[i + 1];
+      if (b.resetAt === a.resetAt && b.used > a.used) sum += b.used - a.used;
+    }
+    return sum;
+  }
 }
 
 /** 按点数加权的隐含单价中位数：污染/畸变样本堆在一侧，中位数最多容忍近半污染。 */
