@@ -18,6 +18,8 @@
  * 均速游标改为出条上下各一像素，压在实色段上也分得清；
  * 有请求在途时胶囊上的点跟着跳，收起状态下也看得出正在生成。
  *
+ * v21 与桌面面板对齐信息层级：主行放精确值（本机账本直接求和），满额并列两个口径
+ *     （标定法 / 官方口径法），账号级折算值降到副行并带 ≈。
  * v20 满额不可用时主行改用点数：兜底满额来自本机账本反推的每点美元，账本失真会把满额
  * 同倍放大，而卡面只有一个 `~` 前缀。Swift 侧判出账本与点数不自洽即不再给 fullUSD，
  * 此时把账本支出抬到主行同样不可信，故主行取点数，账本留在副行。
@@ -30,7 +32,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 20;
+  const VERSION = 21;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -900,13 +902,15 @@
       // 三张卡的序号都取不到，错峰就退化成同时出现。
       setVar(c.el, '--i', String(i));
       setText(c.wl, winTitle(w.label));
-      // 主行按点数口径折算，与百分比、进度条同分母；账本支出落到副行。
-      // 满额不可用而点数在手时主行改用点数：此时账本已判定不自洽，不该被抬到主行。
-      const headPoints = w.scaledSpentUSD == null && w.fullUSD == null && w.points;
-      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点'
-        : usd(w.scaledSpentUSD != null ? w.scaledSpentUSD : w.spentUSD));
-      setText(c.full, '/ ' + (w.fullUSD == null ? '标定中'
-        : (w.confidence === 'high' ? '' : '~') + usd(w.fullUSD)));
+      // 主行放精确值（本机账本 token × 官方价直接求和，可与 Mirasim 流量监控逐笔核对）；
+      // 满额给出两个口径对照：标定法与官方口径法。与桌面面板保持同一套信息层级，
+      // 两个显示面不各讲一套（用户 2026-08-28 要求内嵌与桌面端一致）。
+      const headPoints = w.spentUSD == null && w.points;
+      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(w.spentUSD ?? 0));
+      const cals = [];
+      if (w.fullUSD != null) cals.push('标 ' + usd(w.fullUSD));
+      if (w.fullUSDOfficial != null) cals.push('官 ' + usd(w.fullUSDOfficial) + (w.officialBiasedLow ? '⁻' : ''));
+      setText(c.full, cals.length ? '/ ' + cals.join(' · ') : '/ 满额标定中');
       setText(c.pc, (w.inferred ? '≈' : '') + pct(w.usedPercent));
       setTone(c.pc, 'pc', tone);
       setStyle(c.fill, 'width', Math.min(100, Math.max(0, w.usedPercent)) + '%');
@@ -935,7 +939,7 @@
       setTick(c.right, w.resetAt ? countdown(w.resetAt - now) : '无固定重置');
 
       const bits = [];
-      if (w.scaledSpentUSD != null || headPoints) bits.push('账本 ' + usd(w.spentUSD));
+      if (w.scaledSpentUSD != null) bits.push('账号级 ≈' + usd(w.scaledSpentUSD));
       if (w.points) bits.push(`${kilo(w.points.used)}/${kilo(w.points.budget)} 点`);
       setText(c.sub, bits.join(' · '));
       setHidden(c.sub, !bits.length);

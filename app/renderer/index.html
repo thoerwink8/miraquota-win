@@ -159,6 +159,7 @@
     <span class="ver" id="ver"></span>
     <span class="badge" id="state">连接中</span>
     <span class="sp"></span>
+    <button class="tbtn" id="btnTheme" title="主题：跟随系统 / 亮色 / 暗色">◐</button>
     <button class="tbtn" id="btnMin" title="最小化">–</button>
     <button class="tbtn" id="btnHide" title="收到托盘">✕</button>
   </div>
@@ -215,6 +216,25 @@
   const $ = (id) => document.getElementById(id);
   $('btnMin').onclick = () => window.miraquota.minimize();
   $('btnHide').onclick = () => window.miraquota.hide();
+
+  // 主题三态循环。实际生效在主进程（nativeTheme.themeSource），这里只管显示与下一态。
+  const THEME_ORDER = ['system', 'light', 'dark'];
+  const THEME_ICON = { system: '◐', light: '☀', dark: '☾' };
+  const THEME_NAME = { system: '跟随系统', light: '亮色', dark: '暗色' };
+  let theme = 'system';
+  function paintThemeBtn() {
+    const b = $('btnTheme');
+    b.textContent = THEME_ICON[theme];
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
+    b.title = `主题：${THEME_NAME[theme]}（点击切到${THEME_NAME[next]}）`;
+  }
+  $('btnTheme').onclick = async () => {
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
+    theme = (await window.miraquota.setTheme?.(next)) ?? next;
+    paintThemeBtn();
+  };
+  window.miraquota.getTheme?.().then((v) => { if (v) { theme = v; paintThemeBtn(); } }).catch(() => {});
+  paintThemeBtn();
 
   const WINDOW_NAME = { '5h': '5 小时', '7d': '7 天', '7d_fable': '7 天 · Fable' };
   const CONF = { none: '无样本', low: '标定中', medium: '收敛中', high: '高置信' };

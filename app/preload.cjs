@@ -4,6 +4,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('miraquota', {
   get: () => ipcRenderer.invoke('quota:get'),
   version: () => ipcRenderer.invoke('app:version'),
+  getTheme: () => ipcRenderer.invoke('theme:get'),
+  setTheme: (v) => ipcRenderer.invoke('theme:set', v),
   onQuota: (cb) => ipcRenderer.on('quota', (_e, payload) => cb(payload)),
   minimize: () => ipcRenderer.send('win:min'),
   hide: () => ipcRenderer.send('win:hide'),

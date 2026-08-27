@@ -29,10 +29,29 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('second-instance', () => { if (win) { win.show(); win.focus(); } });
 
-  const BOUNDS_FILE = join(homedir(), '.miraquota', 'ui.json');
-  function savedBounds() {
-    try { return JSON.parse(readFileSync(BOUNDS_FILE, 'utf8')).bounds ?? null; }
-    catch { return null; }
+  // 窗口位置与主题偏好同存一个文件；读失败一律回默认，不让 UI 状态挡住启动。
+  const UI_FILE = join(homedir(), '.miraquota', 'ui.json');
+  function readUI() {
+    try { return JSON.parse(readFileSync(UI_FILE, 'utf8')) ?? {}; } catch { return {}; }
+  }
+  function writeUI(patch) {
+    try {
+      mkdirSync(join(homedir(), '.miraquota'), { recursive: true });
+      writeFileSync(UI_FILE, JSON.stringify({ ...readUI(), ...patch }));
+    } catch { /* ignore */ }
+  }
+  const savedBounds = () => readUI().bounds ?? null;
+
+  /**
+   * 主题走 Electron 原生 nativeTheme.themeSource：设成 light/dark 后渲染进程里的
+   * prefers-color-scheme 随之翻转，所以 CSS 不需要为手动切换另写一套选择器。
+   * 'system' 回到跟随系统。
+   */
+  const THEMES = ['system', 'light', 'dark'];
+  function applyTheme(v) {
+    const t = THEMES.includes(v) ? v : 'system';
+    electron.nativeTheme.themeSource = t;
+    return t;
   }
 
   function createWindow() {
@@ -60,12 +79,7 @@ if (!app.requestSingleInstanceLock()) {
     let saveTimer = null;
     const persistBounds = () => {
       clearTimeout(saveTimer);
-      saveTimer = setTimeout(() => {
-        try {
-          mkdirSync(join(homedir(), '.miraquota'), { recursive: true });
-          writeFileSync(BOUNDS_FILE, JSON.stringify({ bounds: win.getBounds() }));
-        } catch { /* ignore */ }
-      }, 500);
+      saveTimer = setTimeout(() => writeUI({ bounds: win.getBounds() }), 500);
     };
     win.on('resize', persistBounds);
     win.on('move', persistBounds);
@@ -117,10 +131,17 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     engine = new Engine({ forceOffline: process.argv.includes('--offline') });
     await engine.loadSpeed();
+    applyTheme(readUI().theme);   // 建窗前定主题，避免首帧闪一下另一套配色
     createWindow();
     createTray();
     ipcMain.handle('quota:get', () => engine.payload());
     ipcMain.handle('app:version', () => app.getVersion());
+    ipcMain.handle('theme:get', () => applyTheme(readUI().theme));
+    ipcMain.handle('theme:set', (_e, v) => {
+      const t = applyTheme(v);
+      writeUI({ theme: t });
+      return t;
+    });
     ipcMain.on('win:min', () => win.minimize());
     ipcMain.on('win:hide', () => win.hide());
     ipcMain.on('app:quit', () => { app.isQuittingForReal = true; app.quit(); });
