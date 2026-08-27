@@ -290,24 +290,24 @@
       // 与 Mirasim「流量监控 → 估算成本」列同源可逐笔核对，零推断。
       // 「满额/余」由汇率反推，属推断值，一律带 ≈ 并降到副行（用户 2026-08-28 指出主次颠倒）。
       mainText = money(w.spentUSD ?? 0);
-      fullText = w.points ? ` / ${w.usedPercent.toFixed(1)}% 已用` : '';
       mainTitle = '本机实际花费：账本 token × 官方 API 价直接求和，可与 Mirasim「流量监控」的估算成本列逐笔核对';
+      // 主行「/ 之后」直接摆两个满额口径——那个位置原先重复了右侧的百分比徽章
+      // （用户 2026-08-28 指出重叠且该位置应给满额）。
+      const cals = [];
+      if (w.fullUSD != null) cals.push(`标定 ≈${money(w.fullUSD, 0)}`);
+      if (w.fullUSDOfficial != null) cals.push(`官方 ≈${money(w.fullUSDOfficial, 0)}${w.officialBiasedLow ? '⁻' : ''}`);
+      fullText = cals.length ? ` / ${cals.join(' · ')}` : ' / 满额标定中';
       const infer = [];
       if (w.remainingUSD != null) infer.push(`余 ≈${money(w.remainingUSD, 0)}`);
       if (w.scaledSpentUSD != null) infer.push(`账号级已用 ≈${money(w.scaledSpentUSD)}`);
-      remainText = infer.length ? `推算 ${infer.join(' · ')}` : '标定中';
-      // 两个口径并排：标定法（逐对增量加权中位数）与官方口径法（账本$ ÷ 官方已用点数）。
-      // 接近＝账本与点数自洽；分歧大＝至少一侧失真（用户 2026-08-28 要求两口径同屏对照）。
-      const cals = [];
-      if (w.fullUSD != null) cals.push(`标定 ≈${money(w.fullUSD, 0)}`);
-      if (w.fullUSDOfficial != null) cals.push(`官方口径 ≈${money(w.fullUSDOfficial, 0)}${w.officialBiasedLow ? '⁻' : ''}`);
-      subBits = cals.length ? [`满额 ${cals.join(' / ')}`] : [];
+      remainText = infer.length ? `推算 ${infer.join(' · ')}` : '';
+      subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`] : [];
     }
 
     return `<div class="card">
       <div class="head">
         <span class="label">${name}</span>
-        <span class="money" title="${mainTitle}">${mainText}<span class="full">${fullText}</span></span>
+        <span class="money" title="${mainTitle}">${mainText}<span class="full" title="满额两口径：前者标定法（逐对增量加权中位数），后者官方口径法（账本$ ÷ 官方已用点数 × 预算点）">${fullText}</span></span>
         <span class="pct">${mark}${w.usedPercent.toFixed(1)}%</span>
       </div>
       <div class="bar">
