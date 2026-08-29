@@ -169,9 +169,9 @@
       <button id="tabSim">耗尽预演</button>
       <button id="tabSpec">口径说明</button>
     </div>
-    <div class="mode" title="统计口径：美元（API 等价估值）或原始额度点">
-      <button id="modeUsd" class="on">$</button>
-      <button id="modePts">点</button>
+    <div class="mode" title="统计口径：点数（账号级标准）或美元（本机 API 等价估值）">
+      <button id="modeUsd">$</button>
+      <button id="modePts" class="on">点</button>
     </div>
   </div>
   <div class="scroll">
@@ -204,7 +204,7 @@
         <b>精确（无标记）</b>——① 点数/百分比：来自 Mirasim <code>/v1/limits</code>，账号级权威；② 美元主行：本机账本 token × 官方 API 价直接求和，可与 Mirasim「设置 → 流量监控 → 估算成本」列逐笔核对（同一份账本、同一张价目表）。<br>
         <b>推算（带 ≈）</b>——满额$ / 余$ / 账号级已用$。额度上限以「点」计价，云端不提供点→美元的官方汇率（<code>/v1/limits</code> 是唯一接口，无成本端点），只能反推。满额给出<b>两个口径对照</b>：<br>
         　·「<b>标定</b>」逐对「Δ本机账本$ ÷ Δ已用点数」取按点数加权的中位数，抗单点失真与他机污染；<br>
-        　·「<b>官方口径</b>」直接用官方百分比反推：本机账本$ ÷ 官方已用点数 × 预算点，公式最简、无平滑。<br>
+        　·「<b>点数反推</b>」直接用账号级已用点数反推：本机账本$ ÷ 已用点数 × 预算点，使用官方点数但不是云端美元账单。<br>
         　两者接近＝账本与点数自洽，可放心用；分歧大＝至少一侧失真（多机同时用、或账本尚未回填）。带 ⁻ 号表示该窗口是模型档位窗，分桶自档位声明起才累积，此口径系统性偏低。<br>
         <b>美元性质</b>：按官方 API 价折算的等价估值，不是订阅账单——订阅按窗口额度计费，不按 token 扣款。<br>
         <b>多机</b>：本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本。标定对此有两道防线——检测到他机活跃段整段剔除，聚合取中位数。
@@ -254,9 +254,9 @@
   for (const [k, [btn]] of Object.entries(TABS)) $(btn).onclick = () => switchTab(k);
   try { const t = localStorage.getItem(TAB_KEY); if (t && t !== 'main') switchTab(t); } catch {}
 
-  // ---- 统计口径：usd（默认）| pts ----
+  // ---- 统计口径：pts（默认）| usd ----
   const MODE_KEY = 'miraquota.mode';
-  let MODE = 'usd';
+  let MODE = 'pts';
   try { if (localStorage.getItem(MODE_KEY) === 'pts') MODE = 'pts'; } catch {}
   function switchMode(m) {
     MODE = m;
@@ -317,8 +317,8 @@
       // 主行「/ 之后」直接摆两个满额口径——那个位置原先重复了右侧的百分比徽章
       // （用户 2026-08-28 指出重叠且该位置应给满额）。
       const cals = [];
-      if (w.fullUSD != null) cals.push(`<span class="tag">标</span><b>${money(w.fullUSD, 0)}</b>`);
-      if (w.fullUSDOfficial != null) cals.push(`<span class="tag">官</span><b>${money(w.fullUSDOfficial, 0)}</b>${w.officialBiasedLow ? '⁻' : ''}`);
+      if (w.fullUSD != null) cals.push(`<span class="tag">标≈</span><b>${money(w.fullUSD, 0)}</b>`);
+      if (w.fullUSDOfficial != null) cals.push(`<span class="tag">点≈</span><b>${money(w.fullUSDOfficial, 0)}</b>${w.officialBiasedLow ? '⁻' : ''}`);
       fullText = cals.length ? ` / ${cals.join(' · ')}` : ' / 满额标定中';
       const infer = [];
       if (w.remainingUSD != null) infer.push(`余 <b>${money(w.remainingUSD, 0)}</b>`);
@@ -330,7 +330,7 @@
     return `<div class="card">
       <div class="head">
         <span class="label">${name}</span>
-        <span class="money" title="${mainTitle}">${mainText}<span class="full" title="满额两口径：前者标定法（逐对增量加权中位数），后者官方口径法（账本$ ÷ 官方已用点数 × 预算点）">${fullText}</span></span>
+        <span class="money" title="${mainTitle}">${mainText}<span class="full" title="满额两口径：前者为标定推算，后者为点数反推；两者都不是云端美元账单">${fullText}</span></span>
         <span class="pct">${mark}${w.usedPercent.toFixed(1)}%</span>
       </div>
       <div class="bar">

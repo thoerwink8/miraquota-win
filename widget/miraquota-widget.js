@@ -3,7 +3,7 @@
  *
  * 由 MiraQuota 经 CDP 注入 Mirasim 的渲染进程（不改 Mirasim 的任何文件）。
  * 数据来自本机回环接口 window.__MIRAQUOTA_FEED__ + "/quota.json"，
- * 额度点、美元、速度都在 Swift 侧算好，这里只负责画。
+ * 额度点、美元、速度都在 provider 侧算好，这里只负责画。
  *
  * 标题栏胶囊 + 点击展开的详情层。位置可拖动，存 localStorage。
  *
@@ -19,9 +19,10 @@
  * 有请求在途时胶囊上的点跟着跳，收起状态下也看得出正在生成。
  *
  * v21 与桌面面板对齐信息层级：主行放精确值（本机账本直接求和），满额并列两个口径
- *     （标定法 / 官方口径法），账号级折算值降到副行并带 ≈。
+ *     （标定法 / 点数反推），账号级折算值降到副行并带 ≈。
+ * v22 明确所有满额与余量美元都是推算值；收起状态的账号级金额也带 ≈。
  * v20 满额不可用时主行改用点数：兜底满额来自本机账本反推的每点美元，账本失真会把满额
- * 同倍放大，而卡面只有一个 `~` 前缀。Swift 侧判出账本与点数不自洽即不再给 fullUSD，
+ * 同倍放大，而卡面只有一个 `~` 前缀。provider 侧判出账本与点数不自洽即不再给 fullUSD，
  * 此时把账本支出抬到主行同样不可信，故主行取点数，账本留在副行。
  *
  * v15–v17 加标题栏吸附：宿主标题栏右侧本就排着自己的控件，控件贴右上角会压在上面。
@@ -32,7 +33,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 21;
+  const VERSION = 22;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -832,9 +833,11 @@
     setText(els.lb1, winShort(primary.label));
     setText(els.v1, (primary.inferred ? '≈' : '') + pct(primary.usedPercent));
     setTone(els.v1, 'v', toneOf(primary.usedPercent));
-    setText(els.u1, primary.scaledSpentUSD == null && primary.fullUSD == null && primary.points
-      ? kilo(primary.points.used) + ' 点'
-      : usd(primary.scaledSpentUSD != null ? primary.scaledSpentUSD : primary.spentUSD));
+    setText(els.u1, primary.scaledSpentUSD != null
+      ? '≈' + usd(primary.scaledSpentUSD)
+      : (primary.fullUSD == null && primary.points
+        ? kilo(primary.points.used) + ' 点'
+        : usd(primary.spentUSD ?? 0)));
 
     setHidden(els.sep, !second);
     setHidden(els.seg2, !second);
@@ -908,8 +911,8 @@
       const headPoints = w.spentUSD == null && w.points;
       setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(w.spentUSD ?? 0));
       const cals = [];
-      if (w.fullUSD != null) cals.push('标 ' + usd(w.fullUSD));
-      if (w.fullUSDOfficial != null) cals.push('官 ' + usd(w.fullUSDOfficial) + (w.officialBiasedLow ? '⁻' : ''));
+      if (w.fullUSD != null) cals.push('标≈' + usd(w.fullUSD));
+      if (w.fullUSDOfficial != null) cals.push('点≈' + usd(w.fullUSDOfficial) + (w.officialBiasedLow ? '⁻' : ''));
       setText(c.full, cals.length ? '/ ' + cals.join(' · ') : '/ 满额标定中');
       setText(c.pc, (w.inferred ? '≈' : '') + pct(w.usedPercent));
       setTone(c.pc, 'pc', tone);
@@ -920,7 +923,7 @@
       if (showPace) setStyle(c.pace, 'left', w.pacePercent + '%');
 
       if (w.remainingUSD != null) {
-        setText(c.left, `余 ${w.confidence === 'high' ? '' : '~'}${usd(w.remainingUSD)}`);
+        setText(c.left, `余 ≈${usd(w.remainingUSD)}`);
         if (w.etaSeconds == null) {
           setText(c.eta, '');
         } else if (w.resetAt && now + w.etaSeconds >= w.resetAt) {
@@ -1022,7 +1025,7 @@
       // measured 为真时首 token 是逐请求实测值，不带 ≈；缺字段按回归行处理。
       setText(r.v, row.rate == null ? `端到端 ${row.endToEnd.toFixed(0)} tok/s`
         : (row.ttft != null ? `首 ${row.measured ? '' : '≈'}${row.ttft.toFixed(1)}s · ` : '') + `${row.rate.toFixed(0)} tok/s`);
-      // 阈值由 Swift 侧统一把关（SpeedRow.notableDrift），这里只显示给了值的那一档。
+      // 阈值由 provider 侧统一把关（SpeedRow.notableDrift），这里只显示给了值的那一档。
       const drift = row.driftNotable;
       setText(r.dr, drift == null ? '' : `${drift > 0 ? '快' : '慢'}${Math.abs(drift).toFixed(0)}%`);
       setTone(r.dr, 'dr', drift == null ? '' : drift > 0 ? 'fast' : 'slow');
