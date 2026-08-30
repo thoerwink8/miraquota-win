@@ -15,6 +15,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { billingFamiliesFromUsage, isBillableCloudUsage, modelFamily } from './model-families.mjs';
 
 const HOME = homedir();
 const CLAUDE_PROJECTS = join(HOME, '.claude', 'projects');
@@ -24,6 +25,7 @@ const STATE_FILE = join(STATE_DIR, 'ledger.json');
 
 const RETENTION = 8 * 86400;          // 覆盖 7d 窗口并留余量
 const GATEWAY_RESCAN = 1 << 20;       // 网关账本尾部重扫窗口
+const STATE_SCHEMA = 2;               // v2 扩展 GPT 定价后需重扫 transcript 补旧漏账
 
 const num = (v) => {
   const n = typeof v === 'string' ? Number(v) : v;
@@ -47,6 +49,9 @@ export class CostLedger {
     this.cursors = {};        // transcript 文件 → { size, offset }
     this.buckets = {};        // unix 分钟 → 美元
     this.scoped = {};         // "组|分钟" → 美元
+    this.family = {};         // "家族|分钟" → 官方云端模型家族美元
+    this.familyBooked = {};   // 账目键 → { id, usd }（回填变大时补差额）
+    this.familyLatest = {};   // 家族 → 最近一次成功云端请求秒时间戳
     this.seen = {};           // 账目键 → 入桶分钟
     this.booked = {};         // 账目键 → 已计金额（见更大值补差额）
     this.scopedSince = {};    // 组 → 起始分钟
@@ -59,10 +64,11 @@ export class CostLedger {
     this.countedLedger = new Set();
     this.#index = null;
     this.#scopedIndex = {};
+    this.#familyIndex = {};
     this.#load();
   }
 
-  #index; #scopedIndex;
+  #index; #scopedIndex; #familyIndex;
 
   #load() {
     try {
@@ -70,9 +76,16 @@ export class CostLedger {
       this.cursors = p.cursors ?? {};
       this.buckets = p.buckets ?? {};
       this.scoped = p.scoped ?? {};
+      this.family = p.family ?? {};
+      this.familyBooked = p.familyBooked ?? {};
+      this.familyLatest = p.familyLatest ?? {};
       this.seen = p.seen ?? {};
       this.booked = p.booked ?? {};
       this.scopedSince = p.scopedSince ?? {};
+      if ((p.schemaVersion ?? 1) < STATE_SCHEMA) {
+        // 已计账目仍由 seen/booked 去重；只归零读取游标，让过去因未知模型价被跳过的记录重新定价。
+        for (const path of Object.keys(this.cursors)) this.cursors[path] = { size: 0, offset: 0 };
+      }
     } catch { /* 首次运行 */ }
   }
 
@@ -80,7 +93,9 @@ export class CostLedger {
     try {
       mkdirSync(STATE_DIR, { recursive: true });
       writeFileSync(STATE_FILE, JSON.stringify({
-        cursors: this.cursors, buckets: this.buckets, scoped: this.scoped,
+        schemaVersion: STATE_SCHEMA,
+        cursors: this.cursors, buckets: this.buckets, scoped: this.scoped, family: this.family,
+        familyBooked: this.familyBooked, familyLatest: this.familyLatest,
         seen: this.seen, booked: this.booked, scopedSince: this.scopedSince,
       }));
     } catch { /* 落盘失败不阻断 */ }
@@ -114,6 +129,12 @@ export class CostLedger {
       this.scoped[k] = (this.scoped[k] ?? 0) + usd;
       this.#scopedIndex[g] = null;
     }
+  }
+
+  #addFamily(minute, usd, familyId) {
+    const key = familyId + '|' + minute;
+    this.family[key] = (this.family[key] ?? 0) + usd;
+    this.#familyIndex[familyId] = null;
   }
 
   refresh(now = Date.now()) {
@@ -202,9 +223,7 @@ export class CostLedger {
       if (!text) continue;
       const lines = text.split('\n');
       const from = offset > 0 ? 1 : 0;   // 起点可能落在半行，跳过第一行
-      for (let i = from; i < lines.length; i++) {
-        if (lines[i].includes('"anthropic"') && this.#parseGateway(lines[i], cutoff)) changed = true;
-      }
+      for (let i = from; i < lines.length; i++) if (this.#parseGateway(lines[i], cutoff)) changed = true;
     }
     return changed;
   }
@@ -212,7 +231,6 @@ export class CostLedger {
   #parseGateway(line, cutoff) {
     let root;
     try { root = JSON.parse(line); } catch { return false; }
-    if (root.provider !== 'anthropic') return false;
     const epoch = root.ts ? Math.floor(Date.parse(root.ts) / 1000) : NaN;
     if (!Number.isFinite(epoch) || epoch < cutoff) return false;
     const id = root.id;
@@ -221,8 +239,8 @@ export class CostLedger {
     const providerCallId = root.providerCallId;
     const key = this.seen[id] != null ? id : (providerCallId ?? id);
     const prior = this.booked[key];
+    const priorFamilyBooking = this.familyBooked[key];
     if (prior == null) {
-      if (this.seen[key] != null) return false;   // 旧版按游标入过账，无从补差
       const agent = root.agent ?? '';
       // 缺 providerCallId 的行无法与 transcript 对齐；claude/codex 另有 transcript 覆盖，宁漏勿重。
       if (providerCallId == null && (agent === 'claude' || agent === 'codex')) return false;
@@ -230,10 +248,36 @@ export class CostLedger {
     const model = root.model ?? '';
     const usd = model ? this.pricing.cost(model, num(root.input), num(root.output),
       num(root.cacheRead), num(root.cacheWrite)) : null;
+    const billable = isBillableCloudUsage(root);
+    let familyChanged = false;
+    if (billable) {
+      const family = modelFamily(model);
+      const priorLatest = this.familyLatest[family.id] ?? 0;
+      this.familyLatest[family.id] = Math.max(priorLatest, epoch);
+      if (this.familyLatest[family.id] !== priorLatest) familyChanged = true;
+      if (usd != null && usd > 0) {
+        const booked = this.familyBooked[key];
+        const priorFamilyUSD = typeof booked === 'object' ? Number(booked.usd) || 0 : 0;
+        if (usd > priorFamilyUSD) {
+          this.#addFamily(Math.floor(epoch / 60), usd - priorFamilyUSD, family.id);
+          this.familyBooked[key] = { id: family.id, usd };
+          familyChanged = true;
+        }
+      }
+    }
+    // 总账本接纳 Anthropic 记录，以及经 Mirasim 官方 relay 的其他可定价模型（如 GPT）。
+    // 直连/dispatch 请求不因模型缓存里有价格而混入官方计费家族。
+    if (root.provider !== 'anthropic' && !billable) return familyChanged;
     // cost 对零 token 的已知模型返回 0——token 未回填的行此刻不入账，等回填后重读。
     if (usd == null || usd <= 0) { this.unpricedRecords++; return false; }
+    if (prior == null && this.seen[key] != null) {
+      // v1 已见过但未定价的 GPT 请求：v2 从 ai-router 获得价格后允许一次性补账。
+      // 其他旧账目继续宁漏勿重；补账后 booked 会阻止后续重复。
+      const legacyFamily = typeof priorFamilyBooking === 'object' ? priorFamilyBooking.id : priorFamilyBooking;
+      if (legacyFamily !== 'gpt') return familyChanged;
+    }
     if (prior != null) {
-      if (usd <= prior) return false;
+      if (usd <= prior) return familyChanged;
       this.#add(this.seen[key] ?? Math.floor(epoch / 60), usd - prior, model);
       this.booked[key] = usd;
     } else {
@@ -254,12 +298,20 @@ export class CostLedger {
       const m = Number(k.split('|').pop());
       if (m < minCut) delete this.scoped[k];
     }
-    for (const k of Object.keys(this.seen)) if (this.seen[k] < minCut) { delete this.seen[k]; delete this.booked[k]; }
+    for (const k of Object.keys(this.family)) {
+      const m = Number(k.split('|').pop());
+      if (m < minCut) delete this.family[k];
+    }
+    for (const id of Object.keys(this.familyLatest)) if (this.familyLatest[id] < cutoff) delete this.familyLatest[id];
+    for (const k of Object.keys(this.seen)) if (this.seen[k] < minCut) {
+      delete this.seen[k]; delete this.booked[k]; delete this.familyBooked[k];
+    }
     for (const k of Object.keys(this.cursors)) {
       try { statSync(k); } catch { delete this.cursors[k]; }
     }
     if (Object.keys(this.buckets).length !== before) this.#index = null;
     if (Object.keys(this.scoped).length) this.#scopedIndex = {};
+    if (Object.keys(this.family).length) this.#familyIndex = {};
   }
 
   // MARK: 查询
@@ -282,6 +334,21 @@ export class CostLedger {
     return Math.max(0, hi - lo);
   }
 
+  familySpent(fromSec, toSec, familyId, { includeOpenMinute = false } = {}) {
+    const table = this.#familyTable(familyId);
+    if (!table || !table.minutes.length) return 0;
+    const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
+    const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + (includeOpenMinute ? 1 : 0));
+    return table.prefix[hi] - table.prefix[lo];
+  }
+
+  billingFamilies() {
+    return billingFamiliesFromUsage(Object.entries(this.familyLatest).map(([id, at]) => ({
+      model: id === 'claude' ? 'claude-opus-5' : id === 'gpt' ? 'gpt-5' : id,
+      status: 200, viaRelay: true, leg: 'relay', upstreamHost: 'relay.mirasim.ai', at,
+    })));
+  }
+
   #table(group) {
     if (group) {
       const g = group.toLowerCase();
@@ -290,6 +357,17 @@ export class CostLedger {
     }
     if (!this.#index) this.#buildIndex();
     return this.#index;
+  }
+
+  #familyTable(familyId) {
+    const id = String(familyId || '').toLowerCase();
+    if (!this.#familyIndex[id]) {
+      const head = id + '|';
+      this.#familyIndex[id] = prefixSums(Object.entries(this.family)
+        .filter(([k]) => k.startsWith(head))
+        .map(([k, v]) => [Number(k.slice(head.length)), v]));
+    }
+    return this.#familyIndex[id];
   }
 
   #buildIndex() {

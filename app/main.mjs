@@ -11,8 +11,11 @@ import { homedir } from 'node:os';
 
 import { Engine } from '../provider/lib/engine.mjs';
 import { startFeed, Injector } from '../provider/lib/injector.mjs';
+import { resolveVersion } from './version.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(HERE, '..');
+const APP_VERSION = resolveVersion(ROOT);
 const HEARTBEAT_MS = 5_000;    // 界面心跳：账本增量 + 倒计时
 const FETCH_EVERY = 3;         // 每 3 跳问一次 /v1/limits（15 秒，与 mac 版一致）
 
@@ -129,18 +132,28 @@ if (!app.requestSingleInstanceLock()) {
   }
 
   app.whenReady().then(async () => {
-    engine = new Engine({ forceOffline: process.argv.includes('--offline') });
+    engine = new Engine({
+      forceOffline: process.argv.includes('--offline'),
+      billingFamily: readUI().billingFamily ?? null,
+    });
     await engine.loadSpeed();
     applyTheme(readUI().theme);   // 建窗前定主题，避免首帧闪一下另一套配色
     createWindow();
     createTray();
     ipcMain.handle('quota:get', () => engine.payload());
-    ipcMain.handle('app:version', () => app.getVersion());
+    // 与 dist 同一口径（0.2.<提交数>）；安装包无 .git 时 resolveVersion 回退 package.json（builder 已注入）
+    ipcMain.handle('app:version', () => APP_VERSION);
     ipcMain.handle('theme:get', () => applyTheme(readUI().theme));
     ipcMain.handle('theme:set', (_e, v) => {
       const t = applyTheme(v);
       writeUI({ theme: t });
       return t;
+    });
+    ipcMain.handle('billing-family:set', async (_e, v) => {
+      engine.setBillingFamily(v);
+      writeUI({ billingFamily: v });
+      await tick();
+      return engine.payload();
     });
     ipcMain.on('win:min', () => win.minimize());
     ipcMain.on('win:hide', () => win.hide());

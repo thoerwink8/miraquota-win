@@ -23,7 +23,7 @@
 ```powershell
 pnpm install        # 依赖只有 electron / electron-builder（.npmrc 已配 npmmirror）
 pnpm dev            # 开发运行（终端若带 ELECTRON_RUN_AS_NODE 需先清掉）
-pnpm dist           # 打包：dist/MiraQuota Setup 0.2.0.exe（安装版）+ MiraQuota 0.2.0.exe（免安装）
+pnpm dist           # 打包：版本 = 0.2.<git 提交数>（安装版 + 免安装 exe）
 ```
 
 - **托盘常驻**：关窗即收到托盘，悬停看摘要，右键可设开机自启；
@@ -31,6 +31,11 @@ pnpm dist           # 打包：dist/MiraQuota Setup 0.2.0.exe（安装版）+ Mi
   关闭时按落盘的窗口锚点滚动推算，剩余额度仍可读（标 ≈，他人占用不可见故为下界）；
 - **美元口径**：本机账本（Claude Code transcript + Mirasim 网关）折算，满额自标定，
   跨窗口自洽核验，详见 [docs/QUOTA-ESTIMATION.md](docs/QUOTA-ESTIMATION.md)。
+- **模型家族计费**：顶部按本机实际使用过的官方云端模型动态生成 `Claude / GPT / …`
+  选择；Fable、Opus、Sonnet、Haiku 统一归为 Claude，GPT 各版本统一归为 GPT。
+  原有官方额度卡全部保留，选择只改变本机美元花费的家族归集。
+- **模型任务明细**：速度区显示最近使用过的 5 种具体模型（包括本地、直连与辅助模型），
+  每种模型可展开最近 5 个已完成任务；当前计费家族的每条具体模型行重复显示标记。
 
 ## 注入控件（副形态，可选）
 

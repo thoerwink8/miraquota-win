@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('miraquota', {
   version: () => ipcRenderer.invoke('app:version'),
   getTheme: () => ipcRenderer.invoke('theme:get'),
   setTheme: (v) => ipcRenderer.invoke('theme:set', v),
+  setBillingFamily: (v) => ipcRenderer.invoke('billing-family:set', v),
   onQuota: (cb) => ipcRenderer.on('quota', (_e, payload) => cb(payload)),
   minimize: () => ipcRenderer.send('win:min'),
   hide: () => ipcRenderer.send('win:hide'),

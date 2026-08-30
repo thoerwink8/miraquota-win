@@ -24,6 +24,7 @@
 import { readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { modelFamily, recentConcreteModels } from './model-families.mjs';
 
 const HOME = homedir();
 const INSIGHTS = join(HOME, '.mirasim', 'insights');
@@ -38,6 +39,8 @@ const MIN_SEPARATION = 32;        // 回归配对两端输出量差下限
 const MIN_PAIRS = 6;              // 给出斜率所需最少配对数（即最少 12 条样本）
 const MIN_ROW = 1;                // 单模型成行最少样本数
 const RECENT_COUNT = 5;           // 出字速度取最近这么多次请求
+const RECENT_MODEL_CAP = 5;       // 最近使用过的具体模型数
+const TASK_CAP = 5;               // 每种具体模型附带最近任务数
 const RECENCY_LIMIT = 2 * 3600;   // 超过这么久没请求就不再成行，秒
 const MIN_STREAM_SECONDS = 0.25;  // 样本进速率统计所需最短出字时间
 const RATE_MIN = 5.0;             // 速率合理带
@@ -382,6 +385,9 @@ export class SpeedStats {
     if (pool.length === 0 && this.flights.size === 0) return null;
     const fresh = nowSec - RECENCY_LIMIT;
 
+    // 最近 5 种具体模型按完整 48h 保留池排序；速度回归仍只让近 2h 活跃样本参与，
+    // 因而较早使用的本地/直连模型能保留在列表里，但不会伪装成实时速度。
+    const recentModels = recentConcreteModels([...this.samples.values()], RECENT_MODEL_CAP, TASK_CAP);
     const byModel = new Map();
     for (const s of pool) {
       if (!byModel.has(s.model)) byModel.set(s.model, []);
@@ -389,16 +395,28 @@ export class SpeedStats {
     }
 
     const rows = [];
-    for (const group of byModel.values()) {
-      const row = this.estimate(group, fresh);
-      if (row) rows.push(row);
+    for (const recentModel of recentModels) {
+      const group = byModel.get(recentModel.modelId) ?? [];
+      const estimate = group.length ? this.estimate(group, fresh) : null;
+      const family = modelFamily(recentModel.modelId);
+      const tasks = recentModel.tasks.map((task) => ({
+        id: task.id, at: task.at, durationMs: task.ms, outputTokens: task.out,
+        rate: task.ms > 0 && task.out > 0 ? task.out / (task.ms / 1000) : null,
+        ttft: estimate?.ttft ?? null,
+        status: 'completed',
+      }));
+      const taskOut = tasks.reduce((sum, task) => sum + (task.outputTokens || 0), 0);
+      const taskMs = tasks.reduce((sum, task) => sum + (task.durationMs || 0), 0);
+      rows.push({
+        model: shortName(recentModel.modelId), modelId: recentModel.modelId,
+        familyId: family.id, familyLabel: family.label, latestAt: recentModel.latestAt, tasks,
+        samples: estimate?.samples ?? group.length,
+        endToEnd: estimate?.endToEnd ?? (taskMs > 0 ? taskOut / (taskMs / 1000) : 0),
+        ...(estimate ?? {}),
+      });
     }
     rows.sort((a, b) => b.latestAt - a.latestAt);
-    // 卡片按最近使用排序展示；软上限只防极端情况（同时活跃很多模型），
-    // 不是「只看最近 3 个」——旧版硬编 3 会把仍在 fresh 窗口内的模型悄悄顶掉
-    // （用户 2026-08-28 发现 Sonnet 5 用了却不显示）。
-    const ROW_CAP = 8;
-    const top = rows.slice(0, ROW_CAP).map(pruneRow);
+    const top = rows.map(pruneRow);
 
     const sampleTotal = pool.filter((s) => s.at >= fresh).length;
     const inflightSince = [...this.flights.values()].sort((a, b) => a - b);
@@ -406,10 +424,11 @@ export class SpeedStats {
     return {
       rows: top,
       recentCount: RECENT_COUNT,
+      recentModelCount: top.length,
       sampleTotal,
       inflightSince,
+      inflight: inflightSince,
       measuredTurnTTFB: null,
-      ...(rows.length > ROW_CAP ? { truncatedCount: rows.length - ROW_CAP } : {}),
     };
   }
 }
@@ -440,7 +459,10 @@ function parseUsage(line, cutoff) {
 
 /** 缺失字段省略（null/undefined 不进对象），照任务口径「字段名照抄，缺失省略」。 */
 function pruneRow(row) {
-  const out = { model: row.model, samples: row.samples };
+  const out = {
+    model: row.model, modelId: row.modelId, familyId: row.familyId, familyLabel: row.familyLabel,
+    samples: row.samples, tasks: row.tasks ?? [],
+  };
   if (row.ttft != null) out.ttft = row.ttft;
   if (row.rate != null) out.rate = row.rate;
   out.endToEnd = row.endToEnd;

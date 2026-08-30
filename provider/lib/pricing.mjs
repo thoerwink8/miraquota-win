@@ -49,13 +49,17 @@ export class Pricing {
   static #loadCache() {
     try {
       const root = JSON.parse(readFileSync(MODELS_CACHE, 'utf8'));
-      const models = root?.data?.anthropic?.models;
-      if (!models) return null;
       const out = {};
-      for (const [id, m] of Object.entries(models)) {
-        const c = m?.cost;
-        if (typeof c?.input !== 'number' || typeof c?.output !== 'number') continue;
-        out[id] = [c.input, c.output, c.cache_read ?? c.input * 0.1, c.cache_write ?? c.input * 1.25];
+      // Mirasim 官方 relay 会承载 Claude 与 GPT 等模型。Claude 价来自 anthropic，
+      // GPT 路由价来自 ai-router；同名冲突时后写不覆盖，最终内置官方表仍在构造器中最高优先。
+      for (const provider of ['anthropic', 'ai-router']) {
+        const models = root?.data?.[provider]?.models ?? {};
+        for (const [id, m] of Object.entries(models)) {
+          const c = m?.cost;
+          if (typeof c?.input !== 'number' || typeof c?.output !== 'number') continue;
+          if (out[id]) continue;
+          out[id] = [c.input, c.output, c.cache_read ?? c.input * 0.1, c.cache_write ?? c.input * 1.25];
+        }
       }
       return Object.keys(out).length ? out : null;
     } catch { return null; }

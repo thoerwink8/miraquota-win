@@ -19,8 +19,10 @@
  * 有请求在途时胶囊上的点跟着跳，收起状态下也看得出正在生成。
  *
  * v21 与桌面面板对齐信息层级：主行放精确值（本机账本直接求和），满额并列两个口径
- *     （标定法 / 点数反推），账号级折算值降到副行并带 ≈。
+ *     （官≈官方点数反推 / 预≈本机账本预测），账号级折算值降到副行并带 ≈。
  * v22 明确所有满额与余量美元都是推算值；收起状态的账号级金额也带 ≈。
+ * v23 将满额标签改为「官≈」（官方点数反推）与「预≈」（本机账本预测），并统一顺序。
+ * v24 跟随桌面端计费家族选择，为最近 5 种具体模型标出当前家族并展开最近 5 个任务。
  * v20 满额不可用时主行改用点数：兜底满额来自本机账本反推的每点美元，账本失真会把满额
  * 同倍放大，而卡面只有一个 `~` 前缀。provider 侧判出账本与点数不自洽即不再给 fullUSD，
  * 此时把账本支出抬到主行同样不可信，故主行取点数，账本留在副行。
@@ -33,7 +35,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 22;
+  const VERSION = 24;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -356,6 +358,12 @@
   .sp .dr.fast { color: var(--ok); background: var(--okbg); border-radius: 5px; padding: 0 4px; }
   .sp .n { margin-left: auto; flex: none; white-space: nowrap; color: var(--ink3);
     font-size: 9.5px; font-variant-numeric: tabular-nums; }
+  .sp { cursor: pointer; }
+  .sp .bill { flex: none; color: var(--accent); background: var(--accentbg); border-radius: 5px;
+    padding: 0 4px; font-size: 8.5px; white-space: nowrap; }
+  .sp-tasks { margin: 3px 0 5px 12px; padding-left: 7px; border-left: 1px solid var(--bd); }
+  .sp-task { display: grid; grid-template-columns: 42px 1fr auto; gap: 5px; font-size: 9px;
+    color: var(--ink3); line-height: 1.7; font-variant-numeric: tabular-nums; }
   .live { display: inline-flex; align-items: center; gap: 4px; font-size: 9.5px; color: var(--ok); font-weight: 600;
     background: var(--okbg); border-radius: 8px; padding: 2px 7px; }
   .pulse { width: 6px; height: 6px; border-radius: 3px; background: var(--ok); animation: mqPulse 1.2s ease-in-out infinite; }
@@ -906,13 +914,13 @@
       setVar(c.el, '--i', String(i));
       setText(c.wl, winTitle(w.label));
       // 主行放精确值（本机账本 token × 官方价直接求和，可与 Mirasim 流量监控逐笔核对）；
-      // 满额给出两个口径对照：标定法与官方口径法。与桌面面板保持同一套信息层级，
+      // 满额给出两个口径对照：官方点数反推与本机账本预测。与桌面面板保持同一套信息层级，
       // 两个显示面不各讲一套（用户 2026-08-28 要求内嵌与桌面端一致）。
       const headPoints = w.spentUSD == null && w.points;
       setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(w.spentUSD ?? 0));
       const cals = [];
-      if (w.fullUSD != null) cals.push('标≈' + usd(w.fullUSD));
-      if (w.fullUSDOfficial != null) cals.push('点≈' + usd(w.fullUSDOfficial) + (w.officialBiasedLow ? '⁻' : ''));
+      if (w.fullUSDOfficial != null) cals.push('官≈' + usd(w.fullUSDOfficial) + (w.officialBiasedLow ? '⁻' : ''));
+      if (w.fullUSD != null) cals.push('预≈' + usd(w.fullUSD));
       setText(c.full, cals.length ? '/ ' + cals.join(' · ') : '/ 满额标定中');
       setText(c.pc, (w.inferred ? '≈' : '') + pct(w.usedPercent));
       setTone(c.pc, 'pc', tone);
@@ -981,9 +989,14 @@
     if (r) return r;
     const el = document.createElement('div');
     el.className = 'sp';
-    el.innerHTML = `<span class="m"></span><span class="v"></span><span class="dr"></span><span class="n"></span>`;
+    el.innerHTML = `<span class="m"></span><span class="bill" hidden>当前计费</span><span class="v"></span><span class="dr"></span><span class="n"></span>`;
+    const tasks = document.createElement('div');
+    tasks.className = 'sp-tasks';
+    tasks.hidden = true;
+    el.after(tasks);
     r = { el, m: el.querySelector('.m'), v: el.querySelector('.v'),
-          dr: el.querySelector('.dr'), n: el.querySelector('.n') };
+          bill: el.querySelector('.bill'), dr: el.querySelector('.dr'), n: el.querySelector('.n'), tasks, open: false };
+    el.addEventListener('click', () => { r.open = !r.open; r.tasks.hidden = !r.open; });
     speedRows.set(model, r);
     return r;
   }
@@ -1009,7 +1022,7 @@
     } else {
       if (c.pulse) { c.tag.textContent = ''; c.tag.__v = undefined; c.pulse = null; }
       c.tag.style.color = 'var(--ink3)';
-      setText(c.tag, `最近 ${sp.recentCount} 次`);
+      setText(c.tag, `最近 ${(sp.rows || []).length} 种`);
     }
 
     const rows = sp.rows || [];
@@ -1018,23 +1031,34 @@
 
     const seen = new Set();
     rows.forEach((row, i) => {
-      seen.add(row.model);
-      const r = speedRowFor(row.model);
+      const rowKey = row.modelId || row.model;
+      seen.add(rowKey);
+      const r = speedRowFor(rowKey);
       setText(r.m, shortModel(row.model));
       r.m.title = row.model;
+      setHidden(r.bill, row.familyId !== d.billingFamily);
       // measured 为真时首 token 是逐请求实测值，不带 ≈；缺字段按回归行处理。
-      setText(r.v, row.rate == null ? `端到端 ${row.endToEnd.toFixed(0)} tok/s`
+      setText(r.v, row.rate == null ? `首 — · 端到端 ${Number(row.endToEnd || 0).toFixed(0)} tok/s`
         : (row.ttft != null ? `首 ${row.measured ? '' : '≈'}${row.ttft.toFixed(1)}s · ` : '') + `${row.rate.toFixed(0)} tok/s`);
       // 阈值由 provider 侧统一把关（SpeedRow.notableDrift），这里只显示给了值的那一档。
       const drift = row.driftNotable;
       setText(r.dr, drift == null ? '' : `${drift > 0 ? '快' : '慢'}${Math.abs(drift).toFixed(0)}%`);
       setTone(r.dr, 'dr', drift == null ? '' : drift > 0 ? 'fast' : 'slow');
       setTick(r.n, ago(row.latestAt));
-      const at = c.rows.children[i];
+      const rowTasks = row.tasks || [];
+      r.tasks.innerHTML = rowTasks.map((task, taskIndex) => {
+        const speed = task.rate == null ? '—' : `${task.rate.toFixed(0)} tok/s`;
+        const duration = task.durationMs == null ? '—' : `${(task.durationMs / 1000).toFixed(1)}s`;
+        const first = task.ttft == null ? '首 —' : `首 ≈${task.ttft.toFixed(1)}s`;
+        return `<div class="sp-task"><span>任务 ${taskIndex + 1} · 已完成</span><span>${first} · 端到端 ${speed} · ${duration}</span><span>${ago(task.at)}</span></div>`;
+      }).join('');
+      r.tasks.hidden = !r.open;
+      const at = c.rows.children[i * 2];
       if (at !== r.el) c.rows.insertBefore(r.el, at || null);
+      if (r.tasks.previousSibling !== r.el) r.el.after(r.tasks);
     });
     for (const [model, r] of speedRows) {
-      if (!seen.has(model)) { r.el.remove(); speedRows.delete(model); }
+      if (!seen.has(model)) { r.el.remove(); r.tasks.remove(); speedRows.delete(model); }
     }
   }
 

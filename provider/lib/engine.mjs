@@ -119,6 +119,17 @@ export class Engine {
     this.last = null;           // { at, limits }
     this.pointsTrail = {};
     this.everConnected = false;
+    this.selectedBillingFamily = opts.billingFamily ?? null;
+  }
+
+  setBillingFamily(id) {
+    this.selectedBillingFamily = typeof id === 'string' && id ? id : null;
+  }
+
+  #billingSelection() {
+    const families = this.ledger.billingFamilies();
+    const selected = families.find((f) => f.id === this.selectedBillingFamily) ?? families[0] ?? null;
+    return { families, selected };
   }
 
   /** speed 模块可选挂载：缺席或崩溃都不拖垮额度主线。 */
@@ -281,6 +292,7 @@ export class Engine {
     const limits = this.last.limits;
     const coherence = evaluateCoherence(limits.windows, this.ledger, now);
     const rate = coherence.perPoint;
+    const billing = this.#billingSelection();
 
     let calibDropped = 0;
     const windows = limits.windows.map((w) => {
@@ -289,6 +301,10 @@ export class Engine {
       const dur = windowDuration(w.label);
       const start = dur ? w.resetAt - dur : null;
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
+      const familySpentUSD = start == null || !billing.selected ? null
+        : group ? (billing.selected.id === 'claude'
+          ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : null)
+          : this.ledger.familySpent(start, now, billing.selected.id, { includeOpenMinute: true });
       const { fullUSD, confidence, sampleCount, dropped } = this.#fullOf(w.label, w.budget, group, rate);
       calibDropped += dropped;
       // 第二个口径：直接用官方百分比反推满额（本机账本$ ÷ 官方已用点数 × 预算点）。
@@ -301,6 +317,7 @@ export class Engine {
       return {
         label: w.label, usedPercent, inferred: false, confidence, sampleCount,
         spentUSD: spent,
+        ...(familySpentUSD != null ? { familySpentUSD } : {}),
         ...(dur != null ? { durationSeconds: dur } : {}),
         ...(fullUSDOfficial != null ? { fullUSDOfficial, officialBiasedLow: !!group } : {}),
         ...(exhaust ? { exhaust } : {}),
@@ -322,6 +339,11 @@ export class Engine {
       : limits.degraded ? '上游降级运行中' : null;
 
     const out = this.#base(level, this.last.at, windows);
+    out.billingFamilies = billing.families;
+    if (billing.selected) {
+      out.billingFamily = billing.selected.id;
+      out.billingFamilyLabel = billing.selected.label;
+    }
     if (rate != null) {
       out.unitPriceUSD = rate;
       // 公式素材：单价 = 基准窗账本支出 ÷ 同期已用点数；spread 是跨窗交叉校验的离散倍数
@@ -336,6 +358,7 @@ export class Engine {
 
   /** 锚点推算：窗口边界滚动 + 本机账本。同窗口期内以锚点百分比为基线（更准），滚动后纯本机口径。 */
   #reckonedPayload(now) {
+    const billing = this.#billingSelection();
     const windows = this.anchors.anchors.map((a) => {
       const rolled = AnchorStore.rollWindow(a, now);
       if (!rolled) return null;
@@ -352,12 +375,17 @@ export class Engine {
       }
       usedPercent = Math.min(100, usedPercent);
       const spentUSD = this.ledger.spent(rolled.start, now, { includeOpenMinute: true, group });
+      const familySpentUSD = !billing.selected ? null
+        : group ? (billing.selected.id === 'claude'
+          ? this.ledger.spent(rolled.start, now, { includeOpenMinute: true, group }) : null)
+          : this.ledger.familySpent(rolled.start, now, billing.selected.id, { includeOpenMinute: true });
       const dur = a.duration;
       const pace = Math.min(100, Math.max(0, (now - rolled.start) / dur * 100));
       return {
         label: a.label, usedPercent, inferred: true,
         confidence: est?.confidence ?? 'none', sampleCount: est?.observations ?? 0,
         spentUSD,
+        ...(familySpentUSD != null ? { familySpentUSD } : {}),
         ...(fullUSD != null ? {
           fullUSD,
           scaledSpentUSD: fullUSD * usedPercent / 100,
@@ -372,6 +400,8 @@ export class Engine {
     const ageMin = Math.round((now - this.anchors.capturedAt) / 60);
     const ageText = ageMin >= 60 ? `${(ageMin / 60).toFixed(1)} 小时` : `${ageMin} 分钟`;
     const out = this.#base('reckoned', this.anchors.capturedAt, windows);
+    out.billingFamilies = billing.families;
+    if (billing.selected) { out.billingFamily = billing.selected.id; out.billingFamilyLabel = billing.selected.label; }
     out.measured = false;
     out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见，实际用量可能更高`;
     return out;
@@ -379,18 +409,24 @@ export class Engine {
 
   /** 最后一级：滚动窗口报本机支出。 */
   #localPayload(now) {
+    const billing = this.#billingSelection();
     const windows = [['5h', 5 * 3600], ['7d', 7 * 86400]].map(([label, dur]) => {
       const spent = this.ledger.spent(now - dur, now, { includeOpenMinute: true });
+      const familySpentUSD = billing.selected
+        ? this.ledger.familySpent(now - dur, now, billing.selected.id, { includeOpenMinute: true }) : null;
       const est = this.calibrator.estimate(label, this.ledger);
       return {
         label, inferred: true,
         usedPercent: est?.fullUSD ? Math.min(100, spent / est.fullUSD * 100) : 0,
         confidence: est?.confidence ?? 'none', sampleCount: est?.observations ?? 0,
         spentUSD: spent,
+        ...(familySpentUSD != null ? { familySpentUSD } : {}),
         ...(est?.fullUSD ? { fullUSD: est.fullUSD } : {}),
       };
     });
     const out = this.#base('local', now, windows);
+    out.billingFamilies = billing.families;
+    if (billing.selected) { out.billingFamily = billing.selected.id; out.billingFamilyLabel = billing.selected.label; }
     out.measured = false;
     out.detail = this.everConnected
       ? '接口不可达且无窗口锚点，仅按本机滚动窗口统计支出'
