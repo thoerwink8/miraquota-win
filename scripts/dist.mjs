@@ -14,7 +14,7 @@ import { resolveVersion } from '../app/version.mjs';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** dist 里的历史安装包/blockmap：MiraQuota <版本>.exe、MiraQuota Setup <版本>.exe(.blockmap) */
-const OLD_ARTIFACT = /^MiraQuota(?: Setup)? [0-9.]+\\.exe(?:\\.blockmap)?$/;
+const OLD_ARTIFACT = /^MiraQuota(?: Setup)? [0-9.]+\.exe(?:\.blockmap)?$/;
 
 const args = process.argv.slice(2);
 const versionAt = args.indexOf('--version');
