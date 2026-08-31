@@ -146,21 +146,6 @@ export class Engine {
     };
   }
 
-  /**
-   * 窗口期用量走势（sparkline 素材）：取标定器落盘的点数轨迹（3 天保留、跨重启），
-   * 内存里的 pointsTrail 只有本进程启动后的几分钟，画出来是没有形状的斜线。
-   * 同一 resetAt 的样本抽稀到 ≤64 点。
-   */
-  #trailOf(w) {
-    const raw = this.calibrator.trail(w.label, w.resetAt);
-    if (raw.length < 2) return null;
-    const stride = Math.max(1, Math.ceil(raw.length / 64));
-    const out = [];
-    for (let i = 0; i < raw.length; i += stride) out.push(raw[i]);
-    if (out[out.length - 1] !== raw[raw.length - 1]) out.push(raw[raw.length - 1]);
-    return out.map((p) => ({ at: p.at, pct: Math.min(100, p.used / w.budget * 100) }));
-  }
-
   /** speed 模块可选挂载：缺席或崩溃都不拖垮额度主线。 */
   async loadSpeed() {
     try {
@@ -365,12 +350,10 @@ export class Engine {
       const eta = this.#eta(w, now);
       const exhaust = this.#exhaust(w, start, now, group);
       const breakdown = this.#familyBreakdown(start, now, group);
-      const trail = this.#trailOf(w);
       return {
         label: w.label, usedPercent, inferred: false, confidence, sampleCount,
         spentUSD: spent,
         ...(breakdown ?? {}),
-        ...(trail ? { trail } : {}),
         ...(dur != null ? { durationSeconds: dur } : {}),
         ...(fullUSDOfficial != null ? { fullUSDOfficial, officialBiasedLow: !!group } : {}),
         ...(exhaust ? { exhaust } : {}),

@@ -32,11 +32,10 @@ test('all model families show side by side instead of a picker', () => {
   assert.match(renderer, /w\.families/);
 });
 
-test('cards carry an activity rhythm chart, colored pace and exhaustion clock time', () => {
-  // 累计曲线读不出信息（用户 2026-08-31），图表必须是「消耗量分桶」而非累计线
-  assert.match(renderer, /function activityBars\(trail, budget\)/);
-  assert.doesNotMatch(renderer, /function sparkline/);
-  assert.match(renderer, /data-tip/);
+test('cards carry colored pace and exhaustion clock time, and no usage chart', () => {
+  // 图表两版都试过（累计线读不懂、节奏柱太占地），用户 2026-08-31 拍板彻底删除：
+  // 决策信息由省/快徽章 + 打满钟点 + 耗尽预演承担，卡片不再放走势图
+  assert.doesNotMatch(renderer, /function sparkline|activityBars/);
   assert.match(renderer, /pace-fast/);
   assert.match(renderer, /pace-save/);
   assert.match(renderer, /打满/);

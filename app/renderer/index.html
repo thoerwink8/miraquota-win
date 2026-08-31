@@ -123,30 +123,6 @@
   .pace-save { color: var(--ok); font-weight: 600; }
   .pace-even { color: var(--ink3); }
 
-  /* ---- 使用节奏柱状图：柱高＝该时段消耗点数，无柱＝空闲 ---- */
-  .acti { margin-top: 9px; }
-  .acti-bars { display: flex; align-items: flex-end; gap: 2px; height: 26px; }
-  .acti-bars .abar {
-    flex: 1; height: var(--h); min-height: 3px;
-    background: linear-gradient(180deg, var(--accent2), var(--accent));
-    opacity: .6; border-radius: 2px 2px 0 0;
-    transition: opacity .12s ease, transform .12s ease; transform-origin: bottom;
-  }
-  .acti-bars .abar.idle { height: 2.5px; background: var(--track); opacity: 1; border-radius: 1px; }
-  .acti-bars .abar:hover { opacity: 1; transform: scaleY(1.08); }
-  .acti-bars .abar.idle:hover { transform: none; }
-  .acti-cap { display: flex; justify-content: space-between; font-size: 10px; color: var(--ink3); margin-top: 3px; }
-
-  /* 自绘悬浮提示：跟随柱子，比原生 title 即时且不刺眼 */
-  #tip {
-    position: fixed; z-index: 99; pointer-events: none; white-space: nowrap;
-    background: var(--bg); border: .5px solid var(--bd); border-radius: 7px;
-    padding: 4px 9px; font-size: 10.5px; color: var(--ink);
-    box-shadow: 0 6px 20px rgba(0,0,0,.3);
-  }
-  #tip b { font-weight: 700; }
-  #tip[hidden] { display: none; }
-
   .card table { width: 100%; border-collapse: collapse; margin-top: 4px; }
   .card td { padding: 5px 0; font-size: 11px; color: var(--ink2); }
   .card td.m { font-weight: 600; color: var(--ink); white-space: nowrap; padding-right: 10px; }
@@ -254,7 +230,6 @@
       </div></div>
     </div>
   </div>
-  <div id="tip" hidden></div>
 
 <script>
   const $ = (id) => document.getElementById(id);
@@ -317,19 +292,6 @@
   // 速度模型行展开态：按模型 id 记住，避免每秒 render 整表重建后立刻合上
   const openSpeedModels = new Set();
 
-  // 柱状图悬浮提示：事件委托一次绑定，DOM 重建不失效
-  const tipEl = $('tip');
-  document.addEventListener('mouseover', (e) => {
-    const bar = e.target.closest?.('.abar');
-    if (!bar) { tipEl.hidden = true; return; }
-    tipEl.innerHTML = bar.dataset.tip;   // 内容为本页自产的时段与数字，无外部输入
-    tipEl.hidden = false;
-    const r = bar.getBoundingClientRect();
-    tipEl.style.left = Math.min(window.innerWidth - tipEl.offsetWidth - 8,
-      Math.max(8, r.left + r.width / 2 - tipEl.offsetWidth / 2)) + 'px';
-    tipEl.style.top = (r.top - tipEl.offsetHeight - 7) + 'px';
-  });
-
   function fmtReset(t) {
     if (t == null) return '';
     const left = Math.max(0, t - Date.now() / 1000);
@@ -350,40 +312,6 @@
     const r = 11, cx = 16, cy = 16;
     const x = cx + r * Math.sin(a), y = cy - r * Math.cos(a);
     $('logoArc').setAttribute('d', `M ${cx} ${cy - r} A ${r} ${r} 0 ${a > Math.PI ? 1 : 0} 1 ${x} ${y}`);
-  }
-
-  /**
-   * 使用节奏柱状图：把窗口期轨迹切成等宽时段，柱高＝该时段消耗的点数。
-   * 累计曲线只有「一直向上」一种形状读不出信息（用户 2026-08-31 指出）；
-   * 消耗量分桶后高柱＝密集干活、无柱＝空闲，一眼看出节奏。悬浮给该时段明细。
-   */
-  function activityBars(trail, budget) {
-    if (!trail || trail.length < 2 || !(budget > 0)) return '';
-    const t0 = trail[0].at, t1 = trail[trail.length - 1].at;
-    const span = t1 - t0;
-    if (span < 600) return '';   // 轨迹不足 10 分钟，分桶没意义
-    const N = 36;
-    const buckets = new Array(N).fill(0);
-    for (let i = 1; i < trail.length; i++) {
-      const d = (trail[i].pct - trail[i - 1].pct) / 100 * budget;
-      if (d <= 0) continue;
-      buckets[Math.min(N - 1, Math.floor((trail[i].at - t0) / span * N))] += d;
-    }
-    const max = Math.max(...buckets);
-    if (!(max > 0)) return '';
-    const step = span / N;
-    const hm = (sec) => { const d = new Date(sec * 1000); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
-    const md = (sec) => { const d = new Date(sec * 1000); return `${d.getMonth() + 1}/${d.getDate()} `; };
-    const cols = buckets.map((v, i) => {
-      const from = t0 + i * step, to = from + step;
-      const day = span > 86400 ? md(from) : '';
-      const tip = v > 0 ? `${day}${hm(from)}–${hm(to)} · 消耗 <b>${Math.round(v).toLocaleString()}</b> 点` : `${day}${hm(from)}–${hm(to)} · 空闲`;
-      return `<span class="abar${v > 0 ? '' : ' idle'}" style="--h:${v > 0 ? Math.max(10, v / max * 100).toFixed(1) : 0}%" data-tip="${esc(tip)}"></span>`;
-    }).join('');
-    const hours = span / 3600;
-    const spanText = hours >= 24 ? `${(hours / 24).toFixed(1)} 天` : `${hours.toFixed(1)} 小时`;
-    return `<div class="acti"><div class="acti-bars">${cols}</div>
-      <div class="acti-cap"><span>${span > 86400 ? md(t0) : ''}${hm(t0)}</span><span>使用节奏 · 近 ${spanText}</span><span>刚刚</span></div></div>`;
   }
 
   /** 均速偏离：快=照此提前打满（警示色），省=到期用不完（安全色）。 */
@@ -477,7 +405,6 @@
         <span class="r">${paceChip(w.paceDelta)} ${CONF[w.confidence] ?? ''}</span>
       </div>
       ${familyRow(w)}
-      ${activityBars(w.trail, w.points?.budget)}
     </div>`;
   }
   const fmtK = (n) => n >= 10000 ? Math.round(n / 1000) + 'k' : String(Math.round(n));
@@ -541,11 +468,7 @@
     $('detail').textContent = p.detail ?? '';
 
     const ws = p.windows ?? [];
-    // 悬浮卡片区（看柱状图明细）时暂停重建，否则每秒整体重绘会打断 hover；数据本身 5 秒一推不受影响
-    const cardsEl = $('cards');
-    if (!cardsEl.matches(':hover')) {
-      cardsEl.innerHTML = ws.length ? ws.map(windowCard).join('') : '<div class="empty">暂无额度数据</div>';
-    }
+    $('cards').innerHTML = ws.length ? ws.map(windowCard).join('') : '<div class="empty">暂无额度数据</div>';
     drawArc(ws.find((w) => w.label === '5h')?.usedPercent ?? 0);
 
     const sims = ws.map((w) => simWindow(w, p.unitPriceUSD)).filter(Boolean);
