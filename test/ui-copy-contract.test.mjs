@@ -32,8 +32,11 @@ test('all model families show side by side instead of a picker', () => {
   assert.match(renderer, /w\.families/);
 });
 
-test('cards carry sparkline, colored pace and exhaustion clock time', () => {
-  assert.match(renderer, /function sparkline\(trail\)/);
+test('cards carry an activity rhythm chart, colored pace and exhaustion clock time', () => {
+  // 累计曲线读不出信息（用户 2026-08-31），图表必须是「消耗量分桶」而非累计线
+  assert.match(renderer, /function activityBars\(trail, budget\)/);
+  assert.doesNotMatch(renderer, /function sparkline/);
+  assert.match(renderer, /data-tip/);
   assert.match(renderer, /pace-fast/);
   assert.match(renderer, /pace-save/);
   assert.match(renderer, /打满/);
