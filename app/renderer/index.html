@@ -226,6 +226,7 @@
         　两者接近＝账本与点数自洽，可放心用；分歧大＝至少一侧失真（多机同时用、或账本尚未回填）。带 ⁻ 号表示该窗口是模型档位窗，分桶自档位声明起才累积，此口径系统性偏低。<br>
         <b>美元性质</b>：按官方 API 价折算的等价估值，不是订阅账单——订阅按窗口额度计费，不按 token 扣款。<br>
         <b>分家族</b>：窗口卡末行按模型家族（Claude / GPT …）拆分。美元＝该家族账本实测；点数＝官方点数增量按同期各家族账本美元占比归因（增量静置 5 分钟等 relay 回填 token 再分摊）。同期无任何账本支出的增量记「未归因」（他机用量）。点数归因自本版部署起累积，更早的用量拆不出家族。<br>
+        <b>今天</b>：自然日 0 点起。点数＝官方点数增量逐段累加（账号级，含其他设备；本机停机时段按前后差值补账，重置瞬间跨越的一小段宁漏勿错）；美元＝本机账本。两者口径不同，不能互相换算核对。<br>
         <b>多机</b>：本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本。标定对此有两道防线——检测到他机活跃段整段剔除，聚合取中位数。
       </div></div>
     </div>
@@ -409,6 +410,39 @@
   }
   const fmtK = (n) => n >= 10000 ? Math.round(n / 1000) + 'k' : String(Math.round(n));
 
+  /**
+   * 「今天」摘要卡（自然日 0 点起）：官方窗口都是滚动窗，回答不了「今天用了多少」。
+   * 点数＝官方 used 增量逐段累加（账号级，含他机）；美元＝本机账本；≈$ 为单价换算推断。
+   */
+  function todayCard(t) {
+    if (!t) return '';
+    const famBits = (t.families ?? []).map((f) =>
+      `<b>${esc(f.label)}</b> ${MODE === 'pts' && f.points != null ? fmtK(f.points) + ' 点' : money(f.usd)}`);
+    if (MODE === 'pts' && t.unattributedPoints >= 1) famBits.push(`未归因 ${fmtK(t.unattributedPoints)} 点`);
+    let mainText, mainTitle, subBits;
+    if (MODE === 'pts') {
+      mainText = Math.round(t.points).toLocaleString();
+      mainTitle = '今天 0 点起官方点数增量逐段累加，账号级（含其他设备）；本机停机时段按前后差值补账';
+      const est = latest?.unitPriceUSD != null && t.points > 0 ? `<span class="full"> ≈${money(t.points * latest.unitPriceUSD, 0)}</span>` : '';
+      mainText += `<span class="full"> 点${est}</span>`;
+      subBits = [`本机账本 ${money(t.usd ?? 0)}`, ...famBits];
+    } else {
+      mainText = money(t.usd ?? 0);
+      mainTitle = '今天 0 点起的本机账本花费：token × API 价直接求和（其他设备不计入）';
+      subBits = [`账号 ${Math.round(t.points).toLocaleString()} 点`, ...famBits];
+    }
+    return `<div class="card">
+      <div class="head">
+        <span class="label">今天</span>
+        <span class="money" title="${mainTitle}">${mainText}</span>
+      </div>
+      <div class="row">
+        <span>${subBits.join(' · ')}</span>
+        <span class="r">0:00 起</span>
+      </div>
+    </div>`;
+  }
+
   // ---- 耗尽预演 ----
   const HOURS_KEY = 'miraquota.hoursPerDay';
   function hoursPerDay() {
@@ -468,7 +502,9 @@
     $('detail').textContent = p.detail ?? '';
 
     const ws = p.windows ?? [];
-    $('cards').innerHTML = ws.length ? ws.map(windowCard).join('') : '<div class="empty">暂无额度数据</div>';
+    $('cards').innerHTML = ws.length
+      ? ws.map(windowCard).join('') + todayCard(p.today)
+      : '<div class="empty">暂无额度数据</div>';
     drawArc(ws.find((w) => w.label === '5h')?.usedPercent ?? 0);
 
     const sims = ws.map((w) => simWindow(w, p.unitPriceUSD)).filter(Boolean);

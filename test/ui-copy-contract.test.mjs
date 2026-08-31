@@ -24,6 +24,13 @@ test('full-dollar labels distinguish official points from local prediction', () 
   assert.match(widget, /cals\.push\('预≈' \+ usd\(w\.fullUSD\)/);
 });
 
+test('a today card answers daily usage that rolling windows cannot', () => {
+  // 官方只有滚动窗，「今天用了多少」是用户明确要的参考值（2026-08-31）
+  assert.match(renderer, /function todayCard\(t\)/);
+  assert.match(renderer, /todayCard\(p\.today\)/);
+  assert.match(renderer, /0:00 起/);
+});
+
 test('all model families show side by side instead of a picker', () => {
   // 家族选择器已删（用户 2026-08-31：应该都统计，不是选谁看谁）；卡片直接列全家族明细
   assert.doesNotMatch(renderer, /id="billingFamily"/);

@@ -455,6 +455,31 @@ export class Engine {
     return out;
   }
 
+  /**
+   * 「今天」摘要（自然日 0 点起）：官方窗口没有日口径，这里用官方点数增量逐段累加补上。
+   * 点数取非档位、周期最长的窗（7d）——重置最少，consumedPoints 的停机补账最完整；
+   * 点数是账号级（含他机），美元是本机账本，两者口径不同，展示时分开标。
+   */
+  #todaySummary(now) {
+    const midnight = new Date(now * 1000);
+    midnight.setHours(0, 0, 0, 0);
+    const from = midnight.getTime() / 1000;
+    const base = Object.keys(this.calibrator.points).filter((l) => !modelGroup(l))
+      .sort((a, b) => (windowDuration(b) ?? 0) - (windowDuration(a) ?? 0))[0];
+    const points = base ? this.calibrator.consumedPoints(base, from) : 0;
+    const usd = this.ledger.spent(from, now, { includeOpenMinute: true });
+    const families = this.ledger.familyIds().map((id) => {
+      const fUsd = this.ledger.familySpent(from, now, id, { includeOpenMinute: true });
+      const fPts = this.pointsAttrib.familyPoints(from, now, id);
+      return { id, label: familyLabel(id), usd: fUsd, ...(fPts >= 0.5 ? { points: fPts } : {}) };
+    }).filter((r) => r.usd > 0.005 || r.points != null).sort((a, b) => b.usd - a.usd);
+    const unattributed = this.pointsAttrib.unattributedPoints(from, now);
+    return {
+      from, points, usd, families,
+      ...(unattributed >= 0.5 ? { unattributedPoints: unattributed } : {}),
+    };
+  }
+
   #fullOf(label, budget, group, rate) {
     const est = this.calibrator.estimate(label, this.ledger, budget, group);
     const dropped = est?.foreignDropped ?? 0;
@@ -476,6 +501,7 @@ export class Engine {
       pricing: this.pricing.source,
       buckets: this.ledger.bucketCount,
       windows,
+      today: this.#todaySummary(Date.now() / 1000),
       speed: this.#speedReport(),
     };
   }
