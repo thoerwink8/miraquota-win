@@ -78,43 +78,7 @@
     line-height: 1.5;
   }
   .mode button.on { background: var(--accentbg); color: var(--accent); }
-  .family {
-    -webkit-app-region: no-drag; position: relative; margin: 0 0 8px 6px;
-    display: flex; min-width: 90px; max-width: 130px;
-    background: var(--card); border: .5px solid var(--cardbd); border-radius: 9px; padding: 2px;
-  }
-  .family-btn {
-    width: 100%; display: flex; align-items: center; gap: 4px;
-    border: 0; border-radius: 7px; padding: 5px 7px 5px 9px;
-    background: transparent; color: var(--ink2); font: inherit; font-size: 11.5px; font-weight: 600;
-    line-height: 1.5; cursor: pointer; text-align: left;
-  }
-  .family-btn:hover:not(:disabled) { background: var(--cardhi); color: var(--ink); }
-  .family-btn:disabled { opacity: .45; cursor: default; }
-  .family.open .family-btn { background: var(--accentbg); color: var(--accent); }
-  .family-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .family-caret {
-    flex: none; color: inherit; opacity: .55; font-size: 11.5px; font-weight: 600;
-    line-height: 1; transition: transform .15s ease;
-  }
-  .family.open .family-caret { opacity: 1; transform: rotate(180deg); }
-  .family-menu {
-    position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 30;
-    min-width: 100%; width: max-content; max-width: 180px;
-    /* 必须用不透明底，半透明 --card 会让下方卡片穿模 */
-    background: var(--bg); border: .5px solid var(--cardbd); border-radius: 9px; padding: 2px;
-    box-shadow: 0 10px 28px rgba(0,0,0,.28);
-  }
-  .family-menu[hidden] { display: none; }
-  .family-menu button {
-    display: block; width: 100%; border: 0; border-radius: 7px; padding: 5px 9px;
-    background: transparent; color: var(--ink2); font: inherit; font-size: 11.5px; font-weight: 600;
-    line-height: 1.5; cursor: pointer; text-align: left;
-  }
-  .family-menu button:hover { background: var(--cardhi); color: var(--ink); }
-  .family-menu button.on { background: var(--accentbg); color: var(--accent); }
-  /* 整条工具栏抬到内容之上，避免每秒重绘卡片时盖住下拉 */
-  .bars { position: relative; z-index: 20; display: flex; align-items: stretch; margin: 0 14px; }
+  .bars { display: flex; align-items: stretch; margin: 0 14px; }
 
   /* ---- 内容 ---- */
   /* 面板型软件：不出现滚动条；超高内容裁掉，用户可拉高窗口 */
@@ -133,9 +97,10 @@
     box-shadow: inset 0 .5px 0 rgba(255,255,255,.04);
     padding: 11px 13px; margin-bottom: 9px;
   }
-  .card .head { display: flex; align-items: baseline; gap: 8px; }
-  .card .label { font-size: 11.5px; color: var(--ink2); font-weight: 600; }
-  .card .money { margin-left: auto; font-size: 19px; font-weight: 700; letter-spacing: -.3px; }
+  /* 头行整块不在词中间断行：放不下时「金额+满额」整体换到下一行（wrap 落点干净） */
+  .card .head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+  .card .label { font-size: 11.5px; color: var(--ink2); font-weight: 600; white-space: nowrap; }
+  .card .money { margin-left: auto; font-size: 19px; font-weight: 700; letter-spacing: -.3px; white-space: nowrap; }
   .card .full { font-size: 13px; color: var(--ink2); font-weight: 500; }
   .card .full b { font-weight: 700; color: var(--ink); }
   .card .full .tag { font-size: 11px; color: var(--ink3); font-weight: 600; margin-right: 1px; }
@@ -151,19 +116,28 @@
   .row { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--ink2); margin-top: 4px; }
   .row .r { color: var(--ink3); }
   .row b { font-weight: 600; color: var(--ink); }
+  /* 分家族明细行：略小半级、更收敛，读起来是卡片的注脚而非并列信息 */
+  .row.fam { font-size: 11px; color: var(--ink3); }
+  .row.fam b { font-weight: 600; color: var(--ink2); }
+  .spark { flex: none; margin-left: 6px; opacity: .85; align-self: center; }
+  .pace-fast { color: var(--warn); font-weight: 600; }
+  .pace-save { color: var(--ok); font-weight: 600; }
+  .pace-even { color: var(--ink3); }
 
-  .card table { width: 100%; border-collapse: collapse; margin-top: 6px; }
-  .card td { padding: 3px 0; font-size: 11px; color: var(--ink2); }
+  .card table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  .card td { padding: 5px 0; font-size: 11px; color: var(--ink2); }
   .card td.m { font-weight: 600; color: var(--ink); white-space: nowrap; padding-right: 10px; }
   .card td.t { text-align: right; color: var(--ink3); white-space: nowrap; }
   .model-main { cursor: pointer; }
-  .model-main:hover { background: var(--cardhi); }
-  .model-main td:first-child::before { content: '›'; display: inline-block; width: 12px; color: var(--ink3); }
-  .model-main.open td:first-child::before { content: '⌄'; }
-  .billing-tag { color: var(--accent); background: var(--accentbg); border-radius: 99px;
-    padding: 1px 6px; font-size: 9.5px; margin-left: 5px; white-space: nowrap; }
-  .task-row td { background: var(--card); color: var(--ink3); font-size: 10.5px; padding: 3px 5px; }
-  .task-row td:first-child { padding-left: 20px; }
+  .model-main:hover td { background: var(--cardhi); }
+  .model-main td { border-top: .5px solid var(--cardbd); }
+  .model-main:first-child td { border-top: 0; }
+  /* 展开指示放行尾（macOS 列表习惯），行首不占宽 */
+  .model-main td.t::after { content: '›'; display: inline-block; margin-left: 7px; color: var(--ink3);
+    transition: transform .15s ease; }
+  .model-main.open td.t::after { transform: rotate(90deg); }
+  .task-row td { color: var(--ink3); font-size: 10.5px; padding: 2px 0; border: 0; }
+  .task-row td:first-child { padding-left: 10px; }
   .drift-up { color: var(--ok); }
   .drift-down { color: var(--bad); }
   .inflight { font-size: 11px; color: var(--accent); margin-top: 6px; }
@@ -214,13 +188,6 @@
       <button id="tabSim">耗尽预演</button>
       <button id="tabSpec">口径说明</button>
     </div>
-    <div class="family" id="billingFamilyWrap" title="按本机实际使用过的官方云端模型家族归集美元花费">
-      <button type="button" class="family-btn" id="billingFamily" aria-label="计费模型家族" aria-haspopup="listbox" aria-expanded="false" disabled>
-        <span class="family-label" id="familyLabel">计费模型</span>
-        <span class="family-caret" aria-hidden="true">▾</span>
-      </button>
-      <div class="family-menu" id="familyMenu" role="listbox" hidden></div>
-    </div>
     <div class="mode" title="统计口径：点数（账号级标准）或美元（本机 API 等价估值）">
       <button id="modeUsd">$</button>
       <button id="modePts" class="on">点</button>
@@ -259,6 +226,7 @@
         　·「<b>点数反推</b>」直接用账号级已用点数反推：本机账本$ ÷ 已用点数 × 预算点，使用官方点数但不是云端美元账单。<br>
         　两者接近＝账本与点数自洽，可放心用；分歧大＝至少一侧失真（多机同时用、或账本尚未回填）。带 ⁻ 号表示该窗口是模型档位窗，分桶自档位声明起才累积，此口径系统性偏低。<br>
         <b>美元性质</b>：按官方 API 价折算的等价估值，不是订阅账单——订阅按窗口额度计费，不按 token 扣款。<br>
+        <b>分家族</b>：窗口卡末行按模型家族（Claude / GPT …）拆分。美元＝该家族账本实测；点数＝官方点数增量按同期各家族账本美元占比归因（增量静置 5 分钟等 relay 回填 token 再分摊）。同期无任何账本支出的增量记「未归因」（他机用量）。点数归因自本版部署起累积，更早的用量拆不出家族。<br>
         <b>多机</b>：本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本。标定对此有两道防线——检测到他机活跃段整段剔除，聚合取中位数。
       </div></div>
     </div>
@@ -322,51 +290,6 @@
   $('modePts').onclick = () => switchMode('pts');
   if (MODE === 'pts') { $('modeUsd').classList.remove('on'); $('modePts').classList.add('on'); }
 
-  const familyBtn = $('billingFamily');
-  const familyMenu = $('familyMenu');
-  const familyWrap = $('billingFamilyWrap');
-  let familyOptions = [];
-  let familyValue = '';
-
-  function paintFamily() {
-    const current = familyOptions.find((f) => f.id === familyValue);
-    $('familyLabel').textContent = current?.label || (familyOptions.length ? familyOptions[0].label : '计费模型');
-    familyBtn.disabled = !familyOptions.length;
-    familyBtn.setAttribute('aria-expanded', familyWrap.classList.contains('open') ? 'true' : 'false');
-    familyMenu.innerHTML = familyOptions.map((f) =>
-      `<button type="button" role="option" data-id="${esc(f.id)}" class="${f.id === familyValue ? 'on' : ''}" aria-selected="${f.id === familyValue ? 'true' : 'false'}">${esc(f.label)}</button>`
-    ).join('');
-    familyMenu.querySelectorAll('button').forEach((btn) => {
-      btn.onclick = async () => {
-        closeFamily();
-        if (btn.dataset.id === familyValue) return;
-        familyValue = btn.dataset.id;
-        paintFamily();
-        const p = await window.miraquota.setBillingFamily?.(familyValue);
-        if (p) { latest = p; render(p); }
-      };
-    });
-  }
-  function closeFamily() {
-    const wasOpen = familyWrap.classList.contains('open');
-    familyWrap.classList.remove('open');
-    familyMenu.hidden = true;
-    familyBtn.setAttribute('aria-expanded', 'false');
-    // 展开期间暂停了整页重绘，收起后立刻用最新数据补一帧
-    if (wasOpen && latest) render(latest);
-  }
-  function toggleFamily() {
-    if (familyBtn.disabled) return;
-    const open = !familyWrap.classList.contains('open');
-    familyWrap.classList.toggle('open', open);
-    familyMenu.hidden = !open;
-    familyBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-  }
-  function familyOpen() { return familyWrap.classList.contains('open'); }
-  familyBtn.onclick = (e) => { e.stopPropagation(); toggleFamily(); };
-  document.addEventListener('click', (e) => { if (!familyWrap.contains(e.target)) closeFamily(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFamily(); });
-
   // 速度模型行展开态：按模型 id 记住，避免每秒 render 整表重建后立刻合上
   const openSpeedModels = new Set();
 
@@ -392,13 +315,65 @@
     $('logoArc').setAttribute('d', `M ${cx} ${cy - r} A ${r} ${r} 0 ${a > Math.PI ? 1 : 0} 1 ${x} ${y}`);
   }
 
+  /**
+   * 窗口期用量走势。纵轴按轨迹范围归一让形状可见（平台期＝空闲、陡坡＝干活），
+   * 但归一下限压在 2 个百分点：增长不足预算 2% 时画近平线，不把噪声放大成假斜坡。
+   */
+  function sparkline(trail) {
+    if (!trail || trail.length < 2) return '';
+    const W = 44, H = 14, P = 1.5;
+    const t0 = trail[0].at, span = Math.max(1, trail[trail.length - 1].at - t0);
+    let lo = Infinity, hi = -Infinity;
+    for (const p of trail) { if (p.pct < lo) lo = p.pct; if (p.pct > hi) hi = p.pct; }
+    const range = Math.max(hi - lo, 2);
+    const hours = span / 3600;
+    const spanText = hours >= 24 ? `${(hours / 24).toFixed(1)} 天` : `${hours.toFixed(1)} 小时`;
+    const pts = trail.map((p) =>
+      `${(P + (p.at - t0) / span * (W - 2 * P)).toFixed(1)},${(H - P - (p.pct - lo) / range * (H - 2 * P)).toFixed(1)}`).join(' ');
+    return `<span class="spark" title="本窗口期近 ${spanText} 的用量走势（平＝空闲，陡＝密集使用）"><svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><polyline points="${pts}" fill="none" stroke="var(--ok)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg></span>`;
+  }
+
+  /** 均速偏离：快=照此提前打满（警示色），省=到期用不完（安全色）。 */
+  function paceChip(delta) {
+    if (delta == null) return '';
+    if (Math.abs(delta) < 1) return '<span class="pace-even">匀速</span>';
+    return delta > 0
+      ? `<span class="pace-fast" title="用量进度超前时间进度 ${delta.toFixed(1)}%，照此节奏会提前打满">快 ${delta.toFixed(0)}%</span>`
+      : `<span class="pace-save" title="用量进度落后时间进度 ${Math.abs(delta).toFixed(1)}%，照此节奏到期用不完">省 ${Math.abs(delta).toFixed(0)}%</span>`;
+  }
+
+  /** 打满时刻：24 小时内给钟点（对表就能安排工作），更远给天数。 */
+  function etaText(sec) {
+    if (sec < 86400) {
+      const d = new Date(Date.now() + sec * 1000);
+      return `≈${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} 打满`;
+    }
+    return `≈${(sec / 86400).toFixed(1)} 天后打满`;
+  }
+
+  /** 分家族明细行：只在窗口里出现过第二个家族时才占一行，单家族时总数就是它。 */
+  function familyRow(w) {
+    const fams = w.families ?? [];
+    if (fams.length < 2) return '';
+    const bits = fams.map((f) => {
+      const pts = MODE === 'pts' && f.points != null ? `${fmtK(f.points)} 点` : null;
+      return `<b>${esc(f.label)}</b> ${pts ?? money(f.usd)}`;
+    });
+    if (w.familyPointsUnattributed >= 1 && MODE === 'pts') bits.push(`未归因 ${fmtK(w.familyPointsUnattributed)} 点`);
+    const partial = MODE === 'pts' && w.familyPointsPartial ? '；点数归因自部署起累积，窗口早段未覆盖，偏低' : '';
+    return `<div class="row fam" title="分家族实测：美元＝各家族账本 token × API 价；点数＝官方点数增量按同期账本占比归因${partial}"><span>${bits.join(' · ')}</span></div>`;
+  }
+
   function windowCard(w) {
     const name = WINDOW_NAME[w.label] ?? w.label;
     const mark = w.inferred ? '≈' : '';
     const hot = w.paceDelta != null && w.paceDelta > 0;
     const eta = w.etaSeconds != null
-      ? (w.resetAt != null && w.etaSeconds > w.resetAt - Date.now() / 1000 ? '到重置不满' : `≈${(w.etaSeconds / 86400 >= 1 ? (w.etaSeconds / 86400).toFixed(1) + ' 天' : (w.etaSeconds / 3600).toFixed(1) + ' 小时')}后打满`)
+      ? (w.resetAt != null && w.etaSeconds > w.resetAt - Date.now() / 1000 ? '到重置不满' : etaText(w.etaSeconds))
       : '';
+    // 跨天窗口给日均（已经历的天数摊）；不足半天不给，样本太薄
+    const elapsedDays = w.durationSeconds != null && w.pacePercent > 0
+      ? w.durationSeconds * w.pacePercent / 100 / 86400 : null;
 
     let mainText, fullText, remainText, subBits, mainTitle;
     if (MODE === 'pts' && w.points) {
@@ -408,17 +383,14 @@
       remainText = `余 ${Math.round(w.points.budget - w.points.used).toLocaleString()} 点`;
       mainTitle = '原始额度点，来自 Mirasim /v1/limits，账号级权威口径';
       subBits = [`本机合计 ${money(w.spentUSD ?? 0)}`];
-      if (w.familySpentUSD != null) subBits.unshift(`${latest?.billingFamilyLabel ?? '当前模型'}花费 ${money(w.familySpentUSD)}`);
-      else if (w.modelGroup) subBits.unshift(`${latest?.billingFamilyLabel ?? '当前模型'}不适用于此专属窗`);
+      if (elapsedDays >= 0.5) subBits.push(`日均 ${fmtK(w.points.used / elapsedDays)} 点`);
       if (w.scaledSpentUSD != null) subBits.push(`账号折算 ≈${money(w.scaledSpentUSD)}`);
     } else {
-      // 美元口径：主行放**精确值**——本机账本 token × 官方价直接求和，
+      // 美元口径：主行放**精确值**——本机账本 token × 官方价直接求和（全家族合计），
       // 与 Mirasim「流量监控 → 估算成本」列同源可逐笔核对，零推断。
       // 「满额/余」由汇率反推，属推断值，一律带 ≈ 并降到副行（用户 2026-08-28 指出主次颠倒）。
-      mainText = money(w.familySpentUSD ?? w.spentUSD ?? 0);
-      mainTitle = w.familySpentUSD != null
-        ? `${latest?.billingFamilyLabel ?? '本机'}模型家族实际花费：该家族账本 token × API 价直接求和`
-        : `${w.modelGroup ?? '本机'}专属窗口实际花费；当前选择的模型家族不适用于此窗`;
+      mainText = money(w.spentUSD ?? 0);
+      mainTitle = '本机账本实际花费：token × API 价直接求和（全家族合计）';
       // 主行「/ 之后」直接摆两个满额口径——那个位置原先重复了右侧的百分比徽章
       // （用户 2026-08-28 指出重叠且该位置应给满额）。
       const cals = [];
@@ -429,12 +401,13 @@
       if (w.remainingUSD != null) infer.push(`余 <b>${money(w.remainingUSD, 0)}</b>`);
       if (w.scaledSpentUSD != null) infer.push(`账号级已用 <b>${money(w.scaledSpentUSD)}</b>`);
       remainText = infer.length ? `推算 ${infer.join(' · ')}` : '';
-      subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`, `本机合计 ${money(w.spentUSD ?? 0)}`] : [];
+      subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`] : [];
+      if (elapsedDays >= 0.5) subBits.push(`日均 ${money((w.spentUSD ?? 0) / elapsedDays)}`);
     }
 
     return `<div class="card">
       <div class="head">
-        <span class="label">${name}</span>
+        <span class="label">${name}</span>${sparkline(w.trail)}
         <span class="money" title="${mainTitle}">${mainText}<span class="full" title="满额两口径：官≈为官方点数反推，预≈为本机账本预测；两者都不是云端美元账单">${fullText}</span></span>
         <span class="pct">${mark}${w.usedPercent.toFixed(1)}%</span>
       </div>
@@ -448,8 +421,9 @@
       </div>
       <div class="row">
         <span>${subBits.join(' · ')}</span>
-        <span class="r">${w.paceDelta != null ? '均速 ' + (w.paceDelta >= 0 ? '+' : '') + w.paceDelta.toFixed(1) + '%' : ''} ${CONF[w.confidence] ?? ''}</span>
+        <span class="r">${paceChip(w.paceDelta)} ${CONF[w.confidence] ?? ''}</span>
       </div>
+      ${familyRow(w)}
     </div>`;
   }
   const fmtK = (n) => n >= 10000 ? Math.round(n / 1000) + 'k' : String(Math.round(n));
@@ -507,28 +481,12 @@
 
   function render(p) {
     if (!p) return;
-    // 下拉展开时整页重绘会重建卡片层，半秒内把菜单盖住/看起来像收回——展开期间只更新标题徽章
-    if (familyOpen()) {
-      const st = $('state');
-      st.textContent = p.stateLabel ?? '—';
-      st.className = 'badge ' + (p.state ?? '');
-      return;
-    }
     const st = $('state');
     st.textContent = p.stateLabel ?? '—';
     st.className = 'badge ' + (p.state ?? '');
     $('detail').textContent = p.detail ?? '';
 
     const ws = p.windows ?? [];
-    const families = p.billingFamilies ?? [];
-    const familyKey = families.map((f) => `${f.id}:${f.label}`).join('|');
-    const nextValue = p.billingFamily || families[0]?.id || '';
-    if (familyBtn.dataset.key !== familyKey || familyValue !== nextValue) {
-      familyBtn.dataset.key = familyKey;
-      familyOptions = families;
-      familyValue = nextValue;
-      paintFamily();
-    }
     $('cards').innerHTML = ws.length ? ws.map(windowCard).join('') : '<div class="empty">暂无额度数据</div>';
     drawArc(ws.find((w) => w.label === '5h')?.usedPercent ?? 0);
 
@@ -549,14 +507,17 @@
       for (const id of [...openSpeedModels]) if (!alive.has(id)) openSpeedModels.delete(id);
       $('speedRows').innerHTML = sp.rows.map((r, rowIndex) => {
         const drift = r.driftNotable != null
-          ? `<span class="${r.driftNotable >= 0 ? 'drift-up' : 'drift-down'}">${r.driftNotable >= 0 ? '+' : ''}${r.driftNotable.toFixed(0)}%</span>` : '';
-        const current = r.familyId === p.billingFamily ? '<span class="billing-tag">当前计费</span>' : '';
+          ? `<span class="${r.driftNotable >= 0 ? 'drift-up' : 'drift-down'}">${r.driftNotable >= 0 ? '快' : '慢'} ${Math.abs(r.driftNotable).toFixed(0)}%</span>` : '';
         const open = openSpeedModels.has(r.model);
+        // 有回归结果给「首字 + 出字」；只有端到端时不再堆「首 —」占位，直接给端到端
+        const metric = r.rate != null
+          ? `${r.ttft != null ? '首字 ≈' + r.ttft.toFixed(1) + 's · ' : ''}${r.rate.toFixed(0)} tok/s`
+          : `端到端 ${Number(r.endToEnd ?? 0).toFixed(0)} tok/s`;
         const tasks = (r.tasks ?? []).map((task, taskIndex) => `<tr class="task-row task-for-${rowIndex}" style="display:${open ? '' : 'none'}">
-          <td>任务 ${taskIndex + 1} · 已完成</td><td>${task.ttft != null ? '首 ≈' + task.ttft.toFixed(1) + 's' : '首 —'} · ${task.rate != null ? '端到端 ' + task.rate.toFixed(0) + ' tok/s' : '速度 —'} · ${task.durationMs != null ? (task.durationMs / 1000).toFixed(1) + 's' : '耗时 —'}</td><td class="t">${ago(task.at)}</td></tr>`).join('');
+          <td>任务 ${taskIndex + 1}</td><td>${task.rate != null ? task.rate.toFixed(0) + ' tok/s' : '—'} · ${task.durationMs != null ? (task.durationMs / 1000).toFixed(1) + 's' : '—'}</td><td class="t">${ago(task.at)}</td></tr>`).join('');
         return `<tr class="model-main${open ? ' open' : ''}" data-row="${rowIndex}" data-model="${esc(r.model)}">
-          <td class="m">${esc(r.model)}${current}</td>
-          <td>${r.ttft != null ? '首 ≈' + r.ttft.toFixed(1) + 's' : '首 —'} ${r.rate != null ? '· ' + r.rate.toFixed(0) + ' tok/s' : '· 端到端 ' + Number(r.endToEnd ?? 0).toFixed(0) + ' tok/s'} ${drift}</td>
+          <td class="m">${esc(r.model)}</td>
+          <td>${metric} ${drift}</td>
           <td class="t">${ago(r.latestAt)}</td>
         </tr>${tasks}`;
       }).join('');

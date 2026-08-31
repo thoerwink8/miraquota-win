@@ -12,6 +12,8 @@ import { execFile } from 'node:child_process';
 
 import { Pricing } from './pricing.mjs';
 import { CostLedger } from './ledger.mjs';
+import { PointsAttributor } from './points-attrib.mjs';
+import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
 import { evaluateCoherence, coherenceNotice } from './coherence.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
@@ -112,6 +114,7 @@ export class Engine {
     this.opts = opts;
     this.pricing = new Pricing();
     this.ledger = new CostLedger(this.pricing);
+    this.pointsAttrib = new PointsAttributor();
     this.calibrator = new Calibrator();
     this.anchors = new AnchorStore();
     this.speed = null;
@@ -119,17 +122,43 @@ export class Engine {
     this.last = null;           // { at, limits }
     this.pointsTrail = {};
     this.everConnected = false;
-    this.selectedBillingFamily = opts.billingFamily ?? null;
   }
 
-  setBillingFamily(id) {
-    this.selectedBillingFamily = typeof id === 'string' && id ? id : null;
+  /**
+   * 窗口期内的全家族明细：美元来自账本家族分桶，点数来自增量归因（都是实测口径）。
+   * 模型档位窗（fable 等）本身就属于单一家族，官方点数即该家族点数，不出列表。
+   */
+  #familyBreakdown(start, now, group) {
+    if (start == null || group) return null;
+    const rows = this.ledger.familyIds().map((id) => {
+      const usd = this.ledger.familySpent(start, now, id, { includeOpenMinute: true });
+      const points = this.pointsAttrib.familyPoints(start, now, id);
+      return { id, label: familyLabel(id), usd, ...(points >= 0.5 ? { points } : {}) };
+    }).filter((r) => r.usd > 0.005 || r.points != null)
+      .sort((a, b) => b.usd - a.usd);
+    if (!rows.length) return null;
+    const unattributed = this.pointsAttrib.unattributedPoints(start, now);
+    return {
+      families: rows,
+      ...(unattributed >= 0.5 ? { familyPointsUnattributed: unattributed } : {}),
+      // 归因自部署起才累积；起点晚于窗口起点时点数明细是部分的，展示需标注
+      familyPointsPartial: !this.pointsAttrib.covers(start),
+    };
   }
 
-  #billingSelection() {
-    const families = this.ledger.billingFamilies();
-    const selected = families.find((f) => f.id === this.selectedBillingFamily) ?? families[0] ?? null;
-    return { families, selected };
+  /**
+   * 窗口期用量走势（sparkline 素材）：取标定器落盘的点数轨迹（3 天保留、跨重启），
+   * 内存里的 pointsTrail 只有本进程启动后的几分钟，画出来是没有形状的斜线。
+   * 同一 resetAt 的样本抽稀到 ≤64 点。
+   */
+  #trailOf(w) {
+    const raw = this.calibrator.trail(w.label, w.resetAt);
+    if (raw.length < 2) return null;
+    const stride = Math.max(1, Math.ceil(raw.length / 64));
+    const out = [];
+    for (let i = 0; i < raw.length; i += stride) out.push(raw[i]);
+    if (out[out.length - 1] !== raw[raw.length - 1]) out.push(raw[raw.length - 1]);
+    return out.map((p) => ({ at: p.at, pct: Math.min(100, p.used / w.budget * 100) }));
   }
 
   /** speed 模块可选挂载：缺席或崩溃都不拖垮额度主线。 */
@@ -154,22 +183,47 @@ export class Engine {
     return null;
   }
 
-  /** 路由端口与令牌：显式参数 → PEB 自动发现 → 免认证（旧版）。 */
+  /**
+   * 组装 /v1/limits 请求。两代认证并存（见 session-token.mjs 头注）：
+   * 新版令牌并在 URL 路径里（此时不带 header——旧 header 令牌已失效，带上反而 401）；
+   * 旧版走 x-api-key 头。
+   */
+  #limitsRequest(pair) {
+    return {
+      url: `http://127.0.0.1:${pair.port}${pair.path ?? ''}/v1/limits`,
+      headers: !pair.path && pair.token ? { 'x-api-key': pair.token } : undefined,
+    };
+  }
+
+  async #fetchLimits(pair, ms = 2500) {
+    const { url, headers } = this.#limitsRequest(pair);
+    return parseLimits(await getJSON(url, ms, headers));
+  }
+
+  /** 本进程若由 Mirasim 会话拉起，环境里就有现成的路由地址，零成本先试。 */
+  #ownEnvPair() {
+    const m = String(process.env.ANTHROPIC_BASE_URL || '')
+      .match(/^http:\/\/127\.0\.0\.1:(\d+)(\/[^\s]*)?$/);
+    if (!m) return null;
+    return { port: Number(m[1]), path: m[2]?.replace(/\/+$/, '') || null, token: process.env.ANTHROPIC_AUTH_TOKEN || null };
+  }
+
+  /** 路由端口与令牌：显式参数 → 本进程环境 → PEB 自动发现 → 免认证（旧版）。 */
   async #discoverRouter(processes, channelPort) {
     const explicitPort = Number(this.opts.routerPort ?? 0);
     const explicitToken = this.opts.routerToken ?? null;
 
     if (this.cachedRouter) {
-      const s = parseLimits(await getJSON(`http://127.0.0.1:${this.cachedRouter.port}/v1/limits`, 2500,
-        this.cachedRouter.token ? { 'x-api-key': this.cachedRouter.token } : undefined));
-      if (s) return this.cachedRouter;
+      if (await this.#fetchLimits(this.cachedRouter)) return this.cachedRouter;
       this.cachedRouter = null;
     }
 
     const pairs = [];
     if (explicitPort) pairs.push({ port: explicitPort, token: explicitToken });
+    const own = this.#ownEnvPair();
+    if (own) pairs.push(own);
     const discovered = explicitToken ? [] : await discoverSessionTokens();
-    const tokenByPort = new Map(discovered.map((d) => [d.port, d.token]));
+    const byPort = new Map(discovered.map((d) => [d.port, d]));
 
     if (processes.length) {
       const byPid = await listeningPorts(processes.map((p) => p.pid));
@@ -177,13 +231,15 @@ export class Engine {
       for (const [, list] of byPid) if (channelPort != null && list.includes(channelPort)) { ports = list; break; }
       if (!ports) ports = [...byPid.values()].flat();
       const ordered = [...new Set(ports)].sort((a, b) => (a === channelPort ? 1 : 0) - (b === channelPort ? 1 : 0));
-      for (const p of ordered) pairs.push({ port: p, token: explicitToken ?? tokenByPort.get(p) ?? null });
+      for (const p of ordered) {
+        const d = byPort.get(p);
+        pairs.push({ port: p, path: d?.path ?? null, token: explicitToken ?? d?.token ?? null });
+      }
     }
-    for (const d of discovered) if (!pairs.some((x) => x.port === d.port)) pairs.push({ port: d.port, token: d.token });
+    for (const d of discovered) if (!pairs.some((x) => x.port === d.port && (x.path ?? null) === (d.path ?? null))) pairs.push(d);
 
     for (const pair of pairs) {
-      const headers = pair.token ? { 'x-api-key': pair.token } : undefined;
-      if (parseLimits(await getJSON(`http://127.0.0.1:${pair.port}/v1/limits`, 2500, headers))) {
+      if (await this.#fetchLimits(pair)) {
         this.cachedRouter = pair;
         return pair;
       }
@@ -256,14 +312,12 @@ export class Engine {
       const processes = await mirasimProcesses();
       const channelPort = await this.#discoverChannelPort(processes);
       const router = await this.#discoverRouter(processes, channelPort);
-      const limits = router
-        ? parseLimits(await getJSON(`http://127.0.0.1:${router.port}/v1/limits`, 2500,
-            router.token ? { 'x-api-key': router.token } : undefined))
-        : null;
+      const limits = router ? await this.#fetchLimits(router) : null;
       if (limits) {
         const nowSec = Date.now() / 1000;
         this.#recordTrail(limits, nowSec);
         this.calibrator.record(limits.windows, nowSec);
+        this.pointsAttrib.record(limits.windows, nowSec);
         this.anchors.update(limits.windows, nowSec);
         this.ledger.adoptScopedGroups(
           limits.windows.filter((w) => w.modelScoped).map((w) => modelGroup(w.label)).filter(Boolean));
@@ -272,6 +326,7 @@ export class Engine {
       }
     }
     this.ledger.refresh();
+    this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
     this.#speedRefresh();
     return !!this.last;
   }
@@ -292,7 +347,6 @@ export class Engine {
     const limits = this.last.limits;
     const coherence = evaluateCoherence(limits.windows, this.ledger, now);
     const rate = coherence.perPoint;
-    const billing = this.#billingSelection();
 
     let calibDropped = 0;
     const windows = limits.windows.map((w) => {
@@ -301,10 +355,6 @@ export class Engine {
       const dur = windowDuration(w.label);
       const start = dur ? w.resetAt - dur : null;
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
-      const familySpentUSD = start == null || !billing.selected ? null
-        : group ? (billing.selected.id === 'claude'
-          ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : null)
-          : this.ledger.familySpent(start, now, billing.selected.id, { includeOpenMinute: true });
       const { fullUSD, confidence, sampleCount, dropped } = this.#fullOf(w.label, w.budget, group, rate);
       calibDropped += dropped;
       // 第二个口径：直接用官方百分比反推满额（本机账本$ ÷ 官方已用点数 × 预算点）。
@@ -314,10 +364,13 @@ export class Engine {
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
       const eta = this.#eta(w, now);
       const exhaust = this.#exhaust(w, start, now, group);
+      const breakdown = this.#familyBreakdown(start, now, group);
+      const trail = this.#trailOf(w);
       return {
         label: w.label, usedPercent, inferred: false, confidence, sampleCount,
         spentUSD: spent,
-        ...(familySpentUSD != null ? { familySpentUSD } : {}),
+        ...(breakdown ?? {}),
+        ...(trail ? { trail } : {}),
         ...(dur != null ? { durationSeconds: dur } : {}),
         ...(fullUSDOfficial != null ? { fullUSDOfficial, officialBiasedLow: !!group } : {}),
         ...(exhaust ? { exhaust } : {}),
@@ -339,11 +392,6 @@ export class Engine {
       : limits.degraded ? '上游降级运行中' : null;
 
     const out = this.#base(level, this.last.at, windows);
-    out.billingFamilies = billing.families;
-    if (billing.selected) {
-      out.billingFamily = billing.selected.id;
-      out.billingFamilyLabel = billing.selected.label;
-    }
     if (rate != null) {
       out.unitPriceUSD = rate;
       // 公式素材：单价 = 基准窗账本支出 ÷ 同期已用点数；spread 是跨窗交叉校验的离散倍数
@@ -358,7 +406,6 @@ export class Engine {
 
   /** 锚点推算：窗口边界滚动 + 本机账本。同窗口期内以锚点百分比为基线（更准），滚动后纯本机口径。 */
   #reckonedPayload(now) {
-    const billing = this.#billingSelection();
     const windows = this.anchors.anchors.map((a) => {
       const rolled = AnchorStore.rollWindow(a, now);
       if (!rolled) return null;
@@ -375,17 +422,14 @@ export class Engine {
       }
       usedPercent = Math.min(100, usedPercent);
       const spentUSD = this.ledger.spent(rolled.start, now, { includeOpenMinute: true, group });
-      const familySpentUSD = !billing.selected ? null
-        : group ? (billing.selected.id === 'claude'
-          ? this.ledger.spent(rolled.start, now, { includeOpenMinute: true, group }) : null)
-          : this.ledger.familySpent(rolled.start, now, billing.selected.id, { includeOpenMinute: true });
       const dur = a.duration;
       const pace = Math.min(100, Math.max(0, (now - rolled.start) / dur * 100));
+      const breakdown = this.#familyBreakdown(rolled.start, now, group);
       return {
         label: a.label, usedPercent, inferred: true,
         confidence: est?.confidence ?? 'none', sampleCount: est?.observations ?? 0,
         spentUSD,
-        ...(familySpentUSD != null ? { familySpentUSD } : {}),
+        ...(breakdown ?? {}),
         ...(fullUSD != null ? {
           fullUSD,
           scaledSpentUSD: fullUSD * usedPercent / 100,
@@ -400,8 +444,6 @@ export class Engine {
     const ageMin = Math.round((now - this.anchors.capturedAt) / 60);
     const ageText = ageMin >= 60 ? `${(ageMin / 60).toFixed(1)} 小时` : `${ageMin} 分钟`;
     const out = this.#base('reckoned', this.anchors.capturedAt, windows);
-    out.billingFamilies = billing.families;
-    if (billing.selected) { out.billingFamily = billing.selected.id; out.billingFamilyLabel = billing.selected.label; }
     out.measured = false;
     out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见，实际用量可能更高`;
     return out;
@@ -409,24 +451,20 @@ export class Engine {
 
   /** 最后一级：滚动窗口报本机支出。 */
   #localPayload(now) {
-    const billing = this.#billingSelection();
     const windows = [['5h', 5 * 3600], ['7d', 7 * 86400]].map(([label, dur]) => {
       const spent = this.ledger.spent(now - dur, now, { includeOpenMinute: true });
-      const familySpentUSD = billing.selected
-        ? this.ledger.familySpent(now - dur, now, billing.selected.id, { includeOpenMinute: true }) : null;
       const est = this.calibrator.estimate(label, this.ledger);
+      const breakdown = this.#familyBreakdown(now - dur, now, null);
       return {
         label, inferred: true,
         usedPercent: est?.fullUSD ? Math.min(100, spent / est.fullUSD * 100) : 0,
         confidence: est?.confidence ?? 'none', sampleCount: est?.observations ?? 0,
         spentUSD: spent,
-        ...(familySpentUSD != null ? { familySpentUSD } : {}),
+        ...(breakdown ?? {}),
         ...(est?.fullUSD ? { fullUSD: est.fullUSD } : {}),
       };
     });
     const out = this.#base('local', now, windows);
-    out.billingFamilies = billing.families;
-    if (billing.selected) { out.billingFamily = billing.selected.id; out.billingFamilyLabel = billing.selected.label; }
     out.measured = false;
     out.detail = this.everConnected
       ? '接口不可达且无窗口锚点，仅按本机滚动窗口统计支出'

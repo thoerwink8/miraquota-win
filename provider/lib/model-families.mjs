@@ -10,6 +10,14 @@ const FAMILY_RULES = [
   ['kimi', 'Kimi', /(?:^|\/)(?:kimi-|moonshotai\/kimi-)|^kimi/i],
 ];
 
+/** 家族 id → 展示名（未知 id 首字母大写兜底）。 */
+export function familyLabel(id) {
+  const rule = FAMILY_RULES.find(([fid]) => fid === id);
+  if (rule) return rule[1];
+  const s = String(id || '');
+  return s ? s[0].toUpperCase() + s.slice(1) : '未知';
+}
+
 export function modelFamily(rawModel) {
   const model = String(rawModel || '').trim();
   if (!model) return { id: 'unknown', label: '未知' };
@@ -23,18 +31,6 @@ export function isBillableCloudUsage(row) {
   return row?.status === 200 && row?.viaRelay === true && row?.leg === 'relay'
     && String(row?.upstreamHost || '').toLowerCase() === 'relay.mirasim.ai'
     && row?.modelSource !== 'dispatch' && typeof row?.model === 'string' && row.model.length > 0;
-}
-
-export function billingFamiliesFromUsage(rows) {
-  const byFamily = new Map();
-  for (const row of rows || []) {
-    if (!isBillableCloudUsage(row)) continue;
-    const family = modelFamily(row.model);
-    const at = Number(row.at) || 0;
-    const prior = byFamily.get(family.id);
-    if (!prior || at > prior.latestAt) byFamily.set(family.id, { ...family, latestAt: at });
-  }
-  return [...byFamily.values()].sort((a, b) => b.latestAt - a.latestAt || a.label.localeCompare(b.label));
 }
 
 export function recentConcreteModels(samples, modelCap = 5, taskCap = 5) {

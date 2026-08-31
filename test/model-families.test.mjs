@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  billingFamiliesFromUsage,
+  familyLabel,
   isBillableCloudUsage,
   modelFamily,
   recentConcreteModels,
@@ -28,17 +28,10 @@ test('only real relay usage enters billing family choices', () => {
   assert.equal(isBillableCloudUsage({ ...cloud, viaRelay: false, leg: 'direct' }), false);
 });
 
-test('billing choices are dynamic, family-collapsed and ordered by latest use', () => {
-  const rows = [
-    { model: 'claude-fable-5', status: 200, viaRelay: true, leg: 'relay', upstreamHost: 'relay.mirasim.ai', at: 100 },
-    { model: 'claude-opus-5', status: 200, viaRelay: true, leg: 'relay', upstreamHost: 'relay.mirasim.ai', at: 300 },
-    { model: 'gpt-5.6-sol', status: 200, viaRelay: true, leg: 'relay', upstreamHost: 'relay.mirasim.ai', at: 400 },
-    { model: 'Qwen3.8 Max', status: 200, viaRelay: true, leg: 'relay', modelSource: 'dispatch', upstreamHost: 'relay.mirasim.ai', at: 500 },
-  ];
-  assert.deepEqual(billingFamiliesFromUsage(rows), [
-    { id: 'gpt', label: 'GPT', latestAt: 400 },
-    { id: 'claude', label: 'Claude', latestAt: 300 },
-  ]);
+test('family ids map to display labels with a capitalized fallback', () => {
+  assert.equal(familyLabel('claude'), 'Claude');
+  assert.equal(familyLabel('gpt'), 'GPT');
+  assert.equal(familyLabel('mistral'), 'Mistral');
 });
 
 test('speed rows keep the five most recent concrete models and five tasks each', () => {

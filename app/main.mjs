@@ -132,10 +132,7 @@ if (!app.requestSingleInstanceLock()) {
   }
 
   app.whenReady().then(async () => {
-    engine = new Engine({
-      forceOffline: process.argv.includes('--offline'),
-      billingFamily: readUI().billingFamily ?? null,
-    });
+    engine = new Engine({ forceOffline: process.argv.includes('--offline') });
     await engine.loadSpeed();
     applyTheme(readUI().theme);   // 建窗前定主题，避免首帧闪一下另一套配色
     createWindow();
@@ -148,12 +145,6 @@ if (!app.requestSingleInstanceLock()) {
       const t = applyTheme(v);
       writeUI({ theme: t });
       return t;
-    });
-    ipcMain.handle('billing-family:set', async (_e, v) => {
-      engine.setBillingFamily(v);
-      writeUI({ billingFamily: v });
-      await tick();
-      return engine.payload();
     });
     ipcMain.on('win:min', () => win.minimize());
     ipcMain.on('win:hide', () => win.hide());

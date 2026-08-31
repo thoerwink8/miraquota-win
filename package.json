@@ -1,6 +1,6 @@
 {
   "name": "miraquota-win",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Mirasim 额度监控（Windows）：独立桌面应用（托盘常驻），Mirasim 关闭时按锚点推算剩余；另含注入 Mirasim 界面的控件形态",
   "type": "module",
   "private": true,

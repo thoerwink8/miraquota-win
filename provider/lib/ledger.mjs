@@ -15,7 +15,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { billingFamiliesFromUsage, isBillableCloudUsage, modelFamily } from './model-families.mjs';
+import { isBillableCloudUsage, modelFamily } from './model-families.mjs';
 
 const HOME = homedir();
 const CLAUDE_PROJECTS = join(HOME, '.claude', 'projects');
@@ -334,19 +334,20 @@ export class CostLedger {
     return Math.max(0, hi - lo);
   }
 
+  /** 出现过官方云端消费的家族 id 集合（含只在分钟桶里留痕的历史家族）。 */
+  familyIds() {
+    const ids = new Set(Object.keys(this.familyLatest));
+    for (const k of Object.keys(this.family)) ids.add(k.slice(0, k.indexOf('|')));
+    ids.delete('');
+    return [...ids];
+  }
+
   familySpent(fromSec, toSec, familyId, { includeOpenMinute = false } = {}) {
     const table = this.#familyTable(familyId);
     if (!table || !table.minutes.length) return 0;
     const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
     const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + (includeOpenMinute ? 1 : 0));
     return table.prefix[hi] - table.prefix[lo];
-  }
-
-  billingFamilies() {
-    return billingFamiliesFromUsage(Object.entries(this.familyLatest).map(([id, at]) => ({
-      model: id === 'claude' ? 'claude-opus-5' : id === 'gpt' ? 'gpt-5' : id,
-      status: 200, viaRelay: true, leg: 'relay', upstreamHost: 'relay.mirasim.ai', at,
-    })));
   }
 
   #table(group) {

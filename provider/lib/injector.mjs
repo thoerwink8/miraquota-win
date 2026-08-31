@@ -116,7 +116,9 @@ export class Injector {
       return this.#reschedule(feedPort, SWEEP_MS, `找不到调试端口（试过 ${this.cdpPorts.join('、')}）`);
     }
 
-    const pages = targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+    // 自家面板（file://…/app/renderer/index.html）不注入——带调试端口跑 dev 时会被自己巡检命中
+    const pages = targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl
+      && !/miraquota.*\/app\/renderer\/index\.html$/i.test(String(t.url || '')));
     const script = `window.__MIRAQUOTA_FEED__="http://127.0.0.1:${feedPort}";\n` + this.source;
     let hits = 0, injected = 0;
 

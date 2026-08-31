@@ -989,13 +989,13 @@
     if (r) return r;
     const el = document.createElement('div');
     el.className = 'sp';
-    el.innerHTML = `<span class="m"></span><span class="bill" hidden>当前计费</span><span class="v"></span><span class="dr"></span><span class="n"></span>`;
+    el.innerHTML = `<span class="m"></span><span class="v"></span><span class="dr"></span><span class="n"></span>`;
     const tasks = document.createElement('div');
     tasks.className = 'sp-tasks';
     tasks.hidden = true;
     el.after(tasks);
     r = { el, m: el.querySelector('.m'), v: el.querySelector('.v'),
-          bill: el.querySelector('.bill'), dr: el.querySelector('.dr'), n: el.querySelector('.n'), tasks, open: false };
+          dr: el.querySelector('.dr'), n: el.querySelector('.n'), tasks, open: false };
     el.addEventListener('click', () => { r.open = !r.open; r.tasks.hidden = !r.open; });
     speedRows.set(model, r);
     return r;
@@ -1036,10 +1036,9 @@
       const r = speedRowFor(rowKey);
       setText(r.m, shortModel(row.model));
       r.m.title = row.model;
-      setHidden(r.bill, row.familyId !== d.billingFamily);
-      // measured 为真时首 token 是逐请求实测值，不带 ≈；缺字段按回归行处理。
-      setText(r.v, row.rate == null ? `首 — · 端到端 ${Number(row.endToEnd || 0).toFixed(0)} tok/s`
-        : (row.ttft != null ? `首 ${row.measured ? '' : '≈'}${row.ttft.toFixed(1)}s · ` : '') + `${row.rate.toFixed(0)} tok/s`);
+      // measured 为真时首 token 是逐请求实测值，不带 ≈；只有端到端时不堆「首 —」占位。
+      setText(r.v, row.rate == null ? `端到端 ${Number(row.endToEnd || 0).toFixed(0)} tok/s`
+        : (row.ttft != null ? `首字 ${row.measured ? '' : '≈'}${row.ttft.toFixed(1)}s · ` : '') + `${row.rate.toFixed(0)} tok/s`);
       // 阈值由 provider 侧统一把关（SpeedRow.notableDrift），这里只显示给了值的那一档。
       const drift = row.driftNotable;
       setText(r.dr, drift == null ? '' : `${drift > 0 ? '快' : '慢'}${Math.abs(drift).toFixed(0)}%`);
@@ -1049,8 +1048,7 @@
       r.tasks.innerHTML = rowTasks.map((task, taskIndex) => {
         const speed = task.rate == null ? '—' : `${task.rate.toFixed(0)} tok/s`;
         const duration = task.durationMs == null ? '—' : `${(task.durationMs / 1000).toFixed(1)}s`;
-        const first = task.ttft == null ? '首 —' : `首 ≈${task.ttft.toFixed(1)}s`;
-        return `<div class="sp-task"><span>任务 ${taskIndex + 1} · 已完成</span><span>${first} · 端到端 ${speed} · ${duration}</span><span>${ago(task.at)}</span></div>`;
+        return `<div class="sp-task"><span>任务 ${taskIndex + 1}</span><span>${speed} · ${duration}</span><span>${ago(task.at)}</span></div>`;
       }).join('');
       r.tasks.hidden = !r.open;
       const at = c.rows.children[i * 2];

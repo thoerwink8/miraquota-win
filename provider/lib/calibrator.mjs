@@ -137,6 +137,11 @@ export class Calibrator {
 
   pointSampleCount(label) { return (this.points[label] ?? []).length; }
 
+  /** 当前窗口期内的落盘点数轨迹（跨进程重启仍在），供趋势线使用。 */
+  trail(label, resetAt) {
+    return (this.points[label] ?? []).filter((s) => s.resetAt === resetAt);
+  }
+
   /**
    * sinceSec 以来该窗口实际消耗的点数：逐对正增量求和（跨重置的回落不计）。
    * 停机期的消耗由停机前后两条样本的差值一次性补上（resetAt 未变时）。

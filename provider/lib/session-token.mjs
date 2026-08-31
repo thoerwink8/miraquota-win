@@ -1,9 +1,14 @@
 /**
  * Windows 会话令牌自动发现。
  *
- * 现行 Mirasim 的 `/v1/limits` 要求带会话令牌，该令牌只存在于 Mirasim 拉起的会话进程
- * 环境变量里（`ANTHROPIC_BASE_URL` 指向哪个回环端口，`ANTHROPIC_AUTH_TOKEN` 就是那个
- * 端口的令牌）。macOS / Linux 用 `ps eww` 读得到；Windows 的 `Get-CimInstance` 不暴露
+ * 现行 Mirasim 的 `/v1/limits` 要求带会话令牌，令牌只存在于 Mirasim 拉起的会话进程
+ * 环境变量里。两代约定并存：
+ *  - 旧版（≤0.0.25x 早期）：`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`，令牌在
+ *    `ANTHROPIC_AUTH_TOKEN`，请求时放 `x-api-key` 头。
+ *  - 新版（0.0.257 起）：令牌并进 URL 路径 `http://127.0.0.1:<port>/<token>`，
+ *    `ANTHROPIC_AUTH_TOKEN` 换成了上游凭据、对 /v1/limits 无效（实测 invalid x-api-key）。
+ * 这里两种都带回去，由 engine 按「有路径用路径、没路径用头」组装请求。
+ * macOS / Linux 用 `ps eww` 读得到；Windows 的 `Get-CimInstance` 不暴露
  * 进程环境，参考实现因此要求手工传令牌。
  *
  * 这里改用 PEB 内存读取还原自动发现：`NtQueryInformationProcess` 取 PEB 基址，
@@ -53,19 +58,20 @@ $seen = @{}
 foreach($procId in $targets){
   $blk = Get-ProcEnv $procId
   if(-not $blk){ continue }
-  if($blk -match 'ANTHROPIC_BASE_URL=http://127\.0\.0\.1:(\d+)' ){
+  if($blk -match 'ANTHROPIC_BASE_URL=http://127\.0\.0\.1:(\d+)(/[^\x00]*)?' ){
     $port=$Matches[1]
-    if($blk -match 'ANTHROPIC_AUTH_TOKEN=([^\x00]+)'){
-      $tok=$Matches[1]
-      $key="$port"
-      if(-not $seen.ContainsKey($key)){ $seen[$key]=$true; "$port $tok" }
-    }
+    $path=if($Matches[2]){$Matches[2]}else{'-'}
+    $tok='-'
+    if($blk -match 'ANTHROPIC_AUTH_TOKEN=([^\x00]+)'){ $tok=$Matches[1] }
+    $key="$port$path"
+    if(-not $seen.ContainsKey($key)){ $seen[$key]=$true; "$port $path $tok" }
   }
 }
 `;
 
 /**
- * 返回 [{ port, token }]，来自本机 Mirasim 会话进程的环境。
+ * 返回 [{ port, path, token }]，来自本机 Mirasim 会话进程的环境。
+ * `path` 是并在 URL 里的令牌路径（新版），`token` 是 header 令牌（旧版）；缺失为 null。
  * 非 Windows 或读取失败时返回空数组，由调用方退回 relay 帧口径。
  */
 export function discoverSessionTokens() {
@@ -78,11 +84,12 @@ export function discoverSessionTokens() {
         if (err && !stdout) return resolve([]);
         const out = [];
         for (const line of String(stdout || '').split(/\r?\n/)) {
-          const sp = line.indexOf(' ');
-          if (sp < 0) continue;
-          const port = Number(line.slice(0, sp));
-          const token = line.slice(sp + 1).trim();
-          if (port && token) out.push({ port, token });
+          const parts = line.trim().split(/\s+/);
+          if (parts.length < 3) continue;
+          const port = Number(parts[0]);
+          const path = parts[1] === '-' ? null : parts[1].replace(/\/+$/, '');
+          const token = parts[2] === '-' ? null : parts[2];
+          if (port && (path || token)) out.push({ port, path, token });
         }
         resolve(out);
       });
