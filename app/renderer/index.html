@@ -147,6 +147,16 @@
   @keyframes pulse { 50% { opacity: .3; } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
+  /* ---- 多机同步明细 ---- */
+  .sync-state { font-size: 11px; font-weight: 600; }
+  .sync-state.ok { color: var(--ok); }
+  .sync-state.error { color: var(--bad); }
+  .sync-state.connecting { color: var(--ink3); }
+  .sync-machine { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink2); margin-top: 4px; }
+  .sync-machine .id { font-weight: 600; color: var(--ink); }
+  .sync-machine .when { color: var(--ink3); }
+  .sync-machine.expired .id, .sync-machine.expired .when { color: var(--ink3); font-weight: 500; }
+
   .foot { font-size: 10.5px; color: var(--ink3); line-height: 1.7; padding: 2px 2px 0; }
   .foot b { color: var(--ink2); font-weight: 600; }
   .empty { text-align: center; color: var(--ink3); padding: 48px 0 32px; font-size: 12px; }
@@ -200,6 +210,11 @@
         <div class="head"><span class="label">速度</span><span class="sp" style="flex:1"></span><span class="label" id="speedNote"></span></div>
         <table id="speedRows"></table>
         <div class="inflight" id="inflight" style="display:none"></div>
+      </div>
+      <!-- 多机同步：payload 无 sync 字段（未配置）时整卡隐藏，界面零变化 -->
+      <div class="card" id="syncCard" style="display:none">
+        <div class="head"><span class="label">多机同步</span><span class="sp" style="flex:1"></span><span class="sync-state" id="syncState"></span></div>
+        <div id="syncMachines"></div>
       </div>
       <div class="foot" id="foot"></div>
     </div>
@@ -551,17 +566,31 @@
       $('inflight').innerHTML = `<span class="dot"></span>生成中 ${sp.inflightSince.length} 条 · 最长已 ${Math.round(Date.now() / 1000 - oldest)} 秒`;
     }
 
-    // 总览页脚只留一行现状；公式与免责全文在「口径说明」页。
+    // 多机同步明细卡：payload 无 sync 字段（未配置）时整卡隐藏，不显示任何新 UI。
+    const sy = p.sync;
+    $('syncCard').style.display = sy ? '' : 'none';
+    if (sy) {
+      const stEl = $('syncState');
+      stEl.className = 'sync-state ' + sy.state;
+      stEl.innerHTML = sy.state === 'ok' ? '● GitHub 已接入'
+        : sy.state === 'error' ? '● 同步失败：' + esc(sy.error ?? '')
+        : '● 连接中…';
+      // 分片超过 2×intervalSec 未更新 ⇒ 该机器视为已过期（可能离场或同步中断）
+      const expiredBefore = Date.now() / 1000 - 2 * (sy.intervalSec ?? 600);
+      $('syncMachines').innerHTML = (sy.machines ?? []).map((m) => {
+        const expired = m.lastShardSec != null && m.lastShardSec < expiredBefore;
+        const when = m.lastShardSec == null ? '尚未推送' : `${ago(m.lastShardSec)}推送`;
+        return `<div class="sync-machine${expired ? ' expired' : ''}">
+          <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}</span>
+          <span class="when">${when}${expired ? ' · 已过期' : ''}</span></div>`;
+      }).join('');
+    }
+
+    // 总览页脚只留一行现状；公式与免责全文在「口径说明」页，多机明细在上方专卡。
     const foot = [];
     if (p.unitPriceUSD != null) foot.push(`单价 ${p.unitPriceUSD.toFixed(6)} $/点`);
     if (p.calibDropped > 0) foot.push(`已剔除他机观测 ${p.calibDropped} 段`);
     if (p.accountNotice) foot.push(p.accountNotice);
-    // 多机账本同步：payload 无 sync 字段（未配置）时不显示任何新 UI。
-    if (p.sync) {
-      foot.push(p.sync.error ? '多机同步失败'
-        : p.sync.machines > 1 ? `多机账本 ×${p.sync.machines}${p.sync.lastSyncSec ? ' · ' + ago(p.sync.lastSyncSec) : ''}`
-        : '多机账本 · 未见其他机器');
-    }
     foot.push(`采集 ${ago(p.capturedAt)}`);
     $('foot').innerHTML = foot.join(' · ');
 
@@ -579,9 +608,11 @@
     st2.push(`<b>账本</b> ${p.buckets ?? 0} 个分钟桶 · 价目 ${p.pricing ?? '-'}`);
     if (p.calibDropped > 0) st2.push(`<b>标定防线</b> 检测到他机同时使用，已剔除 ${p.calibDropped} 段受污染观测`);
     if (p.sync) {
-      st2.push(`<b>多机</b> ${p.sync.error
-        ? '同步失败：' + esc(p.sync.error)
-        : `已合并 ${p.sync.machines} 台机器的账本${p.sync.lastSyncSec ? ' · 同步于 ' + ago(p.sync.lastSyncSec) : ' · 尚未完成首轮同步'}（美元支出为全机合计）`}`);
+      st2.push(`<b>多机</b> ${p.sync.state === 'error'
+        ? '同步失败：' + esc(p.sync.error ?? '')
+        : p.sync.state === 'ok'
+          ? `GitHub 已接入 · 已合并 ${p.sync.machines.length} 台机器的账本${p.sync.lastSyncSec ? ' · 同步于 ' + ago(p.sync.lastSyncSec) : ''}（美元支出为全机合计）`
+          : '连接中…（尚未完成同步）'}`);
     }
     if (p.accountNotice) st2.push(`<b>账号</b> ${p.accountNotice}`);
     $('specState').innerHTML = st2.join('<br>');

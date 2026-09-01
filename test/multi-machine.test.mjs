@@ -60,7 +60,11 @@ test('two machines publish shards over a bare git remote and read each other', a
   assert.equal(rb.error, undefined);
   const ra = await syncA.run(ledgerA, T + 1);
   assert.equal(ra.error, undefined);
-  assert.equal(ra.machines, 2);
+  // 机器明细：本机 lastShardSec = 发布成功时刻，外机 = 其分片的 generatedAt
+  assert.deepEqual(ra.machines, [
+    { id: 'alpha', lastShardSec: T + 1, self: true },
+    { id: 'beta', lastShardSec: T, self: false },
+  ]);
   assert.equal(ra.shards.length, 1);
   const shard = ra.shards[0];
   assert.equal(shard.machineId, 'beta');
@@ -102,8 +106,24 @@ test('a broken remote is reported in status without throwing', async () => {
   });
   const fake = { exportShard: (id, now) => ({ schemaVersion: 1, machineId: id, generatedAt: now, coverage: { fromSec: 0, toSec: now }, buckets: {}, scoped: {}, family: {} }) };
   const r = await sync.run(fake, 1000);
-  assert.ok(r.error);            // 失败进状态字段
-  assert.equal(r.machines, 1);   // 不抛异常、不阻断
+  assert.ok(r.error);                // 失败进状态字段
+  assert.equal(r.state, 'error');    // 有 error ⇒ 故障态（UI 红）
+  // 不抛异常、不阻断；push 没成功 ⇒ 本机尚无成功发布时刻
+  assert.deepEqual(r.machines, [{ id: 'broken', lastShardSec: null, self: true }]);
+});
+
+test('sync state machine: connecting before first success, ok while fresh, stale falls back', async () => {
+  const remote = join(tmp, 'state-remote.git');
+  await git('init', '--bare', '--quiet', remote);
+  const T = 2_000_000;
+  const a = new LedgerSync({ configFile: syncConfig('sa', remote), repoDir: join(tmp, 'sa-repo'), machineId: 'sa' });
+  assert.equal(a.status(T).state, 'connecting');   // 启用但从未成功 ⇒ 连接中（UI 灰）
+  const r = await a.run(ledgerWith('sa', { buckets: {} }), T);
+  assert.equal(r.state, 'ok');                     // 最近一轮成功且无 error ⇒ 已接入（UI 绿）
+  assert.equal(r.intervalSec, 600);
+  // 过期判定：距上次成功超过 2×intervalSec 后不再算已接入
+  assert.equal(a.status(T + 1200).state, 'ok');
+  assert.equal(a.status(T + 1201).state, 'connecting');
 });
 
 test('calibration coverage gate keeps fully covered observations and falls back otherwise', () => {
@@ -177,5 +197,9 @@ test('with sync configured the payload carries a sync status field', () => {
       machineId: 'engine',
     },
   });
-  assert.deepEqual(engine.payload().sync, { machines: 1 });
+  assert.deepEqual(engine.payload().sync, {
+    state: 'connecting',
+    intervalSec: 600,
+    machines: [{ id: 'engine', lastShardSec: null, self: true }],
+  });
 });

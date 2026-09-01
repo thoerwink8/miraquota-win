@@ -48,8 +48,9 @@ export class LedgerSync {
     this.configFile = configFile;
     this.repoDir = repoDir;
     this.machineId = machineId;
-    this.shards = [];        // 最近一次 fetch 到的外机分片（内存缓存）
-    this.lastSyncSec = null; // 最近一次成功同步的时刻
+    this.shards = [];          // 最近一次 fetch 到的外机分片（内存缓存）
+    this.lastSyncSec = null;   // 最近一次成功同步的时刻
+    this.lastPublishSec = null; // 本机分片最近一次成功发布（push 成功）的时刻
     this.lastError = null;
     this.config = this.#loadConfig();
   }
@@ -125,26 +126,39 @@ export class LedgerSync {
   /**
    * 一轮同步：发布本机分片 + 读回全部外机分片。任何失败都不抛，只记入 lastError；
    * 上一轮读到的分片保留（远端临时不可达时合并口径不回退）。
-   * 返回 { machines, lastSyncSec, shards, error? }，功能关闭时返回 null。
+   * 返回 status() 的全部字段外加 shards，功能关闭时返回 null。
    */
   async run(ledger, nowSec = Date.now() / 1000) {
     if (!this.enabled) return null;
     try {
       await this.#ensureRepo();
       await this.#publish(ledger.exportShard(this.machineId, nowSec));
+      this.lastPublishSec = nowSec;   // 发布已 push 成功，即使随后 fetch 失败也算数
       this.shards = await this.#fetchForeign();
       this.lastSyncSec = nowSec;
       this.lastError = null;
     } catch (e) {
       this.lastError = String(e.message || e).split('\n')[0].slice(0, 200);
     }
-    return { ...this.status(), shards: this.shards };
+    return { ...this.status(nowSec), shards: this.shards };
   }
 
-  /** payload 的 sync 字段：机器数（含本机）、最近同步时刻、失败原因。 */
-  status() {
+  /**
+   * payload 的 sync 字段。
+   *  - state：'error' 有失败原因；'ok' 最近一轮成功且不超过 2×intervalSec（已接入）；
+   *    其余为 'connecting'（启用但从未成功，或成功记录已过期）。
+   *  - machines：每台机器一行 { id, lastShardSec, self }——本机取最近一次成功发布时刻，
+   *    外机取其分片的 generatedAt；从未发布/无分片时为 null。
+   */
+  status(nowSec = Date.now() / 1000) {
+    const fresh = this.lastSyncSec != null && nowSec - this.lastSyncSec <= 2 * this.intervalSec;
     return {
-      machines: 1 + this.shards.length,
+      state: this.lastError ? 'error' : fresh ? 'ok' : 'connecting',
+      intervalSec: this.intervalSec,   // 显示面据此判「分片超过 2×interval 未更新 ⇒ 已过期」
+      machines: [
+        { id: this.machineId, lastShardSec: this.lastPublishSec, self: true },
+        ...this.shards.map((s) => ({ id: s.machineId, lastShardSec: s.generatedAt, self: false })),
+      ],
       ...(this.lastSyncSec != null ? { lastSyncSec: this.lastSyncSec } : {}),
       ...(this.lastError ? { error: this.lastError } : {}),
     };

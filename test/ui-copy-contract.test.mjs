@@ -61,3 +61,19 @@ test('speed surfaces drop repeated billing badges and keep expandable recent tas
   assert.match(widget, /row\.tasks/);
   assert.match(widget, /r\.open = !r\.open/);
 });
+
+test('sync status shows a connection mark and per-machine push detail in the panel only', () => {
+  // 接入标记三态文案：绿=已接入、红=失败带原因、灰=连接中
+  assert.match(renderer, /● GitHub 已接入/);
+  assert.match(renderer, /● 同步失败：/);
+  assert.match(renderer, /● 连接中…/);
+  // 机器明细每台一行：本机标注 +「N 分钟前推送」+ 过期判定（2×intervalSec）
+  assert.match(renderer, /（本机）/);
+  assert.match(renderer, /推送/);
+  assert.match(renderer, /已过期/);
+  assert.match(renderer, /2 \* \(sy\.intervalSec \?\? 600\)/);
+  // widget 悬浮窗保持极简：状态色点 + ×N，不进机器明细
+  assert.match(widget, /多机 ×/);
+  assert.doesNotMatch(widget, /已过期/);
+  assert.doesNotMatch(widget, /lastShardSec/);
+});

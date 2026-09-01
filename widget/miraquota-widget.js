@@ -174,6 +174,9 @@
     return (sec / 86400).toFixed(1) + ' 天';
   }
 
+  // 极简 HTML 转义：账本行改 innerHTML（多机状态要带色点）后，自由文本先过这里。
+  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
   // 样本新鲜度。速度不动多半是没有新请求，把这件事显式说出来。
   function ago(t) {
     const s = Math.max(0, Date.now() / 1000 - t);
@@ -1079,15 +1082,15 @@
     // 其余按有值的部分拼，缺项不显示——否则精简的 provider 会在这一行显示 undefined。
     const ledger = [];
     if (d.buckets != null) ledger.push(`${d.buckets} 分钟桶`);
-    if (d.pricing) ledger.push(d.pricing);
+    if (d.pricing) ledger.push(esc(d.pricing));
     // 多机账本同步：payload 无 sync 字段（未配置）时这里什么都不加，界面零变化。
+    // 悬浮窗保持极简：状态色点（绿=已接入 红=失败 灰=连接中）+ 机器数，明细只进主面板。
     if (d.sync) {
-      ledger.push(d.sync.error ? '多机同步失败'
-        : d.sync.machines > 1 ? `多机账本 ×${d.sync.machines}${d.sync.lastSyncSec ? ' · ' + ago(d.sync.lastSyncSec) : ''}`
-        : '多机账本 · 未见其他机器');
+      const tone = { ok: 'var(--ok)', error: 'var(--bad)' }[d.sync.state] || 'var(--ink3)';
+      ledger.push(`<span style="color:${tone}">●</span> 多机 ×${(d.sync.machines || []).length}`);
     }
     setHidden(els.rowLedger, !ledger.length);
-    setText(els.metaLedger, ledger.join(' · '));
+    els.metaLedger.innerHTML = ledger.join(' · ');
 
     const line = [];
     if (d.mode || d.host) line.push([d.mode, d.host].filter(Boolean).join(' '));
