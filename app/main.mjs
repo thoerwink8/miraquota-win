@@ -166,7 +166,7 @@ if (!app.requestSingleInstanceLock()) {
     });
     ipcMain.handle('update:get', () => updater.state());
     ipcMain.handle('update:check', () => updater.check());
-    ipcMain.handle('update:install', () => updater.install());
+    ipcMain.handle('update:prompt', () => updater.promptInstall());
     updater.start();
     await tick();
     setInterval(() => tick().catch(() => {}), HEARTBEAT_MS);

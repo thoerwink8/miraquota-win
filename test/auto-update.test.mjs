@@ -49,28 +49,26 @@ test('updates install without the user doing anything', () => {
   assert.match(main, /beforeQuit: \(\) => \{ app\.isQuittingForReal = true; \}/);
 });
 
-test('the ready prompt offers install-and-restart plus later, like the gateway does', () => {
-  // 用户要求机制对齐 Mirasim（2026-09-02）：旧→新版本对照、「安装并重启」、「稍后」，
-  // 外加标题栏角标——点了「稍后」提示条收起，角标仍在，否则这次更新就从界面上消失了。
-  assert.match(renderer, /新版本已下载/);
-  assert.match(renderer, /安装并重启/);
-  assert.match(renderer, /btnLater/);
+test('the whole update prompt is one badge in the title bar', () => {
+  // 2026-09-02 用户拍板：提示条太占地方，顶部一枚角标就够。点它由主进程弹确认框——
+  // 角标紧挨关闭按钮，误点直接重启应用太粗暴。
   assert.match(renderer, /id="newVer"/);
-  assert.match(renderer, /updSnoozed = true/);
-  assert.ok(renderer.includes("$('newVer').onclick = () => { updSnoozed = false"),
-    '点角标要能把收起的提示条唤回来');
-  // 角标只在已下载时出现：还在下载时点它也没得装
-  assert.ok(renderer.includes("badge.style.display = ready ? '' : 'none'"),
-    '角标可见性必须跟着 ready 走');
+  assert.ok(renderer.includes("badge.style.display = ready ? '' : 'none'"), '角标只在已下载时出现');
+  assert.ok(renderer.includes("$('newVer').onclick = () => window.miraquota.promptUpdate"));
+  assert.doesNotMatch(renderer, /id="upd"/, '提示条应已删除');
+  assert.match(updater, /promptInstall/);
+  assert.ok(updater.includes("buttons: ['安装并重启', '稍后']"), '确认框要给出两个选择');
+  assert.match(main, /update:prompt/);
 });
 
-test('update banner shows progress and readiness, never a failed check', () => {
-  // 与多机同步同一套呈现取舍：抖动不报红。检查失败用户也无事可做，只在主动点
-  // 托盘「检查更新」时回话。
-  assert.match(renderer, /st\.phase === 'downloading' \|\| st\.phase === 'ready'/);
+test('checking failures never reach the panel', () => {
+  // 与多机同步同一套取舍：抖动不报红。检查失败用户也无事可做，只在主动点托盘
+  // 「检查更新」时回话。
+  assert.ok(renderer.includes("const ready = st?.phase === 'ready';"), '界面只认「已下载」这一个状态');
   assert.match(main, /检查更新/);
   assert.doesNotMatch(renderer, /更新失败/);
 });
+
 
 test('release refuses when HEAD is not on the remote, and pins the tag to that commit', () => {
   // 实测踩过（v0.9.2）：push 因网络失败但发版继续，gh 把 tag 打在远端分支旧提交上，

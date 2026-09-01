@@ -9,7 +9,7 @@ contextBridge.exposeInMainWorld('miraquota', {
   onQuota: (cb) => ipcRenderer.on('quota', (_e, payload) => cb(payload)),
   update: () => ipcRenderer.invoke('update:get'),
   onUpdate: (cb) => ipcRenderer.on('update', (_e, s) => cb(s)),
-  installUpdate: () => ipcRenderer.invoke('update:install'),
+  promptUpdate: () => ipcRenderer.invoke('update:prompt'),
   setPointCost: (group, ratio) => ipcRenderer.invoke('settings:pointCost', group, ratio),
   minimize: () => ipcRenderer.send('win:min'),
   hide: () => ipcRenderer.send('win:hide'),

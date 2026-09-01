@@ -91,27 +91,6 @@
     border-radius: 8px; padding: 7px 10px; margin-bottom: 10px; line-height: 1.5;
   }
 
-  /* 更新提示条：只在下载中/已就绪时出现，检查失败不占地方（用户也无事可做）。 */
-  .upd {
-    display: flex; align-items: center; gap: 8px; font-size: 11px;
-    color: var(--accent); background: var(--accentbg);
-    border-radius: 8px; padding: 7px 10px; margin-bottom: 10px;
-  }
-  .upd .sub { color: var(--ink3); }
-  .upd .acts { margin-left: auto; display: flex; gap: 6px; }
-  .upd button {
-    -webkit-app-region: no-drag; cursor: pointer;
-    border: 0; border-radius: 6px; padding: 3px 9px; font: inherit; font-weight: 600;
-    background: var(--accent); color: var(--bg);
-  }
-  .upd button.ghost { background: transparent; color: var(--ink2); font-weight: 500; }
-  .upd button.ghost:hover { background: var(--track); color: var(--ink); }
-  /* 标题栏角标：提示条被「稍后」收起后，这里仍然看得见有新版（点它把提示条唤回来） */
-  .titlebar .newver {
-    -webkit-app-region: no-drag; cursor: pointer; border: 0; font: inherit;
-    font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 99px;
-    background: var(--accentbg); color: var(--accent);
-  }
   .detail:empty { display: none; }
 
   .card {
@@ -208,13 +187,16 @@
   .hint { font-size: 10.5px; color: var(--ink3); margin-top: 8px; line-height: 1.55; }
 
   /* 口径配置行：与 .sim-ctl 同族的紧凑控件，放在「口径」页顶部，不占首屏 */
-  .cfg { display: flex; align-items: center; gap: 8px; font-size: 11.5px; flex-wrap: wrap; }
-  .cfg input { width: 62px; background: var(--card); border: 1px solid var(--bd); color: var(--ink);
-    border-radius: 6px; padding: 3px 6px; font: inherit; font-variant-numeric: tabular-nums; }
-  .cfg button { -webkit-app-region: no-drag; cursor: pointer; border: 0; border-radius: 6px;
-    padding: 3px 10px; font: inherit; font-weight: 600; background: var(--accent); color: var(--bg); }
-  .cfg .measured { color: var(--ink2); }
-  .cfg .saved { color: var(--ok); font-weight: 600; }
+  .cfg { display: flex; align-items: center; gap: 8px; font-size: 11.5px; }
+  .cfg .k { flex: 1; min-width: 0; color: var(--ink2); font-weight: 600; }
+  .cfg input { flex: none; width: 58px; background: var(--card); border: .5px solid var(--bd);
+    color: var(--ink); border-radius: 6px; padding: 4px 7px; font: inherit;
+    font-variant-numeric: tabular-nums; text-align: right; }
+  .cfg button { flex: none; -webkit-app-region: no-drag; cursor: pointer; border: 0; border-radius: 6px;
+    padding: 4px 10px; font: inherit; font-size: 11px; font-weight: 600;
+    background: var(--accent); color: var(--bg); white-space: nowrap; }
+  .cfg-note { font-size: 10.5px; color: var(--ink3); margin-top: 6px; line-height: 1.5; }
+  .cfg-note .saved { color: var(--ok); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -243,7 +225,6 @@
     </div>
   </div>
   <div class="scroll">
-    <div class="upd" id="upd" style="display:none"></div>
     <div class="page on" id="pageMain">
       <div class="detail" id="detail"></div>
       <div id="cards"><div class="empty">正在读取额度……</div></div>
@@ -268,12 +249,11 @@
     <div class="page" id="pageSpec">
       <div class="card" id="cfgCard" style="display:none">
         <div class="cfg">
-          <span>fable 点数计量倍率</span>
+          <span class="k">fable 点数计量倍率</span>
           <input id="fableRatio" type="number" min="0.1" max="10" step="0.1">
-          <span class="measured" id="fableMeasured"></span>
-          <span style="flex:1"></span>
           <button id="btnRatio">保存</button>
         </div>
+        <div class="cfg-note" id="fableMeasured"></div>
         <div class="hint">官方口径：fable 资源紧张，同样一份用量按 <b>2 倍</b>扣点，所以 fable 用得越多、
         额度折算出来的美元越少。这里改的是折算倍率——所有美元数字（满额、已用、剩余）都按
         「全用非 fable 时的等价支出」重算，与官方「不用 fable 时一周 5600 刀」同口径。
@@ -745,35 +725,20 @@
    * 更新提示条。下载中顺带报一句实际下载量：差分命中时通常几 MB，
    * 这是「换安装版」这次改动唯一看得见的收益，值得让用户看见。
    */
-  let updState = null;
-  let updSnoozed = false;    // 用户点过「稍后」：本次会话不再弹提示条，但角标留着
-  function renderUpdate(next) {
-    if (next) updState = next;
-    const st = updState;
-    const el = $('upd'), badge = $('newVer');
-    const active = st && (st.phase === 'downloading' || st.phase === 'ready');
-    // 角标只在「已下载」时出现：还在下载时点它也没得装，徒增一个按不动的按钮
+  /**
+   * 更新提示只占标题栏一枚角标（2026-09-02 用户拍板：顶部就够了）。
+   * 点它由主进程弹确认框再装——角标就在关闭按钮旁边，误点直接重启应用太粗暴。
+   * 只在「已下载」时出现：还在下载时点了也没得装。
+   */
+  function renderUpdate(st) {
+    const badge = $('newVer');
     const ready = st?.phase === 'ready';
     badge.style.display = ready ? '' : 'none';
-    if (ready) {
-      badge.textContent = '↑v' + st.version;
-      badge.title = '有新版 v' + st.version + '，点这里查看';
-    }
-    if (!active || (ready && updSnoozed)) { el.style.display = 'none'; return; }
-    if (st.phase === 'downloading') {
-      const size = st.totalMB ? ` · 本次下载 ${st.totalMB.toFixed(1)}MB` : '';
-      el.innerHTML = `新版 v${st.version ?? ''} 下载中 ${st.percent ?? 0}%<span class="sub">${size}</span>`;
-    } else {
-      el.innerHTML = `<b>新版本已下载</b><span class="sub">v${APP_VER ?? ''} → v${st.version}`
-        + ` · 点「安装并重启」立即生效，稍后关掉应用时也会自动装上（账本与标定已落盘，重启不丢数）</span>`
-        + `<span class="acts"><button class="ghost" id="btnLater">稍后</button>`
-        + `<button id="btnUpd">安装并重启</button></span>`;
-      $('btnUpd').onclick = () => window.miraquota.installUpdate?.();
-      $('btnLater').onclick = () => { updSnoozed = true; renderUpdate(); };
-    }
-    el.style.display = 'flex';
+    if (!ready) return;
+    badge.textContent = '↑v' + st.version;
+    badge.title = `新版 v${st.version} 已下载，点击安装并重启`;
   }
-  $('newVer').onclick = () => { updSnoozed = false; renderUpdate(); };
+  $('newVer').onclick = () => window.miraquota.promptUpdate?.();
   window.miraquota.onUpdate?.(renderUpdate);
   window.miraquota.update?.().then(renderUpdate).catch(() => {});
 

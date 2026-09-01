@@ -70,9 +70,18 @@ export function createUpdater({ onState = () => {}, beforeQuit = () => {} } = {}
     return state;
   }
 
+  /** 立刻重启装新版；没下完时什么也不做（界面此时不会给入口）。 */
+  function install() {
+    if (!enabled || state.phase !== 'ready') return false;
+    beforeQuit();
+    autoUpdater.quitAndInstall(true, true);
+    return true;
+  }
+
   return {
     state: () => state,
     check,
+    install,
     /** 托盘菜单里用户主动问的一次检查：无论结果都回一句话，别让人点了没反应。 */
     async checkInteractive() {
       if (!enabled) {
@@ -88,12 +97,22 @@ export function createUpdater({ onState = () => {}, beforeQuit = () => {} } = {}
       }[s.phase] ?? '正在检查……';
       dialog.showMessageBox({ message: text, buttons: ['好'] });
     },
-    /** 立刻重启装新版；没下完时什么也不做（界面此时不会给按钮）。 */
-    install() {
+    /**
+     * 点标题栏角标走这条：先确认再装。角标紧挨着关闭按钮，误点就重启应用太粗暴；
+     * 确认框也是交代「不装会怎样」的地方——不装也会在下次退出时装上，用户不必现在决定。
+     */
+    async promptInstall() {
       if (!enabled || state.phase !== 'ready') return false;
-      beforeQuit();
-      autoUpdater.quitAndInstall(true, true);
-      return true;
+      const { response } = await dialog.showMessageBox({
+        type: 'question',
+        message: `新版本 v${state.version} 已下载`,
+        detail: '安装会重启应用（账本与标定已落盘，不丢数）。\n不装也会在下次退出应用时自动装上。',
+        buttons: ['安装并重启', '稍后'],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (response !== 0) return false;
+      return install();
     },
     start() {
       if (!enabled) return;
