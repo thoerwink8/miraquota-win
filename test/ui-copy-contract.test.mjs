@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 
 const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
 const widget = readFileSync(new URL('../widget/miraquota-widget.js', import.meta.url), 'utf8');
+const engine = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
 
 test('new users start in the authoritative points mode', () => {
   assert.match(renderer, /let MODE = 'pts';/);
@@ -16,12 +17,14 @@ test('account-level dollar values are visibly approximate in the embedded widget
   assert.match(widget, /`余 ≈\$\{usd\(w\.remainingUSD\)\}`/);
 });
 
-test('full-dollar labels distinguish official points from local prediction', () => {
+test('each card shows exactly one full-quota number, in both display faces', () => {
+  // 2026-09-02 用户拍板：满额统一走总额比值口径后，原来的「官≈/预≈」两个数只差
+  // fable 折算，并排摆着只会让人问哪个对。中位数退到 tooltip 当保守参考。
   assert.match(renderer, /点数反推/);
-  assert.match(renderer, /cals\.push\(`<span class="tag">官≈<\/span><b>\$\{money\(w\.fullUSDOfficial, 0\)\}/);
-  assert.match(renderer, /cals\.push\(`<span class="tag">预≈<\/span><b>\$\{money\(w\.fullUSD, 0\)\}/);
-  assert.match(widget, /cals\.push\('官≈' \+ usd\(w\.fullUSDOfficial\)/);
-  assert.match(widget, /cals\.push\('预≈' \+ usd\(w\.fullUSD\)/);
+  assert.match(renderer, /<span class="tag">满额≈<\/span>/);
+  assert.match(widget, /'\/ 满额≈' \+ usd\(w\.fullUSD\)/);
+  // 旧的两口径字段整条链路都不该再有（payload 也不再产出它）
+  for (const src of [renderer, widget, engine]) assert.doesNotMatch(src, /fullUSDOfficial/);
 });
 
 test('a today card answers daily usage that rolling windows cannot', () => {

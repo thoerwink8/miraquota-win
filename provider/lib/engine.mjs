@@ -404,12 +404,15 @@ export class Engine {
       const dur = windowDuration(w.label);
       const start = dur ? w.resetAt - dur : null;
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
-      const { fullUSD, confidence, sampleCount, dropped, basis } = this.#fullOf(w.label, w.budget, group, rate);
+      // 满额口径：整窗支出 ÷ 整窗点数 × 预算点（2026-09-02 用户拍板，与官方宣称对得上）。
+      // 总窗用折算后的基准单价（rate 已含档位倍率）；档位窗用它自己的支出与点数——
+      // 它的点是从同一个池里按倍率扣的，除出来就是该档位的每点美元，不必再折算。
+      const ratioFull = group
+        ? (spent > 0 && w.used > 0 ? spent / w.used * w.budget : null)
+        : (rate != null ? rate * w.budget : null);
+      const { fullUSD, confidence, sampleCount, dropped, basis, conservativeUSD } =
+        this.#fullOf(w.label, w.budget, group, ratioFull);
       calibDropped += dropped;
-      // 第二个口径：直接用官方百分比反推满额（本机账本$ ÷ 官方已用点数 × 预算点）。
-      // 与上面的回归标定互为交叉验证——两者接近说明账本与点数自洽。
-      // modelScoped 窗口的分桶自档位声明起才累积，此口径会系统性偏低，故标注出来。
-      const fullUSDOfficial = spent > 0 && w.used > 0 ? spent / w.used * w.budget : null;
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
       const eta = this.#eta(w, now);
       const exhaust = this.#exhaust(w, start, now, group);
@@ -419,11 +422,14 @@ export class Engine {
         spentUSD: spent,
         ...(breakdown ?? {}),
         ...(dur != null ? { durationSeconds: dur } : {}),
-        ...(fullUSDOfficial != null ? { fullUSDOfficial, officialBiasedLow: !!group } : {}),
+
         ...(exhaust ? { exhaust } : {}),
         ...(fullUSD != null ? {
           fullUSD,
           ...(basis ? { fullUSDBasis: basis } : {}),
+          // 分段单价中位数：抗污染但系统性保守，只作次要参考（界面放在 tooltip 里）
+          ...(conservativeUSD != null && Math.abs(conservativeUSD - fullUSD) / fullUSD > 0.05
+            ? { conservativeUSD } : {}),
           scaledSpentUSD: fullUSD * usedPercent / 100,
           remainingUSD: Math.max(0, fullUSD * (100 - usedPercent) / 100),
         } : {}),
@@ -568,24 +574,21 @@ export class Engine {
    * 或跨窗离散判不自洽）时才用它，此时宁可保守也不要没有数。
    * 回归标定的观测数仍然照常汇报——它是「这个数有多少实测撑着」的唯一来源。
    */
-  #fullOf(label, budget, group, rate) {
+  #fullOf(label, budget, group, ratioFull) {
     const est = this.calibrator.estimate(label, this.ledger, budget, group, this.settings.groupPointCost);
     const dropped = est?.foreignDropped ?? 0;
-    if (rate != null && !group) {
-      // 档位窗（group 非空）不走这条：rate 是非该档位的基准单价，乘它的预算点会高估。
+    if (ratioFull != null) {
       return {
-        fullUSD: rate * budget, basis: 'ratio',
+        fullUSD: ratioFull, basis: 'ratio', conservativeUSD: est?.fullUSD ?? null,
         confidence: est?.confidence ?? 'low', sampleCount: est?.observations ?? 0, dropped,
       };
     }
+    // 总额比值给不出（点数样本太少、或跨窗离散判不自洽）才退回中位数：宁可保守，不要没有数
     if (est) {
       return {
-        fullUSD: est.fullUSD, basis: 'median',
+        fullUSD: est.fullUSD, basis: 'median', conservativeUSD: null,
         confidence: est.confidence, sampleCount: est.observations, dropped,
       };
-    }
-    if (rate != null) {
-      return { fullUSD: rate * budget, basis: 'ratio', confidence: 'low', sampleCount: 0, dropped };
     }
     return { fullUSD: null, confidence: 'none', sampleCount: 0, dropped };
   }

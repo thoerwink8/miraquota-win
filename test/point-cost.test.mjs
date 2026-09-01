@@ -109,10 +109,14 @@ test('the measured ratio pairs the scoped window with the pool window of the sam
   assert.equal(measureGroupRatio([withFiveHour[0], merged7d[1]], ledger, now, 'fable'), null);
 });
 
-test('pool windows report the total-ratio full value, scoped windows keep the median', () => {
-  // 2026-09-02 用户拍板：卡片满额改用「整窗支出 ÷ 整窗点数 × 预算点」，与官方 5600 对得上；
-  // 中位数退居备用。档位窗不能乘基准单价（那是非该档位的价），仍走中位数。
+test('every window reports the total-ratio full value, median only as fallback', () => {
+  // 2026-09-02 用户拍板：满额改用「整窗支出 ÷ 整窗点数 × 预算点」，与官方 5600 对得上。
+  // 总窗乘折算后的基准单价；档位窗用它自己的支出与点数（它的点已按倍率扣过，不再折算）。
   const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
-  assert.match(src, /if \(rate != null && !group\) \{[\s\S]*?fullUSD: rate \* budget, basis: 'ratio'/);
-  assert.match(src, /fullUSDBasis: basis/);
+  assert.ok(src.includes("? (spent > 0 && w.used > 0 ? spent / w.used * w.budget : null)"),
+    '档位窗要用自己的支出与点数反推');
+  assert.ok(src.includes(": (rate != null ? rate * w.budget : null)"), '总窗要乘折算后的基准单价');
+  assert.ok(src.includes("fullUSD: ratioFull, basis: 'ratio'"), '总额比值优先');
+  assert.ok(src.includes("fullUSD: est.fullUSD, basis: 'median'"), '给不出时才退回中位数');
+  assert.match(src, /conservativeUSD/);
 });

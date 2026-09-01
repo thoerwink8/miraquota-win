@@ -441,7 +441,7 @@
     const elapsedDays = w.durationSeconds != null && w.pacePercent > 0
       ? w.durationSeconds * w.pacePercent / 100 / 86400 : null;
 
-    let mainText, fullText, remainText, subBits, mainTitle;
+    let mainText, fullText, remainText, subBits, mainTitle, fullTitle = '';
     if (MODE === 'pts' && w.points) {
       // 点数口径：主行原始额度点（/v1/limits 权威），美元退到副行。
       mainText = Math.round(w.points.used).toLocaleString();
@@ -459,14 +459,16 @@
       mainTitle = '本机账本实际花费：token × API 价直接求和（全家族合计）';
       // 主行「/ 之后」直接摆两个满额口径——那个位置原先重复了右侧的百分比徽章
       // （用户 2026-08-28 指出重叠且该位置应给满额）。
-      const cals = [];
-      if (w.fullUSDOfficial != null) cals.push(`<span class="tag">官≈</span><b>${money(w.fullUSDOfficial, 0)}</b>${w.officialBiasedLow ? '⁻' : ''}`);
-      if (w.fullUSD != null) cals.push(`<span class="tag">预≈</span><b>${money(w.fullUSD, 0)}</b>`);
-      fullText = cals.length ? ` / ${cals.join(' · ')}` : ' / 满额标定中';
+      // 满额只给一个数（2026-09-02）：原来并排「官≈/预≈」两个口径，改成总额比值后
+      // 两者只差 fable 折算，摆两个数只会让人问哪个对。中位数退到 tooltip 当保守参考。
+      fullText = w.fullUSD != null ? ` / <span class="tag">满额≈</span><b>${money(w.fullUSD, 0)}</b>` : ' / 满额标定中';
       const infer = [];
       if (w.remainingUSD != null) infer.push(`余 <b>${money(w.remainingUSD, 0)}</b>`);
       if (w.scaledSpentUSD != null) infer.push(`账号级已用 <b>${money(w.scaledSpentUSD)}</b>`);
       remainText = infer.length ? `推算 ${infer.join(' · ')}` : '';
+      fullTitle = '满额≈整窗账本支出（fable 按倍率折算）÷ 官方已用点 × 预算点，与官方宣称同口径'
+        + (w.conservativeUSD != null ? ` · 保守估计（分段单价中位数）${money(w.conservativeUSD, 0)}` : '')
+        + ' · 不是云端美元账单';
       subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`] : [];
       if (elapsedDays >= 0.5) subBits.push(`日均 ${money((w.spentUSD ?? 0) / elapsedDays)}`);
     }
@@ -474,7 +476,7 @@
     return `<div class="card">
       <div class="head">
         <span class="label">${name}</span>
-        <span class="money" title="${mainTitle}">${mainText}<span class="full" title="满额两口径：官≈为官方点数反推，预≈为本机账本预测；两者都不是云端美元账单">${fullText}</span></span>
+        <span class="money" title="${mainTitle}">${mainText}<span class="full" title="${fullTitle}">${fullText}</span></span>
         <span class="pct">${mark}${w.usedPercent.toFixed(1)}%</span>
       </div>
       <div class="bar">
