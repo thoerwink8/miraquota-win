@@ -98,10 +98,19 @@
     border-radius: 8px; padding: 7px 10px; margin-bottom: 10px;
   }
   .upd .sub { color: var(--ink3); }
+  .upd .acts { margin-left: auto; display: flex; gap: 6px; }
   .upd button {
-    margin-left: auto; -webkit-app-region: no-drag; cursor: pointer;
+    -webkit-app-region: no-drag; cursor: pointer;
     border: 0; border-radius: 6px; padding: 3px 9px; font: inherit; font-weight: 600;
     background: var(--accent); color: var(--bg);
+  }
+  .upd button.ghost { background: transparent; color: var(--ink2); font-weight: 500; }
+  .upd button.ghost:hover { background: var(--track); color: var(--ink); }
+  /* 标题栏角标：提示条被「稍后」收起后，这里仍然看得见有新版（点它把提示条唤回来） */
+  .titlebar .newver {
+    -webkit-app-region: no-drag; cursor: pointer; border: 0; font: inherit;
+    font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 99px;
+    background: var(--accentbg); color: var(--accent);
   }
   .detail:empty { display: none; }
 
@@ -213,6 +222,7 @@
     <svg class="logo" viewBox="0 0 32 32"><circle cx="16" cy="16" r="11" fill="none" stroke="#464c5a" stroke-width="6"/><path id="logoArc" d="" fill="none" stroke="#7aa2ff" stroke-width="6" stroke-linecap="round"/></svg>
     <span class="name">MiraQuota</span>
     <span class="ver" id="ver"></span>
+    <button class="newver" id="newVer" style="display:none"></button>
     <span class="badge" id="state">连接中</span>
     <span class="sp"></span>
     <button class="tbtn" id="btnTheme" title="主题：跟随系统 / 亮色 / 暗色">◐</button>
@@ -735,19 +745,35 @@
    * 更新提示条。下载中顺带报一句实际下载量：差分命中时通常几 MB，
    * 这是「换安装版」这次改动唯一看得见的收益，值得让用户看见。
    */
-  function renderUpdate(s) {
-    const el = $('upd');
-    if (!s || (s.phase !== 'downloading' && s.phase !== 'ready')) { el.style.display = 'none'; return; }
-    const v = s.version ? 'v' + s.version : '新版';
-    if (s.phase === 'downloading') {
-      const size = s.totalMB ? ` · 本次下载 ${s.totalMB.toFixed(1)}MB` : '';
-      el.innerHTML = `${v} 下载中 ${s.percent ?? 0}%<span class="sub">${size}</span>`;
+  let updState = null;
+  let updSnoozed = false;    // 用户点过「稍后」：本次会话不再弹提示条，但角标留着
+  function renderUpdate(next) {
+    if (next) updState = next;
+    const st = updState;
+    const el = $('upd'), badge = $('newVer');
+    const active = st && (st.phase === 'downloading' || st.phase === 'ready');
+    // 角标只在「已下载」时出现：还在下载时点它也没得装，徒增一个按不动的按钮
+    const ready = st?.phase === 'ready';
+    badge.style.display = ready ? '' : 'none';
+    if (ready) {
+      badge.textContent = '↑v' + st.version;
+      badge.title = '有新版 v' + st.version + '，点这里查看';
+    }
+    if (!active || (ready && updSnoozed)) { el.style.display = 'none'; return; }
+    if (st.phase === 'downloading') {
+      const size = st.totalMB ? ` · 本次下载 ${st.totalMB.toFixed(1)}MB` : '';
+      el.innerHTML = `新版 v${st.version ?? ''} 下载中 ${st.percent ?? 0}%<span class="sub">${size}</span>`;
     } else {
-      el.innerHTML = `${v} 已下载<span class="sub">下次退出自动装上</span><button id="btnUpd">重启更新</button>`;
+      el.innerHTML = `<b>新版本已下载</b><span class="sub">v${APP_VER ?? ''} → v${st.version}`
+        + ` · 点「安装并重启」立即生效，稍后关掉应用时也会自动装上（账本与标定已落盘，重启不丢数）</span>`
+        + `<span class="acts"><button class="ghost" id="btnLater">稍后</button>`
+        + `<button id="btnUpd">安装并重启</button></span>`;
       $('btnUpd').onclick = () => window.miraquota.installUpdate?.();
+      $('btnLater').onclick = () => { updSnoozed = true; renderUpdate(); };
     }
     el.style.display = 'flex';
   }
+  $('newVer').onclick = () => { updSnoozed = false; renderUpdate(); };
   window.miraquota.onUpdate?.(renderUpdate);
   window.miraquota.update?.().then(renderUpdate).catch(() => {});
 
@@ -777,7 +803,13 @@
   let latest = null;
   window.miraquota.onQuota((p) => { latest = p; render(p); });
   window.miraquota.get().then((p) => { latest = p; render(p); });
-  window.miraquota.version?.().then((v) => { if (v) $('ver').textContent = 'v' + v; }).catch(() => {});
+  let APP_VER = null;
+  window.miraquota.version?.().then((v) => {
+    if (!v) return;
+    APP_VER = v;
+    $('ver').textContent = 'v' + v;
+    renderUpdate();      // 版本号回来得比更新状态晚时，把「旧 → 新」补上
+  }).catch(() => {});
   // 倒计时与「N 秒前」每秒走动，数据本身由主进程心跳推送。
   setInterval(() => { if (latest) render(latest); }, 1000);
 </script>

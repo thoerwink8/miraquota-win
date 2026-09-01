@@ -49,11 +49,25 @@ test('updates install without the user doing anything', () => {
   assert.match(main, /beforeQuit: \(\) => \{ app\.isQuittingForReal = true; \}/);
 });
 
+test('the ready prompt offers install-and-restart plus later, like the gateway does', () => {
+  // 用户要求机制对齐 Mirasim（2026-09-02）：旧→新版本对照、「安装并重启」、「稍后」，
+  // 外加标题栏角标——点了「稍后」提示条收起，角标仍在，否则这次更新就从界面上消失了。
+  assert.match(renderer, /新版本已下载/);
+  assert.match(renderer, /安装并重启/);
+  assert.match(renderer, /btnLater/);
+  assert.match(renderer, /id="newVer"/);
+  assert.match(renderer, /updSnoozed = true/);
+  assert.ok(renderer.includes("$('newVer').onclick = () => { updSnoozed = false"),
+    '点角标要能把收起的提示条唤回来');
+  // 角标只在已下载时出现：还在下载时点它也没得装
+  assert.ok(renderer.includes("badge.style.display = ready ? '' : 'none'"),
+    '角标可见性必须跟着 ready 走');
+});
+
 test('update banner shows progress and readiness, never a failed check', () => {
   // 与多机同步同一套呈现取舍：抖动不报红。检查失败用户也无事可做，只在主动点
   // 托盘「检查更新」时回话。
-  assert.match(renderer, /s\.phase !== 'downloading' && s\.phase !== 'ready'/);
-  assert.match(renderer, /重启更新/);
+  assert.match(renderer, /st\.phase === 'downloading' \|\| st\.phase === 'ready'/);
   assert.match(main, /检查更新/);
   assert.doesNotMatch(renderer, /更新失败/);
 });
