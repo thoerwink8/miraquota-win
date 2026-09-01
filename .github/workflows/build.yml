@@ -31,7 +31,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: MiraQuota-win-${{ github.sha }}
-          path: |
-            dist/*.exe
-            dist/*.blockmap
+          path: dist/*.exe
           if-no-files-found: error

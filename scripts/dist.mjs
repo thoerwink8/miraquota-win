@@ -33,13 +33,11 @@ const r = spawnSync('pnpm', ['exec', 'electron-builder', '--win',
   `-c.extraMetadata.version=${version}`, ...passthrough],
   { cwd: ROOT, stdio: 'inherit', shell: true });
 
-// 打包成功后再动手清历史产物：同一版本的两个目标（安装版/便携版）+ blockmap 保留，其余全删。
+// 打包成功后再动手清历史产物：只保留本次版本的 portable，其余（含历史安装版/blockmap）全删。
 if (r.status === 0) {
   const distDir = join(ROOT, 'dist');
   const keep = new Set([
     `MiraQuota ${version}.exe`,
-    `MiraQuota Setup ${version}.exe`,
-    `MiraQuota Setup ${version}.exe.blockmap`,
   ]);
   let removed = 0;
   for (const name of readdirSync(distDir)) {
