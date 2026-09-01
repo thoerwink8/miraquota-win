@@ -499,8 +499,23 @@
         <span>${subBits.join(' · ')}</span>
         <span class="r">${paceChip(w.paceDelta)} ${CONF[w.confidence] ?? ''}</span>
       </div>
-      ${familyRow(w)}
+      ${familyRow(w)}${ratioNote(w)}
     </div>`;
+  }
+  /**
+   * 档位窗的倍率注解。用户问过：fable 占 7d 池 53% 的点，为什么满额只有 $1477 而不是
+   * 一半多的 $2900——因为每美元扣 2 倍点，53% 的点只兑出一半价值。官方自己的算式同理
+   * （用满 fable 那 53% 一周只能到 4116 而非 5600）。不写这行，这张卡看着就像算错了。
+   */
+  function ratioNote(w) {
+    if (!w.modelGroup || !w.points || w.fullUSD == null) return "";
+    const cost = (latest?.pointCost ?? []).find((c) => c.group === w.modelGroup);
+    if (!cost || !(cost.ratio > 1)) return "";
+    const pool = latest?.windows?.find((x) => !x.modelGroup && x.durationSeconds === w.durationSeconds);
+    const share = pool?.points ? Math.round(w.points.budget / pool.points.budget * 100) : null;
+    const head = share != null ? `占同期池 ${share}% 的点，` : "";
+    return `<div class="row fam"><span>按 ${cost.ratio}× 计量：${head}每美元扣 ${cost.ratio} 倍点，`
+      + `故满额只兑出 ${money(w.fullUSD, 0)}</span></div>`;
   }
   const fmtK = (n) => n >= 10000 ? Math.round(n / 1000) + 'k' : String(Math.round(n));
 
