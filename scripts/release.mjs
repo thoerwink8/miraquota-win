@@ -20,6 +20,11 @@ const DIST = join(ROOT, 'dist');
 const run = (cmd, args, opts = {}) =>
   spawnSync(cmd, args, { cwd: ROOT, shell: true, encoding: 'utf8', ...opts });
 const runLoud = (cmd, args) => run(cmd, args, { stdio: 'inherit' });
+/**
+ * gh 一律不走 shell：带空格的参数（--title "MiraQuota 0.6.33"）经 shell 会被拆成两段，
+ * 多出来的 "0.6.33" 被 gh 当成要上传的文件，报 `no matches found for 0.6.33`（实测踩过）。
+ */
+const gh = (args) => spawnSync('gh', args, { cwd: ROOT, encoding: 'utf8', stdio: 'inherit' });
 const die = (msg) => { console.error(`[release] ${msg}`); process.exit(1); };
 
 // 版本口径与 dist 完全一致（package.json 前两段 + 提交数），tag 就是 v<版本>。
@@ -50,11 +55,10 @@ const assets = [
 const missing = assets.filter((f) => !existsSync(f));
 if (missing.length) die(`产物缺失，发出去也没法自动更新：\n${missing.join('\n')}`);
 
-const exists = run('gh', ['release', 'view', tag]).status === 0;
-const quoted = assets.map((f) => `"${f}"`);
+const exists = spawnSync('gh', ['release', 'view', tag], { cwd: ROOT, encoding: 'utf8' }).status === 0;
 const r = exists
-  ? runLoud('gh', ['release', 'upload', tag, ...quoted, '--clobber'])
-  : runLoud('gh', ['release', 'create', tag, ...quoted,
+  ? gh(['release', 'upload', tag, ...assets, '--clobber'])
+  : gh(['release', 'create', tag, ...assets,
       '--title', `MiraQuota ${version}`, '--generate-notes']);
 if (r.status !== 0) die('gh 发布失败');
 
