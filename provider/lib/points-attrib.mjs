@@ -26,8 +26,17 @@ export class PointsAttributor {
     this.last = null;    // { label, resetAt, used, at } 基准窗上次采样
     this.pending = [];   // [{ from, to, points }] 待静置的增量
     this.sinceSec = null; // 归因起始时刻（覆盖率判断用）
+    this.settleSec = SETTLE_SEC;
     this.#index = {};
     this.#load();
+  }
+
+  /**
+   * 多机账本同步启用时放宽静置：外机支出要等它下一轮发布分片才可见，
+   * 静置短于同步间隔会把他机点数错归无主。取 max(默认, 2×同步间隔)。
+   */
+  relaxSettle(intervalSec) {
+    this.settleSec = Math.max(SETTLE_SEC, 2 * (Number(intervalSec) || 0));
   }
 
   #index;
@@ -78,7 +87,7 @@ export class PointsAttributor {
   settle(ledger, nowSec) {
     if (!this.pending.length) return;
     const due = [];
-    this.pending = this.pending.filter((p) => (nowSec - p.to >= SETTLE_SEC ? (due.push(p), false) : true));
+    this.pending = this.pending.filter((p) => (nowSec - p.to >= this.settleSec ? (due.push(p), false) : true));
     if (!due.length) return;
     const ids = ledger.familyIds();
     for (const p of due) {

@@ -14,7 +14,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { isBillableCloudUsage, modelFamily } from './model-families.mjs';
 
 const HOME = homedir();
@@ -26,6 +26,7 @@ const STATE_FILE = join(STATE_DIR, 'ledger.json');
 const RETENTION = 8 * 86400;          // 覆盖 7d 窗口并留余量
 const GATEWAY_RESCAN = 1 << 20;       // 网关账本尾部重扫窗口
 const STATE_SCHEMA = 2;               // v2 扩展 GPT 定价后需重扫 transcript 补旧漏账
+const SHARD_SCHEMA = 1;               // 多机同步分片格式（见 ledger-sync.mjs / docs/MULTI-MACHINE.md）
 
 const num = (v) => {
   const n = typeof v === 'string' ? Number(v) : v;
@@ -44,8 +45,10 @@ function walkTranscripts(dir, depth, out) {
 }
 
 export class CostLedger {
-  constructor(pricing) {
+  /** @param stateFile 状态文件路径（测试注入用，默认 ~/.miraquota/ledger.json） */
+  constructor(pricing, stateFile = STATE_FILE) {
     this.pricing = pricing;
+    this.stateFile = stateFile;
     this.cursors = {};        // transcript 文件 → { size, offset }
     this.buckets = {};        // unix 分钟 → 美元
     this.scoped = {};         // "组|分钟" → 美元
@@ -62,17 +65,22 @@ export class CostLedger {
     this.ledgerRecords = 0;
     this.unpricedRecords = 0;
     this.countedLedger = new Set();
+    this.foreignShards = [];  // 多机同步吸收的外机分片（不落盘，重启后由下一轮同步重建）
     this.#index = null;
     this.#scopedIndex = {};
     this.#familyIndex = {};
+    this.#mergedIndex = null;
+    this.#mergedScopedIndex = {};
+    this.#mergedFamilyIndex = {};
     this.#load();
   }
 
   #index; #scopedIndex; #familyIndex;
+  #mergedIndex; #mergedScopedIndex; #mergedFamilyIndex;
 
   #load() {
     try {
-      const p = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+      const p = JSON.parse(readFileSync(this.stateFile, 'utf8'));
       this.cursors = p.cursors ?? {};
       this.buckets = p.buckets ?? {};
       this.scoped = p.scoped ?? {};
@@ -91,8 +99,8 @@ export class CostLedger {
 
   #save() {
     try {
-      mkdirSync(STATE_DIR, { recursive: true });
-      writeFileSync(STATE_FILE, JSON.stringify({
+      mkdirSync(dirname(this.stateFile), { recursive: true });
+      writeFileSync(this.stateFile, JSON.stringify({
         schemaVersion: STATE_SCHEMA,
         cursors: this.cursors, buckets: this.buckets, scoped: this.scoped, family: this.family,
         familyBooked: this.familyBooked, familyLatest: this.familyLatest,
@@ -122,12 +130,14 @@ export class CostLedger {
     const key = String(minute);
     this.buckets[key] = (this.buckets[key] ?? 0) + usd;
     this.#index = null;
+    this.#mergedIndex = null;
     if (!this.scopedGroups.length || !model) return;
     const lower = model.toLowerCase();
     for (const g of this.scopedGroups) if (lower.includes(g)) {
       const k = g + '|' + key;
       this.scoped[k] = (this.scoped[k] ?? 0) + usd;
       this.#scopedIndex[g] = null;
+      this.#mergedScopedIndex[g] = null;
     }
   }
 
@@ -135,6 +145,7 @@ export class CostLedger {
     const key = familyId + '|' + minute;
     this.family[key] = (this.family[key] ?? 0) + usd;
     this.#familyIndex[familyId] = null;
+    this.#mergedFamilyIndex[familyId] = null;
   }
 
   refresh(now = Date.now()) {
@@ -309,16 +320,56 @@ export class CostLedger {
     for (const k of Object.keys(this.cursors)) {
       try { statSync(k); } catch { delete this.cursors[k]; }
     }
-    if (Object.keys(this.buckets).length !== before) this.#index = null;
-    if (Object.keys(this.scoped).length) this.#scopedIndex = {};
-    if (Object.keys(this.family).length) this.#familyIndex = {};
+    if (Object.keys(this.buckets).length !== before) { this.#index = null; this.#mergedIndex = null; }
+    if (Object.keys(this.scoped).length) { this.#scopedIndex = {}; this.#mergedScopedIndex = {}; }
+    if (Object.keys(this.family).length) { this.#familyIndex = {}; this.#mergedFamilyIndex = {}; }
+  }
+
+  // MARK: 多机分片（详见 docs/MULTI-MACHINE.md）
+
+  /** 本机账本聚合态 → 同步分片。只含本机桶——外机分片单独存放，不回流串账。 */
+  exportShard(machineId, nowSec = Date.now() / 1000) {
+    return {
+      schemaVersion: SHARD_SCHEMA,
+      machineId,
+      generatedAt: nowSec,
+      coverage: { fromSec: nowSec - RETENTION, toSec: nowSec },
+      buckets: this.buckets, scoped: this.scoped, family: this.family,
+    };
+  }
+
+  /**
+   * 吸收外机分片：此后 spent/activeMinutes/familySpent 默认返回本机 + 全部外机之和，
+   * 传 { localOnly: true } 仍可查纯本机口径。无分片时合并口径 = 本机口径，行为零变化。
+   */
+  adoptForeignShards(shards) {
+    this.foreignShards = (Array.isArray(shards) ? shards : [])
+      .filter((s) => s && s.schemaVersion === SHARD_SCHEMA && s.machineId);
+    this.#mergedIndex = null;
+    this.#mergedScopedIndex = {};
+    this.#mergedFamilyIndex = {};
+  }
+
+  /**
+   * 在场外机分片的覆盖区间（标定覆盖门用）。分片过老（generatedAt 早于保留窗）
+   * 视为该机器已离场，不再参与「全覆盖」判定——它的账本早就不新鲜了。
+   */
+  foreignCoverage(nowSec = Date.now() / 1000) {
+    return this.foreignShards
+      .filter((s) => nowSec - (s.generatedAt ?? 0) <= RETENTION)
+      .map((s) => ({
+        machineId: s.machineId,
+        fromSec: s.coverage?.fromSec ?? Infinity,
+        toSec: s.coverage?.toSec ?? -Infinity,
+        generatedAt: s.generatedAt,
+      }));
   }
 
   // MARK: 查询
 
   /** 半开区间 [fromSec, toSec) 内的等价支出（秒为单位的时间戳）。 */
-  spent(fromSec, toSec, { includeOpenMinute = false, group = null } = {}) {
-    const table = this.#table(group);
+  spent(fromSec, toSec, { includeOpenMinute = false, group = null, localOnly = false } = {}) {
+    const table = this.#table(group, localOnly);
     if (!table || !table.minutes.length) return 0;
     const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
     const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + (includeOpenMinute ? 1 : 0));
@@ -326,60 +377,74 @@ export class CostLedger {
   }
 
   /** 半开区间内有支出的分钟数（活跃分钟）：分钟桶只在有消费时才存在，计数即活跃。 */
-  activeMinutes(fromSec, toSec, { group = null } = {}) {
-    const table = this.#table(group);
+  activeMinutes(fromSec, toSec, { group = null, localOnly = false } = {}) {
+    const table = this.#table(group, localOnly);
     if (!table || !table.minutes.length) return 0;
     const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
     const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + 1);
     return Math.max(0, hi - lo);
   }
 
-  /** 出现过官方云端消费的家族 id 集合（含只在分钟桶里留痕的历史家族）。 */
+  /** 出现过官方云端消费的家族 id 集合（含只在分钟桶里留痕的历史家族与外机分片家族）。 */
   familyIds() {
     const ids = new Set(Object.keys(this.familyLatest));
     for (const k of Object.keys(this.family)) ids.add(k.slice(0, k.indexOf('|')));
+    for (const s of this.foreignShards) {
+      for (const k of Object.keys(s.family ?? {})) ids.add(k.slice(0, k.indexOf('|')));
+    }
     ids.delete('');
     return [...ids];
   }
 
-  familySpent(fromSec, toSec, familyId, { includeOpenMinute = false } = {}) {
-    const table = this.#familyTable(familyId);
+  familySpent(fromSec, toSec, familyId, { includeOpenMinute = false, localOnly = false } = {}) {
+    const table = this.#familyTable(familyId, localOnly);
     if (!table || !table.minutes.length) return 0;
     const lo = lowerBound(table.minutes, Math.floor(fromSec / 60));
     const hi = lowerBound(table.minutes, Math.floor(toSec / 60) + (includeOpenMinute ? 1 : 0));
     return table.prefix[hi] - table.prefix[lo];
   }
 
-  #table(group) {
+  #table(group, localOnly = false) {
+    const merged = !localOnly && this.foreignShards.length > 0;
     if (group) {
       const g = group.toLowerCase();
-      if (!this.#scopedIndex[g]) this.#buildScopedIndex(g);
-      return this.#scopedIndex[g];
+      const idx = merged ? this.#mergedScopedIndex : this.#scopedIndex;
+      if (!idx[g]) idx[g] = prefixSums(this.#entries('scoped', g + '|', merged));
+      return idx[g];
     }
-    if (!this.#index) this.#buildIndex();
+    if (merged) {
+      if (!this.#mergedIndex) this.#mergedIndex = prefixSums(this.#entries('buckets', null, true));
+      return this.#mergedIndex;
+    }
+    if (!this.#index) this.#index = prefixSums(this.#entries('buckets', null, false));
     return this.#index;
   }
 
-  #familyTable(familyId) {
+  #familyTable(familyId, localOnly = false) {
     const id = String(familyId || '').toLowerCase();
-    if (!this.#familyIndex[id]) {
-      const head = id + '|';
-      this.#familyIndex[id] = prefixSums(Object.entries(this.family)
-        .filter(([k]) => k.startsWith(head))
-        .map(([k, v]) => [Number(k.slice(head.length)), v]));
-    }
-    return this.#familyIndex[id];
+    const merged = !localOnly && this.foreignShards.length > 0;
+    const idx = merged ? this.#mergedFamilyIndex : this.#familyIndex;
+    if (!idx[id]) idx[id] = prefixSums(this.#entries('family', id + '|', merged));
+    return idx[id];
   }
 
-  #buildIndex() {
-    this.#index = prefixSums(Object.entries(this.buckets).map(([k, v]) => [Number(k), v]));
-  }
-
-  #buildScopedIndex(g) {
-    const head = g + '|';
-    this.#scopedIndex[g] = prefixSums(Object.entries(this.scoped)
-      .filter(([k]) => k.startsWith(head))
-      .map(([k, v]) => [Number(k.slice(head.length)), v]));
+  /**
+   * 某字段（buckets/scoped/family）的 [分钟, 美元] 条目表。head 给定时只取该前缀的键并
+   * 剥掉前缀；merged 为真时把全部外机分片的同名字段逐分钟求和进来。
+   */
+  #entries(field, head, merged) {
+    const sum = new Map();
+    const fold = (obj) => {
+      for (const [k, v] of Object.entries(obj ?? {})) {
+        if (head != null && !k.startsWith(head)) continue;
+        const minute = Number(head != null ? k.slice(head.length) : k);
+        if (!Number.isFinite(minute)) continue;
+        sum.set(minute, (sum.get(minute) ?? 0) + (Number(v) || 0));
+      }
+    };
+    fold(this[field]);
+    if (merged) for (const s of this.foreignShards) fold(s[field]);
+    return [...sum.entries()];
   }
 
   get totalRecords() { return this.transcriptRecords + this.ledgerRecords; }

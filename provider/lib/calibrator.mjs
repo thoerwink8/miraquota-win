@@ -13,10 +13,14 @@
  *    内的观测一并剔除（对面在跑，相邻分钟大概率也在跑）；
  * 2. 聚合用「按点数加权的隐含单价中位数」而非 Σ$/Σ点：污染样本单价系统性偏低、
  *    堆在一侧，中位数最多容忍近半污染。
+ *
+ * 多机账本同步（docs/MULTI-MACHINE.md）启用后，账本支出已是全机合并口径：
+ * 一段观测只有当在场每台外机分片的 coverage 都盖住它时才算「全覆盖」，此时分子
+ * 已含他机支出，不再被上面第 1 条误伤；不全覆盖的时段沿用第 1 条兜底剔除。
  */
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { modelGroup } from './windows.mjs';
 
 const STATE_DIR = join(homedir(), '.miraquota');
@@ -32,20 +36,22 @@ const CONFIDENCE = { none: 0, low: 1, medium: 2, high: 3 };
 const CONFIDENCE_LABEL = { none: '无样本', low: '标定中', medium: '收敛中', high: '高置信' };
 
 export class Calibrator {
-  constructor() {
+  /** @param stateFile 状态文件路径（测试注入用，默认 ~/.miraquota/calibration.json） */
+  constructor(stateFile = STATE_FILE) {
+    this.stateFile = stateFile;
     this.points = {};   // label → [{ at, used, budget, resetAt }]
     this.#load();
   }
 
   #load() {
-    try { this.points = JSON.parse(readFileSync(STATE_FILE, 'utf8')).points ?? {}; }
+    try { this.points = JSON.parse(readFileSync(this.stateFile, 'utf8')).points ?? {}; }
     catch { /* 首次运行 */ }
   }
 
   #save() {
     try {
-      mkdirSync(STATE_DIR, { recursive: true });
-      writeFileSync(STATE_FILE, JSON.stringify({ points: this.points }));
+      mkdirSync(dirname(this.stateFile), { recursive: true });
+      writeFileSync(this.stateFile, JSON.stringify({ points: this.points }));
     } catch { /* ignore */ }
   }
 
@@ -103,7 +109,8 @@ export class Calibrator {
 
   /**
    * 逐对配对出 (cost, unit, from, to) 观测。两侧挂起，窗口滚动或回落即清挂起。
-   * 挂起增量超时 ⇒ 记一段他机活跃，与其（含 FOREIGN_PAD 扩散）相交的观测剔除。
+   * 挂起增量超时 ⇒ 记一段他机活跃，与其（含 FOREIGN_PAD 扩散）相交的观测剔除；
+   * 多机同步在场时，被全部外机分片覆盖的观测豁免剔除（分子已含他机支出）。
    */
   #observe(samples, ledger, group) {
     const obs = [];
@@ -129,8 +136,14 @@ export class Calibrator {
         unitSince = b.at;
       }
     }
+    // 覆盖门：在场每台外机分片（未过期）都盖住 [from,to] 的观测才算全覆盖。
+    // 全覆盖 ⇒ 合并口径的支出已含他机，剔除反而丢真样本；不全覆盖 ⇒ 沿用剔除兜底。
+    const coverage = typeof ledger.foreignCoverage === 'function' ? ledger.foreignCoverage() : [];
+    const covered = (o) => coverage.length > 0
+      && coverage.every((c) => c.fromSec <= o.from && c.toSec >= o.to);
     const kept = foreign.length
-      ? obs.filter((o) => !foreign.some(([f, t]) => o.to >= f - FOREIGN_PAD && o.from <= t + FOREIGN_PAD))
+      ? obs.filter((o) => covered(o)
+        || !foreign.some(([f, t]) => o.to >= f - FOREIGN_PAD && o.from <= t + FOREIGN_PAD))
       : obs;
     return { obs: kept, dropped: obs.length - kept.length };
   }

@@ -12,6 +12,7 @@ import { execFile } from 'node:child_process';
 
 import { Pricing } from './pricing.mjs';
 import { CostLedger } from './ledger.mjs';
+import { LedgerSync } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
@@ -109,6 +110,7 @@ export class Engine {
    * @param opts.routerPort  指定路由端口，跳过发现
    * @param opts.routerToken 指定会话令牌（否则 Windows 走 PEB 自动发现）
    * @param opts.forceOffline 强制离线（验证降级路径用）
+   * @param opts.syncOpts    多机账本同步的路径注入（测试用，默认走 ~/.miraquota）
    */
   constructor(opts = {}) {
     this.opts = opts;
@@ -117,11 +119,33 @@ export class Engine {
     this.pointsAttrib = new PointsAttributor();
     this.calibrator = new Calibrator();
     this.anchors = new AnchorStore();
+    this.sync = new LedgerSync(opts.syncOpts);
+    // 同步启用时放宽归因静置：外机支出要等它下一轮发布分片才可见（见 points-attrib.mjs）。
+    if (this.sync.enabled) this.pointsAttrib.relaxSettle(this.sync.intervalSec);
     this.speed = null;
     this.cachedRouter = null;
     this.last = null;           // { at, limits }
     this.pointsTrail = {};
     this.everConnected = false;
+  }
+
+  #syncBusy = false;
+  #syncKickedAt = 0;
+
+  /**
+   * 多机账本同步：按 intervalSec 节流触发，异步跑完把外机分片交给账本合并。
+   * 失败不阻断主流程，只更新 sync 状态（payload 里可见）。
+   */
+  #maybeSync() {
+    if (!this.sync.enabled || this.#syncBusy) return;
+    const now = Date.now() / 1000;
+    if (now - this.#syncKickedAt < this.sync.intervalSec) return;
+    this.#syncKickedAt = now;
+    this.#syncBusy = true;
+    this.sync.run(this.ledger, now)
+      .then((r) => { if (r) this.ledger.adoptForeignShards(r.shards); })
+      .catch(() => { /* run 自吞错误，这里兜底防未处理拒绝 */ })
+      .finally(() => { this.#syncBusy = false; });
   }
 
   /**
@@ -311,6 +335,7 @@ export class Engine {
       }
     }
     this.ledger.refresh();
+    this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
     this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
     this.#speedRefresh();
     return !!this.last;
@@ -458,7 +483,8 @@ export class Engine {
   /**
    * 「今天」摘要（自然日 0 点起）：官方窗口没有日口径，这里用官方点数增量逐段累加补上。
    * 点数取非档位、周期最长的窗（7d）——重置最少，consumedPoints 的停机补账最完整；
-   * 点数是账号级（含他机），美元是本机账本，两者口径不同，展示时分开标。
+   * 点数是账号级（含他机），美元是账本口径（未启用多机同步时即本机；启用后含已同步的
+   * 外机分片，与点数的差距只剩同步时滞），展示时分开标。
    */
   #todaySummary(now) {
     const midnight = new Date(now * 1000);
@@ -503,6 +529,8 @@ export class Engine {
       windows,
       today: this.#todaySummary(Date.now() / 1000),
       speed: this.#speedReport(),
+      // 无同步配置时不出现该字段，显示面据此不画任何新 UI（硬性验收项）。
+      ...(this.sync.enabled ? { sync: this.sync.status() } : {}),
     };
   }
 }

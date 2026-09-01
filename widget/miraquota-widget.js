@@ -23,6 +23,7 @@
  * v22 明确所有满额与余量美元都是推算值；收起状态的账号级金额也带 ≈。
  * v23 将满额标签改为「官≈」（官方点数反推）与「预≈」（本机账本预测），并统一顺序。
  * v24 跟随桌面端计费家族选择，为最近 5 种具体模型标出当前家族并展开最近 5 个任务。
+ * v25 多机账本同步启用时在账本行加一段状态（×N 机器 / 同步失败）；无同步配置零变化。
  * v20 满额不可用时主行改用点数：兜底满额来自本机账本反推的每点美元，账本失真会把满额
  * 同倍放大，而卡面只有一个 `~` 前缀。provider 侧判出账本与点数不自洽即不再给 fullUSD，
  * 此时把账本支出抬到主行同样不可信，故主行取点数，账本留在副行。
@@ -35,7 +36,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 24;
+  const VERSION = 25;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -1079,6 +1080,12 @@
     const ledger = [];
     if (d.buckets != null) ledger.push(`${d.buckets} 分钟桶`);
     if (d.pricing) ledger.push(d.pricing);
+    // 多机账本同步：payload 无 sync 字段（未配置）时这里什么都不加，界面零变化。
+    if (d.sync) {
+      ledger.push(d.sync.error ? '多机同步失败'
+        : d.sync.machines > 1 ? `多机账本 ×${d.sync.machines}${d.sync.lastSyncSec ? ' · ' + ago(d.sync.lastSyncSec) : ''}`
+        : '多机账本 · 未见其他机器');
+    }
     setHidden(els.rowLedger, !ledger.length);
     setText(els.metaLedger, ledger.join(' · '));
 
