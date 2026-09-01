@@ -46,6 +46,14 @@
   .titlebar .logo { width: 16px; height: 16px; }
   .titlebar .name { font-weight: 600; font-size: 13px; letter-spacing: .2px; }
   .titlebar .ver { font-size: 10.5px; color: var(--ink3); margin-left: -2px; }
+  /* 有新版时的角标。no-drag 是必须的：标题栏整块是拖拽区，缺这行按钮点不动——
+     点击会被当成拖窗口，界面上看不出任何异常（2026-09-02 实测踩过）。 */
+  .titlebar .newver {
+    -webkit-app-region: no-drag; cursor: pointer; border: 0; font: inherit;
+    font-size: 10.5px; font-weight: 700; line-height: 1.6; padding: 1px 8px; border-radius: 99px;
+    background: var(--accent); color: var(--bg);
+  }
+  .titlebar .newver:hover { filter: brightness(1.08); }
   .badge {
     font-size: 10.5px; padding: 2px 8px; border-radius: 99px; font-weight: 600;
     background: var(--okbg); color: var(--ok);

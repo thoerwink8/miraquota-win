@@ -59,6 +59,10 @@ test('the whole update prompt is one badge in the title bar', () => {
   assert.match(updater, /promptInstall/);
   assert.ok(updater.includes("buttons: ['安装并重启', '稍后']"), '确认框要给出两个选择');
   assert.match(main, /update:prompt/);
+  // 标题栏是拖拽区：角标缺 no-drag 就点不动，且界面上完全看不出异常（v0.9.6 实测踩过，
+  // 删提示条时把角标样式一起删了，用户点了半天没反应）。
+  const badgeCss = renderer.slice(renderer.indexOf('.titlebar .newver'), renderer.indexOf('.titlebar .newver') + 260);
+  assert.match(badgeCss, /-webkit-app-region: no-drag/);
 });
 
 test('checking failures never reach the panel', () => {
