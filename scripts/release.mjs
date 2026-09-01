@@ -29,11 +29,14 @@ const version = versionAt >= 0 ? args[versionAt + 1] : resolveVersion(ROOT);
 if (!/^\d+\.\d+\.\d+$/.test(version)) die('版本号需要 x.y.z 格式');
 const tag = `v${version}`;
 
-// 工作区脏 ⇒ 发出去的包和 tag 指的提交对不上，用户拿到的版本号会撒谎。
-const dirty = run('git', ['status', '--porcelain']).stdout?.trim();
+// 已跟踪文件脏 ⇒ 发出去的包和 tag 指的提交对不上，用户拿到的版本号会撒谎。
+// 未跟踪文件不拦（草稿、截图常年躺在仓里），但落在打包目录里的会被打进包，值得提一句。
+const dirty = run('git', ['status', '--porcelain', '--untracked-files=no']).stdout?.trim();
 if (dirty && !args.includes('--allow-dirty')) {
-  die(`工作区还有未提交改动，先提交再发版（确要带着改动发：--allow-dirty）：\n${dirty}`);
+  die(`已跟踪文件还有未提交改动，先提交再发版（确要带着改动发：--allow-dirty）：\n${dirty}`);
 }
+const strays = (run('git', ['ls-files', '--others', '--exclude-standard', 'app', 'provider', 'widget']).stdout ?? '').trim();
+if (strays) console.warn(`[release] 注意：这些文件没提交，但会被打进包里：\n${strays}`);
 
 console.log(`[release] ${tag}`);
 const built = runLoud('node', ['scripts/dist.mjs', ...args]);
