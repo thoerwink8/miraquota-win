@@ -405,10 +405,15 @@ export class Engine {
       const start = dur ? w.resetAt - dur : null;
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
       // 满额口径：整窗支出 ÷ 整窗点数 × 预算点（2026-09-02 用户拍板，与官方宣称对得上）。
-      // 总窗用折算后的基准单价（rate 已含档位倍率）；档位窗用它自己的支出与点数——
-      // 它的点是从同一个池里按倍率扣的，除出来就是该档位的每点美元，不必再折算。
+      // 总窗 = 折算后的基准单价 × 预算点；档位窗 = 基准单价 ÷ 该档位倍率 × 预算点——
+      // 面板上每个数都由同一个模型（基准单价 + 倍率表）推出来，改设置时整块一起动。
+      // 早先档位窗走的是它自己的实测比值，与设置无关，导致「改了倍率有的动有的不动」
+      // （用户 2026-09-02 指出）。倍率设成实测值时两种算法只差 0.1%，不丢精度。
+      // 基准单价给不出时才退回该档位自己的实测比值——宁可用实测，也不要没有数。
+      const groupRatio = group ? this.settings.ratioOf(group) : 1;
       const ratioFull = group
-        ? (spent > 0 && w.used > 0 ? spent / w.used * w.budget : null)
+        ? (rate != null && groupRatio > 0 ? rate / groupRatio * w.budget
+          : (spent > 0 && w.used > 0 ? spent / w.used * w.budget : null))
         : (rate != null ? rate * w.budget : null);
       const { fullUSD, confidence, sampleCount, dropped, basis, conservativeUSD } =
         this.#fullOf(w.label, w.budget, group, ratioFull);
