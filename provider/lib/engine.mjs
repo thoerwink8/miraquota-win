@@ -24,6 +24,7 @@ import { AnchorStore } from './anchors.mjs';
 const CHANNEL_DEFAULT = 4970;
 const STALE_AFTER = 90;      // 秒；超过转 stale
 const RECKON_AFTER = 600;    // 秒；stale 超过此龄期转锚点推算
+const AUTOJOIN_EVERY = 3600; // 秒；未配置多机同步时，隔多久静默探一次默认仓能不能读
 export const LEVELS = {
   exact: '精确', stale: '已过期', reckoned: '推算', local: '无数据', connecting: '连接中',
 };
@@ -131,13 +132,32 @@ export class Engine {
 
   #syncBusy = false;
   #syncKickedAt = 0;
+  #autoJoinBusy = false;
+  #autoJoinAt = 0;
+
+  /**
+   * 没配置多机同步时，隔一阵静默探一次默认仓能不能读，能读就自己接上（见 ledger-sync）。
+   * 探不通什么都不发生，所以这里不记状态、不进 payload——用户看到的仍是「没有多机页」。
+   * 首次在启动后第一跳就探（#autoJoinAt=0），之后每 AUTOJOIN_EVERY 一次：
+   * 这台机器刚 gh auth login 完，不用重启应用也能在下一轮自己接上。
+   */
+  #maybeAutoJoin(now) {
+    if (this.#autoJoinBusy || now - this.#autoJoinAt < AUTOJOIN_EVERY) return;
+    this.#autoJoinAt = now;
+    this.#autoJoinBusy = true;
+    this.sync.tryAutoJoin()
+      .then((joined) => { if (joined) this.pointsAttrib.relaxSettle(this.sync.intervalSec); })
+      .catch(() => { /* tryAutoJoin 自吞错误，这里兜底防未处理拒绝 */ })
+      .finally(() => { this.#autoJoinBusy = false; });
+  }
 
   /**
    * 多机账本同步：按 intervalSec 节流触发，异步跑完把外机分片交给账本合并。
    * 失败不阻断主流程，只更新 sync 状态（payload 里可见）。
    */
   #maybeSync() {
-    if (!this.sync.enabled || this.#syncBusy) return;
+    if (!this.sync.enabled) { this.#maybeAutoJoin(Date.now() / 1000); return; }
+    if (this.#syncBusy) return;
     const now = Date.now() / 1000;
     if (now - this.#syncKickedAt < this.sync.intervalSec) return;
     this.#syncKickedAt = now;

@@ -29,6 +29,16 @@ const ERROR_STREAK = 2;         // 连续失败达到这个轮数才进 error（
 export const SHARD_SCHEMA = 1;
 
 /**
+ * 新机器免手写配置：没有 sync.json 时先静默探一下这个仓能不能读，能读才自动接入
+ * （2026-09-02 用户拍板）。地址写在这里是有意的——仓是私有的，读得动的前提是那台机器
+ * 本来就有本人的 GitHub 凭据；陌生人装了公开版探测必然失败，于是什么都不发生，
+ * 与今天「没配置就整个功能关闭」的行为逐字一致。不想自动接入见 AUTOJOIN_OFF。
+ */
+export const DEFAULT_REMOTE = 'https://github.com/thoerwink8/miraquota-ledger.git';
+/** 探测超时；托盘常驻应用后台跑，宁可等久一点也不要因为网络慢误判成「不能接」。 */
+const PROBE_TIMEOUT_MS = 20_000;
+
+/**
  * 单轮内退避重试一次：网络抖动不该被记成一次失败。
  * 代价：git 调用自带 30s 超时，重试后单步最坏 ~62s，仍远小于同步间隔（默认 600s），
  * 且 run() 在 engine 里是后台异步任务，不阻断轮询主流程。
@@ -65,10 +75,21 @@ export function cleanMachineId(name = hostname()) {
   return id || 'machine';
 }
 
+/**
+ * 后台跑的 git 一律禁止任何交互：托盘应用弹不出终端，凭据管理器却可能弹出登录窗口，
+ * 用户看到的是「我没干什么，突然要我登 GitHub」。凭据已存在则照常走 helper，不受影响。
+ */
+const NO_PROMPT_ENV = {
+  ...process.env,
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_ASKPASS: 'echo',      // 问密码就返回空 → 立刻失败，不弹窗
+  GCM_INTERACTIVE: 'never', // Windows 凭据管理器不弹登录界面
+};
+
 /** 系统 git CLI。stderr 并入报错信息，供 payload 的 sync.error 展示一行。 */
-const git = (cwd, args) => new Promise((resolve, reject) => {
+const git = (cwd, args, timeout = 30_000) => new Promise((resolve, reject) => {
   execFile('git', ['-C', cwd, ...args],
-    { timeout: 30_000, maxBuffer: 8 << 20, windowsHide: true },
+    { timeout, maxBuffer: 8 << 20, windowsHide: true, env: NO_PROMPT_ENV },
     (err, stdout, stderr) => {
       if (err) reject(new Error(String(stderr || err.message || err).trim() || 'git 失败'));
       else resolve(String(stdout));
@@ -95,6 +116,7 @@ export class LedgerSync {
     this.pushOk = false;       // 最近一轮本机分片是否推送成功（区分「只是读不到他机」）
     this.failStreak = 0;       // 连续失败轮数：抖动一次不报红，达 ERROR_STREAK 才报
     this.config = this.#loadConfig();
+    this.autoJoined = !!this.config?.autoJoinedAt;   // 配置是自动接入写的（UI 交代一句来源）
   }
 
   /** 文件不存在、解析失败或无 remote ⇒ 功能关闭（硬性验收：现行为零变化）。 */
@@ -106,12 +128,44 @@ export class LedgerSync {
       return {
         remote: c.remote.trim(),
         intervalSec: Number.isFinite(interval) && interval > 0 ? interval : DEFAULT_INTERVAL,
+        // 自动接入写下的来源标记，重启后仍认得出（UI 据此说明这台机器是自己接上的）
+        ...(typeof c.autoJoinedAt === 'string' ? { autoJoinedAt: c.autoJoinedAt } : {}),
       };
     } catch { return null; }
   }
 
   get enabled() { return !!this.config; }
   get intervalSec() { return this.config?.intervalSec ?? DEFAULT_INTERVAL; }
+
+  /**
+   * 新机器自动接入：没有 sync.json 时，静默探一下默认仓能不能读，能读才写配置并启用。
+   *
+   * 三条硬边界——
+   *  ① 文件存在就一律不动（哪怕内容是空的、坏的、autoJoin:false）：用户配过的就是他说了算；
+   *  ② 探测用 git ls-remote，只读、不建仓、不留痕，失败就当没发生过（不记 error、不进界面），
+   *     这样陌生人装公开版仍是「整个功能关闭」，与今天零差别；
+   *  ③ 写进去的 remote 和探通的是同一个地址，不给「探 A 用 B」留缝。
+   *
+   * @returns true 表示本次接上了（调用方据此放宽归因静置），其余情况一律 false。
+   */
+  async tryAutoJoin({ remote = DEFAULT_REMOTE, now = new Date() } = {}) {
+    if (this.enabled || existsSync(this.configFile) || !remote) return false;
+    try {
+      await git(homedir(), ['ls-remote', '--heads', remote], PROBE_TIMEOUT_MS);
+    } catch { return false; }   // 没凭据/没网/不是这台机器该管的仓：静默作罢，下次再探
+    try {
+      mkdirSync(join(this.configFile, '..'), { recursive: true });
+      writeFileSync(this.configFile, JSON.stringify({
+        remote,
+        intervalSec: DEFAULT_INTERVAL,
+        // 留个来源标记：以后看到这台机器怎么接上的，不用猜（也让 UI 能说一句人话）
+        autoJoinedAt: now.toISOString(),
+      }, null, 2) + '\n');
+    } catch { return false; }
+    this.config = this.#loadConfig();
+    this.autoJoined = this.enabled;
+    return this.enabled;
+  }
 
   /** 同步仓就绪：init + repo 级身份（不碰全局配置）+ origin 对齐 sync.json 的 remote。 */
   async #ensureRepo() {
@@ -221,6 +275,7 @@ export class LedgerSync {
         { id: this.machineId, lastShardSec: this.lastPublishSec, self: true },
         ...this.shards.map((s) => ({ id: s.machineId, lastShardSec: s.generatedAt, self: false })),
       ],
+      ...(this.autoJoined ? { autoJoined: true } : {}),
       ...(this.lastSyncSec != null ? { lastSyncSec: this.lastSyncSec } : {}),
       ...(this.lastError ? { error: this.lastError } : {}),
       ...(hint ? { errorHint: hint } : {}),

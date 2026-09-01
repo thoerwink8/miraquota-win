@@ -656,7 +656,12 @@
       }).join('');
       const basis = [`每 ${Math.round((sy.intervalSec ?? 600) / 60)} 分钟同步一轮`];
       if (sy.lastSyncSec) basis.push(`上次完整成功 ${ago(sy.lastSyncSec)}`);
-      basis.push('配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即完全关闭）');
+      // 自动接入的机器要把「怎么接上的」和「怎么关掉」一起说清楚：此时删文件会被重新接回，
+      // 真正的关闭是把文件内容改成 {"autoJoin": false}（文件在就不再自动探测）。
+      basis.push(sy.autoJoined
+        ? '本机未配置，探到默认仓可读后自动接入 · 配置在 <code>~/.miraquota/sync.json</code>'
+          + '（要关掉就把内容改成 <code>{"autoJoin": false}</code>；直接删会在 1 小时内自动接回）'
+        : '配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即完全关闭）');
       $('syncBasis').innerHTML = basis.join(' · ');
     }
 

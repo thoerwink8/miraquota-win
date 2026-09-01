@@ -34,6 +34,22 @@ Mirasim 的额度点是**账号级**（所有机器共用一个池），而本�
    `intervalSec` 可省略（默认 600 秒）。**文件不存在或无 remote 时功能完全关闭，
    行为与从前完全一致。**
 3. 重启 MiraQuota（桌面版或 provider）。首轮 poll 即同步一次，之后按 intervalSec 节流。
+
+### 新机器免手写：自动接入（v0.6 起）
+
+没有 `sync.json` 的机器，每小时会静默探一次内置的默认仓
+（`DEFAULT_REMOTE`，见 `provider/lib/ledger-sync.mjs`）能不能读：
+
+- **能读**（这台机器本来就有本人的 GitHub 凭据）⇒ 自动写好 `sync.json` 并开始同步，
+  多机页会注明「探到默认仓可读后自动接入」；
+- **读不动**（陌生人装了公开版、没凭据、没网）⇒ 什么都不发生，不记错误也不进界面，
+  与「没配置就整个功能关闭」逐字一致。
+
+探测只跑 `git ls-remote`（只读、不建仓、不留痕），且所有后台 git 都禁用交互
+（`GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never`），不会弹出登录窗口。
+
+**关掉自动接入**：把 `~/.miraquota/sync.json` 的内容改成 `{"autoJoin": false}`——
+文件存在就一律不再探测，而无 remote 又意味着同步关闭。直接删文件不行，一小时内会被接回。
 4. 验证：面板页签末尾出现「多机」页（未配置时这一页与页签都不存在），状态绿标「GitHub 已接入」，每台机器一行
    「<id> · N 分钟前推送」（本机有标注）；远端仓出现 `machine/<各机器名>`
    分支且各只有 1 个提交；`~/.miraquota/sync-repo` 里只有本机的 `shard.json`。
