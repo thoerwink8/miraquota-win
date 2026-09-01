@@ -120,3 +120,13 @@ test('every window reports the total-ratio full value, median only as fallback',
   assert.ok(src.includes("fullUSD: est.fullUSD, basis: 'median'"), '给不出时才退回中位数');
   assert.match(src, /conservativeUSD/);
 });
+
+test('a ratio that contradicts the measured one is called out on the scoped card', () => {
+  // 用户把 fable 倍率改成 1 后问「fable 满额怎么没变」——不是没生效：档位卡的满额是
+  // 实测口径（该档位自己的支出 ÷ 自己的点数），设置只改总窗。两者矛盾时必须说出来，
+  // 否则用户只看到两个对不上的数，不知道是自己的设置与事实不符。
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  assert.match(renderer, /设置 \$\{cost\.ratio\}× 与实测/);
+  assert.ok(renderer.includes('Math.abs(cost.measured - cost.ratio) / cost.measured > 0.15'),
+    '偏差超过 15% 才提示，免得实测噪声天天报警');
+});

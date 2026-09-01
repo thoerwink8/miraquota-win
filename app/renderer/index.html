@@ -510,7 +510,16 @@
   function ratioNote(w) {
     if (!w.modelGroup || !w.points || w.fullUSD == null) return "";
     const cost = (latest?.pointCost ?? []).find((c) => c.group === w.modelGroup);
-    if (!cost || !(cost.ratio > 1)) return "";
+    if (!cost) return "";
+    // 这张卡的满额是实测口径（该档位自己的支出 ÷ 自己的点数），不随设置变。设置只改总窗。
+    // 两者对不上时要说出来——用户把倍率改成 1 后问过「fable 满额怎么没变」，那不是没生效，
+    // 是这个设置与实测扣点矛盾了（实测 2.01×）。
+    if (cost.measured && Math.abs(cost.measured - cost.ratio) / cost.measured > 0.15) {
+      const implied = (latest.unitPriceUSD ?? 0) / cost.ratio * w.points.budget;
+      return `<div class="row fam"><span>设置 ${cost.ratio}× 与实测 ${cost.measured.toFixed(2)}× 不符：`
+        + `本卡按实测给 ${money(w.fullUSD, 0)}，若真按 ${cost.ratio}× 应是 ${money(implied, 0)}</span></div>`;
+    }
+    if (!(cost.ratio > 1)) return "";
     const pool = latest?.windows?.find((x) => !x.modelGroup && x.durationSeconds === w.durationSeconds);
     const share = pool?.points ? Math.round(w.points.budget / pool.points.budget * 100) : null;
     // 「用满即止」是关键约束：用户问过「全用 fable 不该有 2800 吗」——那是整池都买
