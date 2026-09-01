@@ -68,6 +68,15 @@ if (dirty && !args.includes('--allow-dirty')) {
 const strays = (run('git', ['ls-files', '--others', '--exclude-standard', 'app', 'provider', 'widget']).stdout ?? '').trim();
 if (strays) console.warn(`[release] 注意：这些文件没提交，但会被打进包里：\n${strays}`);
 
+/**
+ * HEAD 必须已经在远端：否则 gh 会把 tag 打在远端分支当前的提交上，而安装包是本地 HEAD
+ * 编译的——tag 指着旧代码，release 里躺着新包，事后只能手工 retag（v0.9.2 实测踩过）。
+ * 推送失败最常见的原因是网络抖动，那时更要拦住：发出去的东西必须能被追溯到确切提交。
+ */
+const head = run('git', ['rev-parse', 'HEAD']).stdout?.trim();
+const onRemote = run('git', ['branch', '--remotes', '--contains', head]).stdout?.trim();
+if (!onRemote) die(`HEAD (${head?.slice(0, 8)}) 还没推到远端，tag 会打在旧提交上。先 git push 再发版。`);
+
 console.log(`[release] ${tag}`);
 const built = runLoud('node', ['scripts/dist.mjs', ...args]);
 if (built.status !== 0) die('打包失败，未发版');
@@ -83,7 +92,8 @@ if (missing.length) die(`产物缺失，发出去也没法自动更新：\n${mis
 const exists = run('gh', ['release', 'view', tag]).status === 0;
 const r = exists
   ? gh(['release', 'upload', tag, ...assets, '--clobber'])
-  : gh(['release', 'create', tag, ...assets,
+  // --target 钉死在本次打包的提交上，不让 gh 拿远端分支的当前 HEAD 兜底
+  : gh(['release', 'create', tag, ...assets, '--target', head,
       '--title', `MiraQuota ${version}`, '--generate-notes']);
 if (r.status !== 0) die('gh 发布失败');
 

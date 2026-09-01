@@ -57,3 +57,11 @@ test('update banner shows progress and readiness, never a failed check', () => {
   assert.match(main, /检查更新/);
   assert.doesNotMatch(renderer, /更新失败/);
 });
+
+test('release refuses when HEAD is not on the remote, and pins the tag to that commit', () => {
+  // 实测踩过（v0.9.2）：push 因网络失败但发版继续，gh 把 tag 打在远端分支旧提交上，
+  // 安装包却是本地 HEAD 编译的——tag 指着旧代码，只能事后手工 retag。
+  assert.match(release, /branch', '--remotes', '--contains', head/);
+  assert.match(release, /还没推到远端/);
+  assert.match(release, /'--target', head/);
+});
