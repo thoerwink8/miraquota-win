@@ -81,6 +81,8 @@ if (!app.requestSingleInstanceLock()) {
     });
     win.loadFile(join(HERE, 'renderer', 'index.html'));
     win.once('ready-to-show', () => win.show());
+    // 每次面板露面都补查一次更新（updater 内部有节流）：用户看角标的时刻，结论要新鲜
+    win.on('show', () => updater?.checkOnShow());
     let saveTimer = null;
     const persistBounds = () => {
       clearTimeout(saveTimer);

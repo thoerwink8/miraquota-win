@@ -17,7 +17,12 @@ const { app, dialog } = electron;
 const { autoUpdater } = updaterPkg;
 
 const FIRST_CHECK_MS = 15_000;      // 启动即查会和首帧抢网络，让一让
-const EVERY_MS = 6 * 60 * 60 * 1000; // 6 小时一轮：托盘常驻的应用可能几天不重启
+// 半小时一轮。原来是 6 小时，实测太懒：托盘常驻的实例启动后查一次，用户中途打开面板
+// 看到的永远是几小时前的结论（用户 2026-09-02 报「最新 0.9.12，我这看不到提示」）。
+// 一次检查只是拉几百字节的 latest.yml，密一点不心疼。
+const EVERY_MS = 30 * 60 * 1000;
+// 打开面板时补查一次——那正是用户会看角标的时刻；这个节流防止反复开关窗口猛敲接口。
+const ON_SHOW_MIN_GAP_MS = 3 * 60 * 1000;
 
 /** git/网络类报错的人话归纳，只在用户主动点「检查更新」时用得上。 */
 const HINTS = [
@@ -64,8 +69,10 @@ export function createUpdater({ onState = () => {}, beforeQuit = () => {} } = {}
     }));
   }
 
+  let lastCheckAt = 0;
   async function check() {
     if (!enabled) return state;
+    lastCheckAt = Date.now();
     try { await autoUpdater.checkForUpdates(); } catch { /* 已由 error 事件记下 */ }
     return state;
   }
@@ -113,6 +120,12 @@ export function createUpdater({ onState = () => {}, beforeQuit = () => {} } = {}
       });
       if (response !== 0) return false;
       return install();
+    },
+    /** 面板显示时补查：用户正好在看角标的那一刻，结论不该是几小时前的。 */
+    checkOnShow() {
+      if (!enabled || state.phase === 'ready') return;   // 已就绪就没什么可查了
+      if (Date.now() - lastCheckAt < ON_SHOW_MIN_GAP_MS) return;
+      check();
     },
     start() {
       if (!enabled) return;

@@ -65,6 +65,15 @@ test('the whole update prompt is one badge in the title bar', () => {
   assert.match(badgeCss, /-webkit-app-region: no-drag/);
 });
 
+test('checks are frequent enough that the badge is there when the user looks', () => {
+  // 用户 2026-09-02 报「最新 0.9.12，我这看不到提示」：实例启动后查过一次（那时它就是最新），
+  // 下一次要等 6 小时。半小时一轮 + 面板露面时补查（带节流），才对得上「随时打开看一眼」。
+  assert.ok(updater.includes("const EVERY_MS = 30 * 60 * 1000;"), "轮询间隔应为 30 分钟");
+  assert.match(updater, /checkOnShow/);
+  assert.match(updater, /ON_SHOW_MIN_GAP_MS/);
+  assert.match(main, /win.on('show', () => updater?.checkOnShow())/);
+});
+
 test('checking failures never reach the panel', () => {
   // 与多机同步同一套取舍：抖动不报红。检查失败用户也无事可做，只在主动点托盘
   // 「检查更新」时回话。
