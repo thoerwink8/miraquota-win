@@ -197,6 +197,15 @@
   .sim-line .v.safe { color: var(--ok); }
   .sim-line .v.tight { color: var(--warn); }
   .hint { font-size: 10.5px; color: var(--ink3); margin-top: 8px; line-height: 1.55; }
+
+  /* 口径配置行：与 .sim-ctl 同族的紧凑控件，放在「口径」页顶部，不占首屏 */
+  .cfg { display: flex; align-items: center; gap: 8px; font-size: 11.5px; flex-wrap: wrap; }
+  .cfg input { width: 62px; background: var(--card); border: 1px solid var(--bd); color: var(--ink);
+    border-radius: 6px; padding: 3px 6px; font: inherit; font-variant-numeric: tabular-nums; }
+  .cfg button { -webkit-app-region: no-drag; cursor: pointer; border: 0; border-radius: 6px;
+    padding: 3px 10px; font: inherit; font-weight: 600; background: var(--accent); color: var(--bg); }
+  .cfg .measured { color: var(--ink2); }
+  .cfg .saved { color: var(--ok); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -247,6 +256,19 @@
       </div>
     </div>
     <div class="page" id="pageSpec">
+      <div class="card" id="cfgCard" style="display:none">
+        <div class="cfg">
+          <span>fable 点数计量倍率</span>
+          <input id="fableRatio" type="number" min="0.1" max="10" step="0.1">
+          <span class="measured" id="fableMeasured"></span>
+          <span style="flex:1"></span>
+          <button id="btnRatio">保存</button>
+        </div>
+        <div class="hint">官方口径：fable 资源紧张，同样一份用量按 <b>2 倍</b>扣点，所以 fable 用得越多、
+        额度折算出来的美元越少。这里改的是折算倍率——所有美元数字（满额、已用、剩余）都按
+        「全用非 fable 时的等价支出」重算，与官方「不用 fable 时一周 5600 刀」同口径。
+        改完立即生效并记在 <code>~/.miraquota/settings.json</code>，版本更新不会丢。</div>
+      </div>
       <div class="card"><div class="hint" id="specPrice"></div></div>
       <div class="card"><div class="hint" id="specState"></div></div>
       <div class="card"><div class="hint">
@@ -686,6 +708,11 @@
       const c = p.unitPriceCalc;
       let t = `<b>单价</b> ${p.unitPriceUSD.toFixed(6)} $/点`;
       if (c) t += ` ＝ ${WINDOW_NAME[c.label] ?? c.label}窗本机账本 ${money(c.usd)} ÷ 同期已用 ${Math.round(c.points)} 点`;
+      // 折算过就把原始账本值一并交代：否则用户会拿这个数去对账本，怎么对都对不上
+      if (c?.adjustments?.length) {
+        const parts = c.adjustments.map((a) => `${a.group} ${money(a.usd)}×${a.ratio}`).join('、');
+        t += `<br><b>档位折算</b> 账本原值 ${money(c.rawUSD)}，其中 ${parts}（官方按倍率扣点，倍率可在本页顶部改）`;
+      }
       if (p.unitPriceSpread != null) t += `<br><b>交叉校验</b> 5h/7d 两窗单价离散 ${p.unitPriceSpread.toFixed(2)}×（超过 4× 判不自洽，停用美元显示）`;
       spec.push(t);
     }
@@ -698,6 +725,7 @@
     if (p.sync?.state === 'ok') st2.push(`<b>多机</b> 已合并 ${p.sync.machines.length} 台机器的账本，美元支出为全机合计`);
     if (p.accountNotice) st2.push(`<b>账号</b> ${p.accountNotice}`);
     $('specState').innerHTML = st2.join('<br>');
+    renderPointCost(p.pointCost);
   }
 
   /**
@@ -719,6 +747,29 @@
   }
   window.miraquota.onUpdate?.(renderUpdate);
   window.miraquota.update?.().then(renderUpdate).catch(() => {});
+
+  /**
+   * 档位倍率配置（口径页顶部）。只有官方真的划出该档位窗口时才出现——没有 fable 窗的
+   * 账号看不到一个用不上的开关。实测倍率与配置值并排显示，用户能自己对表再决定填多少。
+   */
+  let cfgReady = false;
+  function renderPointCost(list) {
+    const fable = (list ?? []).find((c) => c.group === 'fable');
+    $('cfgCard').style.display = fable ? '' : 'none';
+    if (!fable) return;
+    if (!cfgReady) { $('fableRatio').value = fable.ratio; cfgReady = true; }   // 别打断正在输入的用户
+    $('fableMeasured').textContent = fable.measured
+      ? `（本机实测 ${fable.measured.toFixed(2)}×：非 fable 单价 ÷ fable 单价，两个数各出自一个官方计数器）`
+      : '（样本还不够，实测倍率暂不可给）';
+  }
+  $('btnRatio').onclick = async () => {
+    const ok = await window.miraquota.setPointCost?.('fable', Number($('fableRatio').value));
+    const tip = document.createElement('span');
+    tip.className = ok ? 'saved' : 'measured';
+    tip.textContent = ok ? '已保存' : '没存上（值要在 0.1–10 之间）';
+    $('fableMeasured').replaceChildren(tip);
+    if (ok) cfgReady = false;   // 下一帧用落盘后的真值回填，确保显示的就是生效的
+  };
 
   let latest = null;
   window.miraquota.onQuota((p) => { latest = p; render(p); });

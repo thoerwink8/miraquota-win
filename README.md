@@ -33,6 +33,10 @@ pnpm release        # 发版：打包 + 用 gh 传 GitHub Releases，各机器�
   下完在面板顶部提示「重启更新」，不点也会在下次退出时装上；
 - **独立于 Mirasim**：Mirasim 在线时走 `/v1/limits` 精确点数（会话令牌 PEB 自动发现）；
   关闭时按落盘的窗口锚点滚动推算，剩余额度仍可读（标 ≈，他人占用不可见故为下界）；
+- **档位点数倍率**：官方对 fable 按 2 倍扣点（同一份用量，走 fable 比走 opus 多耗一倍点数），
+  所有美元数字按「全用非 fable 时的等价支出」折算，与官方「不用 fable 时一周 5600 刀」同口径；
+  倍率可在「口径」页改（默认 2，存 `~/.miraquota/settings.json`，版本更新不丢），旁边给出本机
+  实测倍率供对表——两个数各出自一个独立的官方计数器；
 - **美元口径**：本机账本（Claude Code transcript + Mirasim 网关）折算，满额自标定，
   跨窗口自洽核验，详见 [docs/QUOTA-ESTIMATION.md](docs/QUOTA-ESTIMATION.md)。
 - **模型家族计费**：顶部按本机实际使用过的官方云端模型动态生成 `Claude / GPT / …`

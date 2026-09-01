@@ -16,7 +16,8 @@ import { LedgerSync } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
-import { evaluateCoherence, coherenceNotice } from './coherence.mjs';
+import { evaluateCoherence, coherenceNotice, measureGroupRatio } from './coherence.mjs';
+import { Settings } from './settings.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
 import { windowDuration, modelGroup } from './windows.mjs';
 import { AnchorStore } from './anchors.mjs';
@@ -120,6 +121,7 @@ export class Engine {
     this.pointsAttrib = new PointsAttributor();
     this.calibrator = new Calibrator();
     this.anchors = new AnchorStore();
+    this.settings = new Settings(opts.settingsFile);
     this.sync = new LedgerSync(opts.syncOpts);
     // 同步启用时放宽归因静置：外机支出要等它下一轮发布分片才可见（见 points-attrib.mjs）。
     if (this.sync.enabled) this.pointsAttrib.relaxSettle(this.sync.intervalSec);
@@ -375,7 +377,7 @@ export class Engine {
     const stale = age > STALE_AFTER;
     const level = stale ? 'stale' : 'exact';
     const limits = this.last.limits;
-    const coherence = evaluateCoherence(limits.windows, this.ledger, now);
+    const coherence = evaluateCoherence(limits.windows, this.ledger, now, this.settings.groupPointCost);
     const rate = coherence.perPoint;
 
     let calibDropped = 0;
@@ -423,9 +425,22 @@ export class Engine {
     if (rate != null) {
       out.unitPriceUSD = rate;
       // 公式素材：单价 = 基准窗账本支出 ÷ 同期已用点数；spread 是跨窗交叉校验的离散倍数
-      out.unitPriceCalc = { usd: coherence.basis.usd, points: coherence.basis.points, label: coherence.basis.label };
+      out.unitPriceCalc = {
+        usd: coherence.basis.usd, points: coherence.basis.points, label: coherence.basis.label,
+        ...(coherence.basis.adjustments?.length
+          ? { rawUSD: coherence.basis.rawUSD, adjustments: coherence.basis.adjustments } : {}),
+      };
       if (coherence.spread != null) out.unitPriceSpread = coherence.spread;
     } else { const n = coherenceNotice(coherence); if (n) out.unitPriceNotice = n; }
+    // 档位倍率：配置值与实测值（各出自一个独立的官方计数器）一起给界面，用户能自己对表。
+    const scopedGroups = [...new Set(limits.windows.filter((w) => w.modelScoped)
+      .map((w) => modelGroup(w.label)).filter(Boolean))];
+    if (scopedGroups.length) {
+      out.pointCost = scopedGroups.map((g) => {
+        const m = measureGroupRatio(limits.windows, this.ledger, now, g);
+        return { group: g, ratio: this.settings.ratioOf(g), ...(m ? { measured: m.measured } : {}) };
+      });
+    }
     if (notice) out.accountNotice = notice;
     if (calibDropped > 0) out.calibDropped = calibDropped;
     if (stale) out.detail = `接口已 ${Math.round(age / 60)} 分钟未回传，显示最后一次实测值`;
@@ -481,7 +496,7 @@ export class Engine {
   #localPayload(now) {
     const windows = [['5h', 5 * 3600], ['7d', 7 * 86400]].map(([label, dur]) => {
       const spent = this.ledger.spent(now - dur, now, { includeOpenMinute: true });
-      const est = this.calibrator.estimate(label, this.ledger);
+      const est = this.calibrator.estimate(label, this.ledger, null, null, this.settings.groupPointCost);
       const breakdown = this.#familyBreakdown(now - dur, now, null);
       return {
         label, inferred: true,
@@ -527,7 +542,7 @@ export class Engine {
   }
 
   #fullOf(label, budget, group, rate) {
-    const est = this.calibrator.estimate(label, this.ledger, budget, group);
+    const est = this.calibrator.estimate(label, this.ledger, budget, group, this.settings.groupPointCost);
     const dropped = est?.foreignDropped ?? 0;
     if (est && (est.confidence === 'high' || est.confidence === 'medium')) {
       return { fullUSD: est.fullUSD, confidence: est.confidence, sampleCount: est.observations, dropped };

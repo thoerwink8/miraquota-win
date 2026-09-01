@@ -86,12 +86,12 @@ export class Calibrator {
    * `group` 给定时只计该模型档位组的支出，用于 modelScoped 窗口。
    * 返回 { fullUSD, confidence, observations, coveredPercent } 或 null。
    */
-  estimate(label, ledger, budget = null, group = null) {
+  estimate(label, ledger, budget = null, group = null, groupCost = {}) {
     const samples = this.points[label] ?? [];
     const useBudget = budget ?? samples[samples.length - 1]?.budget;
     if (samples.length < 2 || !(useBudget > 0)) return null;
 
-    const { obs, dropped } = this.#observe(samples, ledger, group);
+    const { obs, dropped } = this.#observe(samples, ledger, group, groupCost);
     if (!obs.length) return null;
     const price = weightedMedianPrice(obs);
     if (!(price > 0)) return null;
@@ -112,16 +112,30 @@ export class Calibrator {
    * 挂起增量超时 ⇒ 记一段他机活跃，与其（含 FOREIGN_PAD 扩散）相交的观测剔除；
    * 多机同步在场时，被全部外机分片覆盖的观测豁免剔除（分子已含他机支出）。
    */
-  #observe(samples, ledger, group) {
+  #observe(samples, ledger, group, groupCost = {}) {
     const obs = [];
     const foreign = [];   // 他机活跃时段 [from, to]
+    // 总窗（group=null）的每段支出要按档位倍率折算，否则同一份 fable 用量在
+    // 回归标定与兜底反推两条路上口径不一，界面会给出两个互相矛盾的满额。
+    // 档位窗自己（group 非空）不折算：它的点数本就是该档位的计数，除出来即该档位单价。
+    const costOf = (from, to) => {
+      const base = ledger.spent(from, to, { group });
+      if (group) return base;
+      let usd = base;
+      for (const [g, ratio] of Object.entries(groupCost)) {
+        if (!(ratio > 0) || ratio === 1) continue;
+        const part = ledger.spent(from, to, { group: g });
+        if (part > 0) usd += (ratio - 1) * part;
+      }
+      return usd;
+    };
     let pendingCost = 0, pendingUnit = 0, unitSince = null, spanStart = null;
     for (let i = 0; i + 1 < samples.length; i++) {
       const a = samples[i], b = samples[i + 1];
       if (b.resetAt !== a.resetAt || b.used < a.used) {
         pendingCost = 0; pendingUnit = 0; unitSince = null; spanStart = null; continue;
       }
-      const cost = ledger.spent(a.at, b.at, { group });
+      const cost = costOf(a.at, b.at);
       if (unitSince != null && b.at - unitSince > CARRY_TIMEOUT) {
         foreign.push([unitSince, b.at]);
         pendingUnit = 0; unitSince = null;

@@ -143,6 +143,12 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.handle('quota:get', () => engine.payload());
     // 与 dist 同一口径（见 app/version.mjs）；安装包无 .git 时回退 package.json（builder 已注入）
     ipcMain.handle('app:version', () => APP_VERSION);
+    // 档位倍率：落盘成功才算改成功，改完立刻重画一帧，用户不用等下一次心跳。
+    ipcMain.handle('settings:pointCost', async (_e, group, ratio) => {
+      const ok = engine.settings.setGroupRatio(group, ratio);
+      if (ok) await tick().catch(() => {});
+      return ok;
+    });
     ipcMain.handle('theme:get', () => applyTheme(readUI().theme));
     ipcMain.handle('theme:set', (_e, v) => {
       const t = applyTheme(v);
