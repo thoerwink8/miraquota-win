@@ -21,12 +21,16 @@
 ## 桌面应用（主形态）
 
 ```powershell
-pnpm install        # 依赖只有 electron / electron-builder（.npmrc 已配 npmmirror）
+pnpm install        # 依赖：electron / electron-builder / electron-updater（.npmrc 已配 npmmirror）
 pnpm dev            # 开发运行（终端若带 ELECTRON_RUN_AS_NODE 需先清掉）
-pnpm dist           # 打包：版本 = 0.2.<git 提交数>（安装版 + 免安装 exe）
+pnpm dist           # 打包：版本 = 0.2.<git 提交数>（NSIS 安装版）
+pnpm release        # 发版：打包 + 用 gh 传 GitHub Releases，各机器自动更新
 ```
 
 - **托盘常驻**：关窗即收到托盘，悬停看摘要，右键可设开机自启；
+- **自动更新**：启动后 15 秒、之后每 6 小时查一次 GitHub Releases，有新版后台差分下载
+  （包里 87MB 绝大部分是 Electron 运行时，日常只改几十 KB 的 JS，实际下载几 MB），
+  下完在面板顶部提示「重启更新」，不点也会在下次退出时装上；
 - **独立于 Mirasim**：Mirasim 在线时走 `/v1/limits` 精确点数（会话令牌 PEB 自动发现）；
   关闭时按落盘的窗口锚点滚动推算，剩余额度仍可读（标 ≈，他人占用不可见故为下界）；
 - **美元口径**：本机账本（Claude Code transcript + Mirasim 网关）折算，满额自标定，

@@ -1,6 +1,6 @@
 {
   "name": "miraquota-win",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Mirasim 额度监控（Windows）：独立桌面应用（托盘常驻），Mirasim 关闭时按锚点推算剩余；另含注入 Mirasim 界面的控件形态",
   "type": "module",
   "private": true,
@@ -16,7 +16,8 @@
     "once": "node provider/miraquota-provider.mjs --once",
     "provider": "node provider/miraquota-provider.mjs",
     "dist": "node scripts/dist.mjs",
-    "postinstall": "node scripts/gen-icon.mjs"
+    "postinstall": "node scripts/gen-icon.mjs",
+    "release": "node scripts/release.mjs"
   },
   "devDependencies": {
     "electron": "^38.1.0",
@@ -45,13 +46,30 @@
       "icon": "build/icon.png",
       "target": [
         {
-          "target": "portable",
+          "target": "nsis",
           "arch": [
             "x64"
           ]
         }
       ]
-    }
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "thoerwink8",
+        "repo": "miraquota-win"
+      }
+    ]
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  }
 }

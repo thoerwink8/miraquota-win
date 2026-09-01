@@ -90,6 +90,19 @@
     font-size: 11px; color: var(--warn); background: var(--warnbg);
     border-radius: 8px; padding: 7px 10px; margin-bottom: 10px; line-height: 1.5;
   }
+
+  /* 更新提示条：只在下载中/已就绪时出现，检查失败不占地方（用户也无事可做）。 */
+  .upd {
+    display: flex; align-items: center; gap: 8px; font-size: 11px;
+    color: var(--accent); background: var(--accentbg);
+    border-radius: 8px; padding: 7px 10px; margin-bottom: 10px;
+  }
+  .upd .sub { color: var(--ink3); }
+  .upd button {
+    margin-left: auto; -webkit-app-region: no-drag; cursor: pointer;
+    border: 0; border-radius: 6px; padding: 3px 9px; font: inherit; font-weight: 600;
+    background: var(--accent); color: var(--bg);
+  }
   .detail:empty { display: none; }
 
   .card {
@@ -211,6 +224,7 @@
     </div>
   </div>
   <div class="scroll">
+    <div class="upd" id="upd" style="display:none"></div>
     <div class="page on" id="pageMain">
       <div class="detail" id="detail"></div>
       <div id="cards"><div class="empty">正在读取额度……</div></div>
@@ -680,6 +694,26 @@
     if (p.accountNotice) st2.push(`<b>账号</b> ${p.accountNotice}`);
     $('specState').innerHTML = st2.join('<br>');
   }
+
+  /**
+   * 更新提示条。下载中顺带报一句实际下载量：差分命中时通常几 MB，
+   * 这是「换安装版」这次改动唯一看得见的收益，值得让用户看见。
+   */
+  function renderUpdate(s) {
+    const el = $('upd');
+    if (!s || (s.phase !== 'downloading' && s.phase !== 'ready')) { el.style.display = 'none'; return; }
+    const v = s.version ? 'v' + s.version : '新版';
+    if (s.phase === 'downloading') {
+      const size = s.totalMB ? ` · 本次下载 ${s.totalMB.toFixed(1)}MB` : '';
+      el.innerHTML = `${v} 下载中 ${s.percent ?? 0}%<span class="sub">${size}</span>`;
+    } else {
+      el.innerHTML = `${v} 已下载<span class="sub">下次退出自动装上</span><button id="btnUpd">重启更新</button>`;
+      $('btnUpd').onclick = () => window.miraquota.installUpdate?.();
+    }
+    el.style.display = 'flex';
+  }
+  window.miraquota.onUpdate?.(renderUpdate);
+  window.miraquota.update?.().then(renderUpdate).catch(() => {});
 
   let latest = null;
   window.miraquota.onQuota((p) => { latest = p; render(p); });

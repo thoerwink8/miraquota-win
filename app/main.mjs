@@ -12,6 +12,7 @@ import { homedir } from 'node:os';
 import { Engine } from '../provider/lib/engine.mjs';
 import { startFeed, Injector } from '../provider/lib/injector.mjs';
 import { resolveVersion } from './version.mjs';
+import { createUpdater } from './updater.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -26,6 +27,7 @@ if (!app.requestSingleInstanceLock()) {
   let win = null;
   let tray = null;
   let engine = null;
+  let updater = null;
   let ticks = 0;
 
   const iconPath = join(HERE, 'assets', 'tray.png');
@@ -113,6 +115,7 @@ if (!app.requestSingleInstanceLock()) {
         checked: app.getLoginItemSettings().openAtLogin,
         click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }),
       },
+      { label: '检查更新', click: () => updater?.checkInteractive() },
       { type: 'separator' },
       { label: '项目主页', click: () => shell.openExternal('https://github.com/Heartcoolman/MiraQuota') },
       { type: 'separator' },
@@ -149,6 +152,16 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.on('win:min', () => win.minimize());
     ipcMain.on('win:hide', () => win.hide());
     ipcMain.on('app:quit', () => { app.isQuittingForReal = true; app.quit(); });
+
+    // 自动更新：状态推给面板画提示条，安装前先放行关窗（托盘版关窗默认只隐藏）。
+    updater = createUpdater({
+      onState: (s) => { if (win && !win.isDestroyed()) win.webContents.send('update', s); },
+      beforeQuit: () => { app.isQuittingForReal = true; },
+    });
+    ipcMain.handle('update:get', () => updater.state());
+    ipcMain.handle('update:check', () => updater.check());
+    ipcMain.handle('update:install', () => updater.install());
+    updater.start();
     await tick();
     setInterval(() => tick().catch(() => {}), HEARTBEAT_MS);
 

@@ -13,8 +13,12 @@ import { resolveVersion } from '../app/version.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-/** dist 里的历史安装包/blockmap：MiraQuota <版本>.exe、MiraQuota Setup <版本>.exe(.blockmap) */
-const OLD_ARTIFACT = /^MiraQuota(?: Setup)? [0-9.]+\.exe(?:\.blockmap)?$/;
+/**
+ * dist 里的历史产物：MiraQuota-Setup-<版本>.exe(.blockmap)，外加带空格的旧命名
+ * （MiraQuota <版本>.exe 免安装包、MiraQuota Setup <版本>.exe）——0.5.32 起产物名不含空格，
+ * 因为 latest.yml 里的下载地址就是无空格名，两边必须字字相同，否则更新会 404。
+ */
+const OLD_ARTIFACT = /^MiraQuota[ -](?:Setup[ -])?[0-9.]+\.exe(?:\.blockmap)?$/;
 
 const args = process.argv.slice(2);
 const versionAt = args.indexOf('--version');
@@ -29,15 +33,20 @@ const passthrough = versionAt >= 0
   : args;
 console.log(`[dist] version ${version}`);
 
+// 发布交给 scripts/release.mjs 用 gh 传（复用 gh 登录态，不另配 GH_TOKEN）；
+// 这里默认 --publish never，免得 builder 见到 tag 或 token 就自作主张发版。
+const publishArgs = passthrough.includes('--publish') ? [] : ['--publish', 'never'];
 const r = spawnSync('pnpm', ['exec', 'electron-builder', '--win',
-  `-c.extraMetadata.version=${version}`, ...passthrough],
+  `-c.extraMetadata.version=${version}`, ...publishArgs, ...passthrough],
   { cwd: ROOT, stdio: 'inherit', shell: true });
 
-// 打包成功后再动手清历史产物：只保留本次版本的 portable，其余（含历史安装版/blockmap）全删。
+// 打包成功后再动手清历史产物：只保留本次版本的安装包与它的 blockmap，其余全删。
+// blockmap 是差分更新的块索引，必须与 exe 一同发布；删了它，各机器只能下全量。
 if (r.status === 0) {
   const distDir = join(ROOT, 'dist');
   const keep = new Set([
-    `MiraQuota ${version}.exe`,
+    `MiraQuota-Setup-${version}.exe`,
+    `MiraQuota-Setup-${version}.exe.blockmap`,
   ]);
   let removed = 0;
   for (const name of readdirSync(distDir)) {
