@@ -513,7 +513,9 @@
     if (!cost || !(cost.ratio > 1)) return "";
     const pool = latest?.windows?.find((x) => !x.modelGroup && x.durationSeconds === w.durationSeconds);
     const share = pool?.points ? Math.round(w.points.budget / pool.points.budget * 100) : null;
-    const head = share != null ? `占同期池 ${share}% 的点，` : "";
+    // 「用满即止」是关键约束：用户问过「全用 fable 不该有 2800 吗」——那是整池都买
+    // fable 的答案（560k×0.005），但子上限 53% 先到，剩下的点只能给别的模型。
+    const head = share != null ? `子上限占同期池 ${share}% 的点、用满即止，` : "";
     return `<div class="row fam"><span>按 ${cost.ratio}× 计量：${head}每美元扣 ${cost.ratio} 倍点，`
       + `故满额只兑出 ${money(w.fullUSD, 0)}</span></div>`;
   }
