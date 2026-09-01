@@ -17,14 +17,15 @@ import { resolveVersion } from '../app/version.mjs';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = join(ROOT, 'dist');
 
-const run = (cmd, args, opts = {}) =>
-  spawnSync(cmd, args, { cwd: ROOT, shell: true, encoding: 'utf8', ...opts });
-const runLoud = (cmd, args) => run(cmd, args, { stdio: 'inherit' });
 /**
- * gh 一律不走 shell：带空格的参数（--title "MiraQuota 0.6.33"）经 shell 会被拆成两段，
- * 多出来的 "0.6.33" 被 gh 当成要上传的文件，报 `no matches found for 0.6.33`（实测踩过）。
+ * 一律不走 shell。带空格的参数（--title "MiraQuota 0.6.34"）经 shell 会被拆成两段，
+ * 多出来的 "0.6.34" 被 gh 当成要上传的文件，报 `no matches found for 0.6.34`（实测踩过）；
+ * node 里 shell:true 还会带 DEP0190 弃用告警。git/gh/node 在 PATH 里，直接 spawn 就够。
  */
-const gh = (args) => spawnSync('gh', args, { cwd: ROOT, encoding: 'utf8', stdio: 'inherit' });
+const run = (cmd, args, opts = {}) =>
+  spawnSync(cmd, args, { cwd: ROOT, encoding: 'utf8', ...opts });
+const runLoud = (cmd, args) => run(cmd, args, { stdio: 'inherit' });
+const gh = (args) => runLoud('gh', args);
 const die = (msg) => { console.error(`[release] ${msg}`); process.exit(1); };
 
 // 版本口径与 dist 完全一致（package.json 前两段 + 提交数），tag 就是 v<版本>。
@@ -55,7 +56,7 @@ const assets = [
 const missing = assets.filter((f) => !existsSync(f));
 if (missing.length) die(`产物缺失，发出去也没法自动更新：\n${missing.join('\n')}`);
 
-const exists = spawnSync('gh', ['release', 'view', tag], { cwd: ROOT, encoding: 'utf8' }).status === 0;
+const exists = run('gh', ['release', 'view', tag]).status === 0;
 const r = exists
   ? gh(['release', 'upload', tag, ...assets, '--clobber'])
   : gh(['release', 'create', tag, ...assets,
