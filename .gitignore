@@ -3,3 +3,6 @@ node_modules/
 dist/
 build/icon.png
 app/assets/tray.png
+
+# 调试草稿：截图、CDP 求值、一次性核算脚本，随手写随手丢，不进版本库
+scripts/.*
