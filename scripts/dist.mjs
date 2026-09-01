@@ -1,7 +1,7 @@
 /**
  * 打包封装：版本号从 git 自动生成后调 electron-builder，不手改 package.json。
- * 规则：<major.minor 取自 package.json> . <git 提交数>——每次 commit 后打包，
- * 补丁位自动 +1，包名/安装器/关于页全部跟着走。可用 --version x.y.z 覆盖。
+ * 规则见 app/version.mjs（base.自锚点 tag 以来的提交数）——每次 commit 后打包，
+ * 补丁位自动 +1、minor bump 时归零，包名/安装器/关于页全部跟着走。可用 --version x.y.z 覆盖。
  * 打包成功后自动清理 dist 里的历史安装包与 blockmap，只保留本次版本。
  * 透传其余 CLI 参数（如 --publish never）。
  */

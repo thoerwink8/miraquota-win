@@ -141,7 +141,7 @@ if (!app.requestSingleInstanceLock()) {
     createWindow();
     createTray();
     ipcMain.handle('quota:get', () => engine.payload());
-    // 与 dist 同一口径（0.2.<提交数>）；安装包无 .git 时 resolveVersion 回退 package.json（builder 已注入）
+    // 与 dist 同一口径（见 app/version.mjs）；安装包无 .git 时回退 package.json（builder 已注入）
     ipcMain.handle('app:version', () => APP_VERSION);
     ipcMain.handle('theme:get', () => applyTheme(readUI().theme));
     ipcMain.handle('theme:set', (_e, v) => {

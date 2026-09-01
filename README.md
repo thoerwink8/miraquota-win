@@ -23,7 +23,7 @@
 ```powershell
 pnpm install        # 依赖：electron / electron-builder / electron-updater（.npmrc 已配 npmmirror）
 pnpm dev            # 开发运行（终端若带 ELECTRON_RUN_AS_NODE 需先清掉）
-pnpm dist           # 打包：版本 = 0.2.<git 提交数>（NSIS 安装版）
+pnpm dist           # 打包：版本 = major.minor.<自锚点 tag 的提交数>（NSIS 安装版）
 pnpm release        # 发版：打包 + 用 gh 传 GitHub Releases，各机器自动更新
 ```
 

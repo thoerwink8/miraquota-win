@@ -9,7 +9,7 @@
  * 认证复用 gh 的登录态，不需要另配 GH_TOKEN。
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveVersion } from '../app/version.mjs';
@@ -28,9 +28,33 @@ const runLoud = (cmd, args) => run(cmd, args, { stdio: 'inherit' });
 const gh = (args) => runLoud('gh', args);
 const die = (msg) => { console.error(`[release] ${msg}`); process.exit(1); };
 
-// 版本口径与 dist 完全一致（package.json 前两段 + 提交数），tag 就是 v<版本>。
+/**
+ * 锚点自愈：版本口径是「base.自 v<base>.0 以来的提交数」（见 app/version.mjs），锚点 tag
+ * 缺失时 resolveVersion 会回退 package.json、版本号偏小，发出去会盖旧版。发版路径在算
+ * 版本前先补锚：用 pickaxe 找到把 package.json 写成 <base>.0 的那次 bump 提交，打上
+ * v<base>.0 并推远端（幂等：tag 已在则只补推）。dao-commit bump 时忘打 tag 也不会漏。
+ */
+function ensureAnchorTag(base) {
+  const anchor = `v${base}.0`;
+  if (run('git', ['rev-parse', '--quiet', '--verify', `refs/tags/${anchor}`]).status !== 0) {
+    const bumpCommit = run('git', ['log', '--format=%H', '-1',
+      '-S', `"version": "${base}.0"`, '--', 'package.json']).stdout?.trim();
+    if (!bumpCommit) die(`找不到把 package.json 写成 ${base}.0 的提交，无法定锚点 ${anchor}`);
+    if (runLoud('git', ['tag', anchor, bumpCommit]).status !== 0) die(`打锚点 ${anchor} 失败`);
+    console.log(`[release] 已补锚点 ${anchor} → ${bumpCommit.slice(0, 8)}`);
+  }
+  // 推 tag 幂等；推不上去只警告——锚点本地已在，版本算得对，远端 tag 晚点补也不影响本次发版
+  if (run('git', ['push', 'origin', `refs/tags/${anchor}`]).status !== 0) {
+    console.warn(`[release] 锚点 ${anchor} 推远端失败（不影响本次发版，下次会重试）`);
+  }
+}
+
 const args = process.argv.slice(2);
 const versionAt = args.indexOf('--version');
+if (versionAt < 0) {
+  const pkgVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
+  ensureAnchorTag(String(pkgVersion).split('.').slice(0, 2).join('.'));
+}
 const version = versionAt >= 0 ? args[versionAt + 1] : resolveVersion(ROOT);
 if (!/^\d+\.\d+\.\d+$/.test(version)) die('版本号需要 x.y.z 格式');
 const tag = `v${version}`;
