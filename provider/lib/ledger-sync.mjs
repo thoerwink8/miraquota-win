@@ -206,6 +206,27 @@ export class LedgerSync {
   async #fetchForeign() {
     await git(this.repoDir, ['fetch', '--quiet', '--prune', 'origin',
       '+refs/heads/machine/*:refs/remotes/origin/machine/*']);
+    return this.#readForeignRefs();
+  }
+
+  /**
+   * 冷启动即用上一轮已 fetch 到的分片：只读本地 refs，不联网、不改工作区。
+   *
+   * 不做的话，进程从启动到第一轮同步跑完（最长 intervalSec）都只认本机账本——美元、
+   * 标定单价、多机页机器数全部按单机口径给，用户看到的是「他机明明推过了，我这没有」。
+   * 分片带 generatedAt，过期与否由显示面判定，读旧的不会让口径回退（比缺整台机器好）。
+   */
+  async loadCachedShards() {
+    if (!this.enabled || !existsSync(join(this.repoDir, '.git'))) return [];
+    try {
+      const shards = await this.#readForeignRefs();
+      if (shards.length) this.shards = shards;
+      return shards;
+    } catch { return []; }
+  }
+
+  /** 本地 refs/remotes/origin/machine/* 里的分片，逐个 git show，坏分片跳过。 */
+  async #readForeignRefs() {
     const refs = (await git(this.repoDir, ['for-each-ref', '--format=%(refname)',
       'refs/remotes/origin/machine/'])).split('\n').map((s) => s.trim()).filter(Boolean);
     const shards = [];

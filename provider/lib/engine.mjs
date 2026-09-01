@@ -134,6 +134,7 @@ export class Engine {
 
   #syncBusy = false;
   #syncKickedAt = 0;
+  #shardsWarmed = false;
   #autoJoinBusy = false;
   #autoJoinAt = 0;
 
@@ -151,6 +152,21 @@ export class Engine {
       .then((joined) => { if (joined) this.pointsAttrib.relaxSettle(this.sync.intervalSec); })
       .catch(() => { /* tryAutoJoin 自吞错误，这里兜底防未处理拒绝 */ })
       .finally(() => { this.#autoJoinBusy = false; });
+  }
+
+  /**
+   * 冷启动一次性装载上一轮已 fetch 到的分片（只读本地仓，不联网，百毫秒级）。
+   * 首轮 poll 前 await：否则从启动到第一轮同步跑完（最长 intervalSec），美元、标定单价、
+   * 多机机器数全按单机口径给，而他机数据其实就躺在本地 sync-repo 里——`--once` 尤其明显，
+   * 它根本活不到第一轮同步完成（本次核算 fable 倍率时就被这个坑过一回）。
+   */
+  async #warmShards() {
+    if (this.#shardsWarmed || !this.sync.enabled) return;
+    this.#shardsWarmed = true;
+    try {
+      const shards = await this.sync.loadCachedShards();
+      if (shards.length) this.ledger.adoptForeignShards(shards);
+    } catch { /* 读缓存失败就等正常那一轮，不影响主流程 */ }
   }
 
   /**
@@ -357,6 +373,7 @@ export class Engine {
       }
     }
     this.ledger.refresh();
+    await this.#warmShards();
     this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
     this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
     this.#speedRefresh();

@@ -72,9 +72,13 @@ export function evaluateCoherence(windows, ledger, nowSec, groupCost = {}) {
  * @returns { group, measured, groupPerPoint, otherPerPoint } | null
  */
 export function measureGroupRatio(windows, ledger, nowSec, group) {
-  const pool = windows.find((w) => !w.modelScoped && windowDuration(w.label));
   const scoped = windows.find((w) => w.modelScoped && w.label.endsWith(`_${group}`));
-  if (!pool || !scoped) return null;
+  if (!scoped) return null;
+  // 必须拿同长度的总窗（7d_fable 配 7d）：档位点数是从同一个池子里扣的，配 5h 池会算出
+  // 「非该档位点数」为负。同长度的没有就放弃——宁可不给倍率，也不给一个跨窗口拼出来的数。
+  const scopedDur = windowDuration(scoped.label);
+  const pool = windows.find((w) => !w.modelScoped && windowDuration(w.label) === scopedDur);
+  if (!pool || !scopedDur) return null;
   const poolDur = windowDuration(pool.label);
   const poolStart = pool.resetAt - poolDur;
   const poolUSD = ledger.spent(poolStart, nowSec, { includeOpenMinute: true });

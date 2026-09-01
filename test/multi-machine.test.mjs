@@ -314,3 +314,28 @@ test('with sync configured the payload carries a sync status field', () => {
     machines: [{ id: 'engine', lastShardSec: null, self: true }],
   });
 });
+
+test('a cold start uses the shards fetched by the previous round, before any network', async () => {
+  // 实测踩过：进程启动到第一轮同步跑完之前只认本机账本，美元与标定按单机口径给，
+  // 而他机分片就躺在本地 sync-repo 里（--once 更是活不到第一轮同步完成）。
+  const remote = join(tmp, 'cold.git');
+  await git('init', '--bare', '--quiet', remote);
+  const a = new LedgerSync({
+    configFile: syncConfig('cold-a', remote), repoDir: join(tmp, 'cold-a-repo'), machineId: 'a',
+  });
+  const b = new LedgerSync({
+    configFile: syncConfig('cold-b', remote), repoDir: join(tmp, 'cold-b-repo'), machineId: 'b',
+  });
+  await a.run(ledgerWith('cold-a', { minutes: { 29000000: { usd: 3 } } }), 29000000 * 60);
+  await b.run(ledgerWith('cold-b', { minutes: {} }), 29000000 * 60);
+  assert.equal(b.shards.length, 1, 'b 这一轮应读到 a 的分片');
+
+  // 新进程：不跑 run()，只装缓存——拿到的仍是 a 的分片
+  const bRestarted = new LedgerSync({
+    configFile: syncConfig('cold-b2', remote), repoDir: join(tmp, 'cold-b-repo'), machineId: 'b',
+  });
+  assert.deepEqual(bRestarted.shards, [], '构造时不该自带分片');
+  const cached = await bRestarted.loadCachedShards();
+  assert.equal(cached.length, 1);
+  assert.equal(cached[0].machineId, 'a');
+});

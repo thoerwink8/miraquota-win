@@ -88,3 +88,23 @@ test('the config lives on the spec tab, not the first screen', () => {
   assert.match(renderer, /setPointCost\?\.\('fable'/);
   assert.ok(existsSync(new URL('../provider/lib/settings.mjs', import.meta.url)));
 });
+
+test('the measured ratio pairs the scoped window with the pool window of the same length', () => {
+  // 实测踩过：窗口表里 5h 排在 7d 前面，若取「第一个非档位窗」会拿 5h 池配 7d_fable，
+  // 「非该档位点数」算成负数，倍率直接消失（界面上表现为一直显示样本不够）。
+  const ledger = fakeLedger({ total: 290.79, byGroup: { fable: 141.93 } });
+  // 合并多机账本后的实测量级：7d 43413 点（fable 28520）、账本 $290.79（fable $141.93）
+  const merged7d = [
+    { label: '7d', used: 43413, budget: 560000, resetAt: now + 86400, modelScoped: false },
+    windows7d[1],
+  ];
+  const withFiveHour = [
+    { label: '5h', used: 7500, budget: 156800, resetAt: now + 3600, modelScoped: false },
+    ...merged7d,
+  ];
+  const m = measureGroupRatio(withFiveHour, ledger, now, 'fable');
+  assert.ok(m, '有同长度的 7d 窗就必须算得出倍率');
+  assert.ok(Math.abs(m.measured - 2.01) < 0.02, `合并多机账本后实测 ≈2.01×，得到 ${m?.measured}`);
+  // 只有 5h 池、没有 7d 池时宁可不给
+  assert.equal(measureGroupRatio([withFiveHour[0], merged7d[1]], ledger, now, 'fable'), null);
+});
