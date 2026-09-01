@@ -108,3 +108,11 @@ test('the measured ratio pairs the scoped window with the pool window of the sam
   // 只有 5h 池、没有 7d 池时宁可不给
   assert.equal(measureGroupRatio([withFiveHour[0], merged7d[1]], ledger, now, 'fable'), null);
 });
+
+test('pool windows report the total-ratio full value, scoped windows keep the median', () => {
+  // 2026-09-02 用户拍板：卡片满额改用「整窗支出 ÷ 整窗点数 × 预算点」，与官方 5600 对得上；
+  // 中位数退居备用。档位窗不能乘基准单价（那是非该档位的价），仍走中位数。
+  const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
+  assert.match(src, /if \(rate != null && !group\) \{[\s\S]*?fullUSD: rate \* budget, basis: 'ratio'/);
+  assert.match(src, /fullUSDBasis: basis/);
+});

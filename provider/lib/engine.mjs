@@ -404,7 +404,7 @@ export class Engine {
       const dur = windowDuration(w.label);
       const start = dur ? w.resetAt - dur : null;
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
-      const { fullUSD, confidence, sampleCount, dropped } = this.#fullOf(w.label, w.budget, group, rate);
+      const { fullUSD, confidence, sampleCount, dropped, basis } = this.#fullOf(w.label, w.budget, group, rate);
       calibDropped += dropped;
       // 第二个口径：直接用官方百分比反推满额（本机账本$ ÷ 官方已用点数 × 预算点）。
       // 与上面的回归标定互为交叉验证——两者接近说明账本与点数自洽。
@@ -423,6 +423,7 @@ export class Engine {
         ...(exhaust ? { exhaust } : {}),
         ...(fullUSD != null ? {
           fullUSD,
+          ...(basis ? { fullUSDBasis: basis } : {}),
           scaledSpentUSD: fullUSD * usedPercent / 100,
           remainingUSD: Math.max(0, fullUSD * (100 - usedPercent) / 100),
         } : {}),
@@ -558,14 +559,34 @@ export class Engine {
     };
   }
 
+  /**
+   * 满额取「总额比值」口径：整窗支出 ÷ 整窗点数 × 预算点（2026-09-02 用户拍板）。
+   *
+   * 原来优先用回归标定（分段单价的加权中位数）。两者同时在跑，本机实测差 36%：
+   * 中位数 $4103、总额比值 $5582，而官方宣称 5600——用户要的是界面数字能直接与官方对账，
+   * 所以主口径改为总额比值。中位数抗污染更强，退居备用：总额比值给不出（点数样本太少、
+   * 或跨窗离散判不自洽）时才用它，此时宁可保守也不要没有数。
+   * 回归标定的观测数仍然照常汇报——它是「这个数有多少实测撑着」的唯一来源。
+   */
   #fullOf(label, budget, group, rate) {
     const est = this.calibrator.estimate(label, this.ledger, budget, group, this.settings.groupPointCost);
     const dropped = est?.foreignDropped ?? 0;
-    if (est && (est.confidence === 'high' || est.confidence === 'medium')) {
-      return { fullUSD: est.fullUSD, confidence: est.confidence, sampleCount: est.observations, dropped };
+    if (rate != null && !group) {
+      // 档位窗（group 非空）不走这条：rate 是非该档位的基准单价，乘它的预算点会高估。
+      return {
+        fullUSD: rate * budget, basis: 'ratio',
+        confidence: est?.confidence ?? 'low', sampleCount: est?.observations ?? 0, dropped,
+      };
     }
-    if (rate != null) return { fullUSD: rate * budget, confidence: 'low', sampleCount: est?.observations ?? 0, dropped };
-    if (est) return { fullUSD: est.fullUSD, confidence: est.confidence, sampleCount: est.observations, dropped };
+    if (est) {
+      return {
+        fullUSD: est.fullUSD, basis: 'median',
+        confidence: est.confidence, sampleCount: est.observations, dropped,
+      };
+    }
+    if (rate != null) {
+      return { fullUSD: rate * budget, basis: 'ratio', confidence: 'low', sampleCount: 0, dropped };
+    }
     return { fullUSD: null, confidence: 'none', sampleCount: 0, dropped };
   }
 

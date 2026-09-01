@@ -676,7 +676,10 @@
           <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}</span>
           <span class="when">${when}${expired ? ' · 已过期' : ''}</span></div>`;
       }).join('');
-      const basis = [`每 ${Math.round((sy.intervalSec ?? 600) / 60)} 分钟同步一轮`];
+      // 他机那一行的时间是「我这边最近一轮读到的那份分片的生成时刻」，不是对方的实时推送时刻：
+      // 同步按 intervalSec 节流，所以最多落后一轮。不写清楚，两台机器对看时数字对不上。
+      const basis = [`每 ${Math.round((sy.intervalSec ?? 600) / 60)} 分钟同步一轮`,
+        `他机时间取自本机最近一轮读到的分片，最多落后一轮（${Math.round((sy.intervalSec ?? 600) / 60)} 分钟）`];
       if (sy.lastSyncSec) basis.push(`上次完整成功 ${ago(sy.lastSyncSec)}`);
       // 自动接入的机器要把「怎么接上的」和「怎么关掉」一起说清楚：此时删文件会被重新接回，
       // 真正的关闭是把文件内容改成 {"autoJoin": false}（文件在就不再自动探测）。
