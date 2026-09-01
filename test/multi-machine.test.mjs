@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { CostLedger } from '../provider/lib/ledger.mjs';
-import { LedgerSync, cleanMachineId } from '../provider/lib/ledger-sync.mjs';
+import { LedgerSync, cleanMachineId, retryOnce, explainSyncError } from '../provider/lib/ledger-sync.mjs';
 import { Calibrator } from '../provider/lib/calibrator.mjs';
 import { PointsAttributor } from '../provider/lib/points-attrib.mjs';
 import { Engine } from '../provider/lib/engine.mjs';
@@ -98,18 +98,128 @@ test('two machines publish shards over a bare git remote and read each other', a
   assert.equal((await git('-C', remote, 'rev-list', '--count', 'machine/beta')).trim(), '1');
 });
 
-test('a broken remote is reported in status without throwing', async () => {
+/** 只需要 exportShard 的假账本。 */
+const fakeLedger = () => ({
+  exportShard: (id, now) => ({
+    schemaVersion: 1, machineId: id, generatedAt: now,
+    coverage: { fromSec: 0, toSec: now }, buckets: {}, scoped: {}, family: {},
+  }),
+});
+
+test('a broken remote is reported in status without throwing, and one failure is not red yet', async () => {
   const sync = new LedgerSync({
     configFile: syncConfig('broken', join(tmp, 'no-such-remote.git')),
     repoDir: join(tmp, 'broken-repo'),
     machineId: 'broken',
+    retryDelayMs: 5,
   });
-  const fake = { exportShard: (id, now) => ({ schemaVersion: 1, machineId: id, generatedAt: now, coverage: { fromSec: 0, toSec: now }, buckets: {}, scoped: {}, family: {} }) };
-  const r = await sync.run(fake, 1000);
-  assert.ok(r.error);                // 失败进状态字段
-  assert.equal(r.state, 'error');    // 有 error ⇒ 故障态（UI 红）
+  const r = await sync.run(fakeLedger(), 1000);
+  assert.ok(r.error);                 // 失败进状态字段
+  assert.equal(r.state, 'warn');      // 抖动不立刻报红：首轮失败只到中间态（UI 黄）
+  assert.equal(r.pushOk, false);
+  assert.equal(r.failStreak, 1);
   // 不抛异常、不阻断；push 没成功 ⇒ 本机尚无成功发布时刻
   assert.deepEqual(r.machines, [{ id: 'broken', lastShardSec: null, self: true }]);
+
+  const r2 = await sync.run(fakeLedger(), 1000 + 600);
+  assert.equal(r2.state, 'error');    // 连续 2 轮失败 ⇒ 才进故障态（UI 红）
+  assert.equal(r2.failStreak, 2);
+});
+
+test('publish succeeding while fetch fails is a middle state, never red', async () => {
+  // 真链路制造「发上去了、读不回来」：origin.url 指向不存在的路径（fetch 用它 ⇒ 失败），
+  // pushurl 指向真 bare 仓（push 用它 ⇒ 成功）。#ensureRepo 只校准 url，不碰 pushurl。
+  const good = join(tmp, 'half-good.git');
+  await git('init', '--bare', '--quiet', good);
+  const bad = join(tmp, 'half-missing.git');
+  const repoDir = join(tmp, 'half-repo');
+  await git('init', '--quiet', repoDir);
+  await git('-C', repoDir, 'remote', 'add', 'origin', bad);
+  await git('-C', repoDir, 'remote', 'set-url', '--push', 'origin', good);
+
+  const T = 3_000_000;
+  const sync = new LedgerSync({
+    configFile: syncConfig('half', bad), repoDir, machineId: 'half', retryDelayMs: 5,
+  });
+  const r = await sync.run(fakeLedger(), T);
+  assert.equal(r.pushOk, true);       // 本机分片确实上传了
+  assert.ok(r.error);                 // 读取失败仍记原因
+  assert.equal(r.state, 'warn');      // 但不是整体失败（UI 黄，不是红）
+  assert.deepEqual(r.machines, [{ id: 'half', lastShardSec: T, self: true }]);
+  assert.equal((await git('-C', good, 'rev-list', '--count', 'machine/half')).trim(), '1');
+
+  // 连续多轮只有读取失败也不报红——本机数据没丢，只是合并样本少
+  const r2 = await sync.run(fakeLedger(), T + 600);
+  assert.equal(r2.state, 'warn');
+  assert.equal(r2.failStreak, 2);
+});
+
+test('a flaky first attempt is retried inside the round and does not count as a failure', async () => {
+  // 实测本地代理偶发 SSL_ERROR_SYSCALL、紧接着的六次访问全部成功。
+  // 用远端 pre-receive 钩子复现：第一次 push 必被拒（并吐同一句报错），第二次即通过。
+  const remote = join(tmp, 'flaky-remote.git');
+  await git('init', '--bare', '--quiet', remote);
+  writeFileSync(join(remote, 'hooks', 'pre-receive'), [
+    '#!/bin/sh',
+    'if [ -f flaked ]; then exit 0; fi',
+    'touch flaked',
+    'echo "OpenSSL SSL_read: SSL_ERROR_SYSCALL" >&2',
+    'exit 1',
+    '',
+  ].join('\n'));
+
+  const sync = new LedgerSync({
+    configFile: syncConfig('flaky', remote), repoDir: join(tmp, 'flaky-repo'),
+    machineId: 'flaky', retryDelayMs: 50,
+  });
+  const r = await sync.run(fakeLedger(), 4_000_000);
+  assert.ok(existsSync(join(remote, 'flaked')));   // 第一次真的被拒了
+  assert.equal(r.error, undefined);                // 抖动被单轮内重试吃掉
+  assert.equal(r.state, 'ok');
+  assert.equal(r.failStreak, undefined);
+  assert.equal((await git('-C', remote, 'rev-list', '--count', 'machine/flaky')).trim(), '1');
+});
+
+test('retryOnce runs the second attempt and reports the latest reason when both fail', async () => {
+  let n = 0;
+  assert.equal(await retryOnce(async () => { if (++n === 1) throw new Error('抖一下'); return 'ok'; }, 5), 'ok');
+  assert.equal(n, 2);
+  await assert.rejects(retryOnce(async () => { throw new Error(`第 ${++n} 次`); }, 5), /第 4 次/);
+});
+
+test('common git failures get a plain-language reading, unknown ones stay raw', () => {
+  // 人话归纳只是导读，原文另存 sync.error（UI 当次要小字），归纳不出来时返回 null
+  assert.equal(explainSyncError("fatal: unable to access 'https://github.com/x/y.git/': OpenSSL SSL_read: SSL_ERROR_SYSCALL"),
+    '网络连不上 GitHub（代理或网络问题）');
+  assert.equal(explainSyncError('fatal: unable to access: Could not resolve host: github.com'),
+    '网络连不上 GitHub（代理或网络问题）');
+  assert.equal(explainSyncError('fatal: Authentication failed for https://github.com/x/y.git/'),
+    '凭据无效或无权限');
+  // 权限类常同时含 unable to access，必须判成权限而不是网络
+  assert.equal(explainSyncError("remote: Permission to x/y.git denied\nfatal: unable to access ...: The requested URL returned error: 403"),
+    '凭据无效或无权限');
+  assert.equal(explainSyncError("remote: Repository not found."), '仓库地址不对或已不存在');
+  assert.equal(explainSyncError('fatal: 某个没见过的毛病'), null);
+});
+
+test('repo-level identity and signing config are re-applied every round, not only on init', async () => {
+  // 实测缺陷：首次 init 后进程提前退出，三项 config 没落盘，之后每轮都以「.git 已存在」跳过补写，
+  // 永久缺失 ⇒ 提交署用户全局身份、开了 GPG 签名则 commit 直接失败。
+  const remote = join(tmp, 'cfg-remote.git');
+  await git('init', '--bare', '--quiet', remote);
+  const repoDir = join(tmp, 'cfg-repo');
+  await git('init', '--quiet', repoDir);   // 只有 .git，三项 config 都没有
+  const readCfg = (k) => git('-C', repoDir, 'config', '--local', '--get', k).then((s) => s.trim(), () => null);
+  assert.equal(await readCfg('user.name'), null);
+
+  const sync = new LedgerSync({
+    configFile: syncConfig('cfg', remote), repoDir, machineId: 'cfg', retryDelayMs: 5,
+  });
+  const r = await sync.run(fakeLedger(), 5_000_000);
+  assert.equal(r.error, undefined);
+  assert.equal(await readCfg('user.name'), 'miraquota');
+  assert.equal(await readCfg('user.email'), 'miraquota@local');
+  assert.equal(await readCfg('commit.gpgsign'), 'false');
 });
 
 test('sync state machine: connecting before first success, ok while fresh, stale falls back', async () => {
@@ -199,6 +309,7 @@ test('with sync configured the payload carries a sync status field', () => {
   });
   assert.deepEqual(engine.payload().sync, {
     state: 'connecting',
+    pushOk: false,
     intervalSec: 600,
     machines: [{ id: 'engine', lastShardSec: null, self: true }],
   });

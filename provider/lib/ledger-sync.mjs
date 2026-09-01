@@ -9,6 +9,11 @@
  *    仓库体积恒定，不需要清理任务；
  *  - 读他机只 fetch machine/* 远程分支并 git show 文件内容，工作区永远只有本机分片；
  *  - 配置文件 ~/.miraquota/sync.json 不存在或无 remote ⇒ 功能完全关闭，零副作用。
+ *
+ * 故障呈现取舍（2026-09-01 实测：本地代理偶发 SSL_ERROR_SYSCALL，紧接着的六次访问全成功）：
+ * 抖动不该报红——红色只留给用户真要处置的持续故障。三道闸依次拦：
+ *  ① 单轮内短退避重试一次；② 发布成功而只读取失败算中间态（本机数据已上传，合并样本少一点而已）；
+ *  ③ 仍失败要连续 ERROR_STREAK 轮、或上次成功已过期，才进 error。
  */
 import { execFile } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -19,7 +24,39 @@ const CONFIG_FILE = join(homedir(), '.miraquota', 'sync.json');
 const REPO_DIR = join(homedir(), '.miraquota', 'sync-repo');
 const SHARD_FILE = 'shard.json';
 const DEFAULT_INTERVAL = 600;   // 秒；sync.json 未写 intervalSec 时的节流间隔
+const RETRY_DELAY_MS = 2000;    // 单轮内退避重试的等待
+const ERROR_STREAK = 2;         // 连续失败达到这个轮数才进 error（红），此前是重试中（黄）
 export const SHARD_SCHEMA = 1;
+
+/**
+ * 单轮内退避重试一次：网络抖动不该被记成一次失败。
+ * 代价：git 调用自带 30s 超时，重试后单步最坏 ~62s，仍远小于同步间隔（默认 600s），
+ * 且 run() 在 engine 里是后台异步任务，不阻断轮询主流程。
+ */
+export async function retryOnce(fn, delayMs = RETRY_DELAY_MS) {
+  try { return await fn(); } catch {
+    await new Promise((r) => setTimeout(r, delayMs));
+    return await fn();      // 仍失败就把这次（最新）的原因抛给调用方计数
+  }
+}
+
+/**
+ * 常见 git 报错的人话归纳。原始报错另存 sync.error 当次要小字，人话丢原文更难查。
+ * 顺序有讲究：权限类报错常同时含 'unable to access'，必须先判权限再判网络。
+ */
+const ERROR_HINTS = [
+  [/authentication|could not read username|invalid credentials|403|permission|denied/i, '凭据无效或无权限'],
+  [/repository not found|not found|not appear to be a git repos/i, '仓库地址不对或已不存在'],
+  [/ssl|unable to access|could not resolve host|resolve|timed out|timeout|connection (?:reset|refused|closed)|network is unreachable|proxy|failed to connect/i,
+    '网络连不上 GitHub（代理或网络问题）'],
+];
+
+/** 归纳不出来时返回 null——UI 此时直接把原文当主文案，不硬套。 */
+export function explainSyncError(raw) {
+  const s = String(raw ?? '');
+  for (const [re, hint] of ERROR_HINTS) if (re.test(s)) return hint;
+  return null;
+}
 
 /** os.hostname() 清洗成可作分支名的短名：小写、只留字母数字与连字符。 */
 export function cleanMachineId(name = hostname()) {
@@ -43,15 +80,20 @@ export class LedgerSync {
    * @param opts.configFile 配置文件路径（测试注入用，默认 ~/.miraquota/sync.json）
    * @param opts.repoDir    同步仓工作目录（默认 ~/.miraquota/sync-repo）
    * @param opts.machineId  机器短名（默认 os.hostname() 清洗）
+   * @param opts.retryDelayMs 单轮内重试的等待（测试注入用，默认 2 秒）
    */
-  constructor({ configFile = CONFIG_FILE, repoDir = REPO_DIR, machineId = cleanMachineId() } = {}) {
+  constructor({ configFile = CONFIG_FILE, repoDir = REPO_DIR, machineId = cleanMachineId(),
+    retryDelayMs = RETRY_DELAY_MS } = {}) {
     this.configFile = configFile;
     this.repoDir = repoDir;
     this.machineId = machineId;
+    this.retryDelayMs = retryDelayMs;
     this.shards = [];          // 最近一次 fetch 到的外机分片（内存缓存）
-    this.lastSyncSec = null;   // 最近一次成功同步的时刻
+    this.lastSyncSec = null;   // 最近一次成功同步的时刻（发布＋读取都成）
     this.lastPublishSec = null; // 本机分片最近一次成功发布（push 成功）的时刻
     this.lastError = null;
+    this.pushOk = false;       // 最近一轮本机分片是否推送成功（区分「只是读不到他机」）
+    this.failStreak = 0;       // 连续失败轮数：抖动一次不报红，达 ERROR_STREAK 才报
     this.config = this.#loadConfig();
   }
 
@@ -76,11 +118,13 @@ export class LedgerSync {
     if (!existsSync(join(this.repoDir, '.git'))) {
       mkdirSync(this.repoDir, { recursive: true });
       await git(this.repoDir, ['init', '--quiet']);
-      await git(this.repoDir, ['config', 'user.name', 'miraquota']);
-      await git(this.repoDir, ['config', 'user.email', 'miraquota@local']);
-      // 数据仓的提交是机器自动产物，不该被用户的全局签名配置卡住（无钥匙时 commit 直接失败）。
-      await git(this.repoDir, ['config', 'commit.gpgsign', 'false']);
     }
+    // 这三项每轮都幂等重设，不放在 init 分支里：实测首次 init 后进程提前退出（--once），
+    // config 没落盘，之后每轮都以「.git 已存在」跳过补写，永久缺失——提交会署用户全局
+    // git 身份，用户若开了 GPG 签名则 commit 直接失败。三次本地 git config 很便宜。
+    await git(this.repoDir, ['config', 'user.name', 'miraquota']);
+    await git(this.repoDir, ['config', 'user.email', 'miraquota@local']);
+    await git(this.repoDir, ['config', 'commit.gpgsign', 'false']);
     const remotes = (await git(this.repoDir, ['remote'])).split('\n').map((s) => s.trim());
     if (!remotes.includes('origin')) {
       await git(this.repoDir, ['remote', 'add', 'origin', this.config.remote]);
@@ -124,36 +168,54 @@ export class LedgerSync {
   }
 
   /**
-   * 一轮同步：发布本机分片 + 读回全部外机分片。任何失败都不抛，只记入 lastError；
-   * 上一轮读到的分片保留（远端临时不可达时合并口径不回退）。
+   * 一轮同步：发布本机分片 + 读回全部外机分片，两条链分开记（发布成功只读取失败是中间态）。
+   * 任何失败都不抛，只记入 lastError；上一轮读到的分片保留（远端临时不可达时合并口径不回退）。
    * 返回 status() 的全部字段外加 shards，功能关闭时返回 null。
    */
   async run(ledger, nowSec = Date.now() / 1000) {
     if (!this.enabled) return null;
+    const firstLine = (e) => String(e.message || e).split('\n')[0].slice(0, 200);
+    let err = null;
     try {
       await this.#ensureRepo();
-      await this.#publish(ledger.exportShard(this.machineId, nowSec));
+      await retryOnce(() => this.#publish(ledger.exportShard(this.machineId, nowSec)), this.retryDelayMs);
       this.lastPublishSec = nowSec;   // 发布已 push 成功，即使随后 fetch 失败也算数
-      this.shards = await this.#fetchForeign();
-      this.lastSyncSec = nowSec;
-      this.lastError = null;
-    } catch (e) {
-      this.lastError = String(e.message || e).split('\n')[0].slice(0, 200);
+      this.pushOk = true;
+    } catch (e) { this.pushOk = false; err = firstLine(e); }
+    // push 都推不上去时同一 remote 的 fetch 几无成功可能，省一次网络往返直接跳过。
+    if (this.pushOk) {
+      try {
+        this.shards = await retryOnce(() => this.#fetchForeign(), this.retryDelayMs);
+        this.lastSyncSec = nowSec;
+      } catch (e) { err = firstLine(e); }
     }
+    this.lastError = err;
+    this.failStreak = err ? this.failStreak + 1 : 0;
     return { ...this.status(nowSec), shards: this.shards };
   }
 
   /**
-   * payload 的 sync 字段。
-   *  - state：'error' 有失败原因；'ok' 最近一轮成功且不超过 2×intervalSec（已接入）；
-   *    其余为 'connecting'（启用但从未成功，或成功记录已过期）。
+   * payload 的 sync 字段。四态对四色，红只留给要用户处置的持续故障：
+   *  - 'ok'（绿）最近一轮发布＋读取都成，且不超过 2×intervalSec；
+   *  - 'warn'（黄）有失败但还不到报红：pushOk 时是「本机已上传、读不到他机」，
+   *    否则是抖动重试中（连续失败未达 ERROR_STREAK 且上次成功还没过期）；
+   *  - 'error'（红）连续失败达 ERROR_STREAK 轮，或曾经成功过但已过期还在失败；
+   *  - 'connecting'（灰）启用但从未成功，或成功记录已过期且当轮没有失败原因。
+   * 另带 pushOk / failStreak 供 UI 挑文案，error 是原始首行、errorHint 是人话（归纳得出才有）。
    *  - machines：每台机器一行 { id, lastShardSec, self }——本机取最近一次成功发布时刻，
    *    外机取其分片的 generatedAt；从未发布/无分片时为 null。
    */
   status(nowSec = Date.now() / 1000) {
     const fresh = this.lastSyncSec != null && nowSec - this.lastSyncSec <= 2 * this.intervalSec;
+    let state;
+    if (!this.lastError) state = fresh ? 'ok' : 'connecting';
+    else if (this.pushOk) state = 'warn';   // 本机分片已上传：合并样本少一点，不会算错
+    else state = (this.failStreak >= ERROR_STREAK || (this.lastSyncSec != null && !fresh))
+      ? 'error' : 'warn';
+    const hint = this.lastError ? explainSyncError(this.lastError) : null;
     return {
-      state: this.lastError ? 'error' : fresh ? 'ok' : 'connecting',
+      state,
+      pushOk: this.pushOk,
       intervalSec: this.intervalSec,   // 显示面据此判「分片超过 2×interval 未更新 ⇒ 已过期」
       machines: [
         { id: this.machineId, lastShardSec: this.lastPublishSec, self: true },
@@ -161,6 +223,8 @@ export class LedgerSync {
       ],
       ...(this.lastSyncSec != null ? { lastSyncSec: this.lastSyncSec } : {}),
       ...(this.lastError ? { error: this.lastError } : {}),
+      ...(hint ? { errorHint: hint } : {}),
+      ...(this.failStreak > 0 ? { failStreak: this.failStreak } : {}),
     };
   }
 }

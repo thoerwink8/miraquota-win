@@ -147,18 +147,24 @@
   @keyframes pulse { 50% { opacity: .3; } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
-  /* ---- 多机同步明细 ---- */
+  /* ---- 多机同步页 ---- */
+  /* 四态四色：绿已接入 / 黄中间态（本机已上传或抖动重试，不影响正确性）/ 红要处置 / 灰连接中 */
   .sync-state { font-size: 11px; font-weight: 600; }
   .sync-state.ok { color: var(--ok); }
+  .sync-state.warn { color: var(--warn); }
   .sync-state.error { color: var(--bad); }
   .sync-state.connecting { color: var(--ink3); }
   .sync-machine { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink2); margin-top: 4px; }
   .sync-machine .id { font-weight: 600; color: var(--ink); }
   .sync-machine .when { color: var(--ink3); }
   .sync-machine.expired .id, .sync-machine.expired .when { color: var(--ink3); font-weight: 500; }
+  .sync-why { font-size: 10.5px; color: var(--ink3); margin-top: 5px; line-height: 1.5; word-break: break-all; }
 
   .foot { font-size: 10.5px; color: var(--ink3); line-height: 1.7; padding: 2px 2px 0; }
   .foot b { color: var(--ink2); font-weight: 600; }
+  .foot .go { cursor: pointer; color: var(--ink2); }
+  .foot .go:hover { color: var(--accent); }
+  .foot .go.bad { color: var(--bad); }
   .empty { text-align: center; color: var(--ink3); padding: 48px 0 32px; font-size: 12px; }
 
   /* ---- 预演页 ---- */
@@ -196,6 +202,8 @@
       <button id="tabMain" class="on">总览</button>
       <button id="tabSim">耗尽预演</button>
       <button id="tabSpec">口径说明</button>
+      <!-- 多机页是运维态信息：payload 无 sync 字段（未配置）时连页签都不出现，界面零变化 -->
+      <button id="tabSync" style="display:none">多机</button>
     </div>
     <div class="mode" title="统计口径：点数（账号级标准）或美元（本机 API 等价估值）">
       <button id="modeUsd">$</button>
@@ -210,11 +218,6 @@
         <div class="head"><span class="label">速度</span><span class="sp" style="flex:1"></span><span class="label" id="speedNote"></span></div>
         <table id="speedRows"></table>
         <div class="inflight" id="inflight" style="display:none"></div>
-      </div>
-      <!-- 多机同步：payload 无 sync 字段（未配置）时整卡隐藏，界面零变化 -->
-      <div class="card" id="syncCard" style="display:none">
-        <div class="head"><span class="label">多机同步</span><span class="sp" style="flex:1"></span><span class="sync-state" id="syncState"></span></div>
-        <div id="syncMachines"></div>
       </div>
       <div class="foot" id="foot"></div>
     </div>
@@ -244,6 +247,25 @@
         <b>今天</b>：自然日 0 点起。点数＝官方点数增量逐段累加（账号级，含其他设备；本机停机时段按前后差值补账，重置瞬间跨越的一小段宁漏勿错）；美元＝本机账本。两者口径不同，不能互相换算核对。<br>
         <b>多机</b>：本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本。标定对此有两道防线——检测到他机活跃段整段剔除，聚合取中位数。
       </div></div>
+    </div>
+    <div class="page" id="pageSync">
+      <div class="card">
+        <div class="head"><span class="label">同步状态</span><span class="sp" style="flex:1"></span><span class="sync-state" id="syncState"></span></div>
+        <div class="sync-why" id="syncWhy" style="display:none"></div>
+        <div id="syncMachines"></div>
+      </div>
+      <div class="card">
+        <div class="hint" id="syncBasis"></div>
+        <div class="hint">
+          <b>为什么要合并</b>：点数是账号级的，账本是本机级的。多台机器共用同一份额度时，
+          「本机账本$ ÷ 账号已用点」系统性偏低；把各机分片合并后，标定单价、家族归因、活跃强度才与官方点数同口径。<br>
+          <b>失败会怎样</b>：只是可用样本变少——美元与标定退回本机口径，<b>不会算错</b>；
+          官方点数与百分比始终直连云端，不经这条同步链。所以黄色不用管（本机数据已上传，或只是抖动重试），
+          红色才需要看一眼网络与凭据。<br>
+          <b>怎么同步的</b>：每台机器只写自己的 <code>machine/&lt;机器名&gt;</code> 分支，单提交覆盖不留历史，仓库体积恒定；
+          读他机只取远程分支的文件内容，不动本机工作区。
+        </div>
+      </div>
     </div>
   </div>
 
@@ -278,17 +300,38 @@
 
   // ---- 页签 ----
   const TAB_KEY = 'miraquota.tab';
-  const TABS = { main: ['tabMain', 'pageMain'], sim: ['tabSim', 'pageSim'], spec: ['tabSpec', 'pageSpec'] };
-  function switchTab(name) {
-    if (!TABS[name]) name = 'main';
+  const TABS = {
+    main: ['tabMain', 'pageMain'], sim: ['tabSim', 'pageSim'],
+    spec: ['tabSpec', 'pageSpec'], sync: ['tabSync', 'pageSync'],
+  };
+  // 多机页只在 payload 带 sync 字段时存在：页签隐藏之外，激活也要挡（记住的页签、页脚跳转都走这里）。
+  let syncAvailable = false;
+  function switchTab(wanted) {
+    let name = wanted;
+    if (!TABS[name] || (name === 'sync' && !syncAvailable)) name = 'main';
     for (const [k, [btn, page]] of Object.entries(TABS)) {
       $(btn).classList.toggle('on', k === name);
       $(page).classList.toggle('on', k === name);
     }
-    try { localStorage.setItem(TAB_KEY, name); } catch {}
+    // 被挡回总览时不覆盖记住的页签：多机配置可能还在，只是这一刻 payload 还没到。
+    if (name === wanted) { try { localStorage.setItem(TAB_KEY, name); } catch {} }
   }
-  for (const [k, [btn]] of Object.entries(TABS)) $(btn).onclick = () => switchTab(k);
-  try { const t = localStorage.getItem(TAB_KEY); if (t && t !== 'main') switchTab(t); } catch {}
+  let tabRestored = false;
+  function restoreTab() {
+    if (tabRestored) return;
+    try {
+      const t = localStorage.getItem(TAB_KEY);
+      if (!t || t === 'main' || !TABS[t] || (t === 'sync' && !syncAvailable)) return;
+      tabRestored = true;
+      switchTab(t);
+    } catch {}
+  }
+  for (const [k, [btn]] of Object.entries(TABS)) $(btn).onclick = () => { tabRestored = true; switchTab(k); };
+  // 页脚那行多机摘要点一下跳过去；foot 每秒重绘，所以挂委托而不是逐次挂 onclick。
+  $('foot').onclick = (e) => {
+    if (e.target.closest('#footSync')) { tabRestored = true; switchTab('sync'); }
+  };
+  restoreTab();
 
   // ---- 统计口径：pts（默认）| usd ----
   const MODE_KEY = 'miraquota.mode';
@@ -566,15 +609,28 @@
       $('inflight').innerHTML = `<span class="dot"></span>生成中 ${sp.inflightSince.length} 条 · 最长已 ${Math.round(Date.now() / 1000 - oldest)} 秒`;
     }
 
-    // 多机同步明细卡：payload 无 sync 字段（未配置）时整卡隐藏，不显示任何新 UI。
+    // 多机页：payload 无 sync 字段（未配置）时页签与页面都不出现，不显示任何新 UI。
     const sy = p.sync;
-    $('syncCard').style.display = sy ? '' : 'none';
+    syncAvailable = !!sy;
+    $('tabSync').style.display = sy ? '' : 'none';
+    if (!sy && $('pageSync').classList.contains('on')) switchTab('main');
     if (sy) {
+      restoreTab();       // 上次停在多机页：这一刻才知道它可用，补一次恢复
+      tabRestored = true; // 可用性已知，恢复到此为止（之后只跟用户点击走）
       const stEl = $('syncState');
       stEl.className = 'sync-state ' + sy.state;
-      stEl.innerHTML = sy.state === 'ok' ? '● GitHub 已接入'
-        : sy.state === 'error' ? '● 同步失败：' + esc(sy.error ?? '')
-        : '● 连接中…';
+      stEl.innerHTML = '● ' + (
+        sy.state === 'ok' ? 'GitHub 已接入'
+          : sy.state === 'error' ? '同步失败：' + esc(sy.errorHint ?? sy.error ?? '')
+          : sy.state === 'warn' ? (sy.pushOk ? '本机已上传，读取他机失败' : '同步重试中')
+          : '连接中…');
+      // 原始报错留作次要小字：人话归纳只是导读，丢了原文没法查。
+      const why = [];
+      if (sy.state === 'warn' && sy.errorHint) why.push(esc(sy.errorHint));
+      if (sy.error) why.push(esc(sy.error));
+      if (sy.failStreak >= 2) why.push(`已连续 ${sy.failStreak} 轮未成功`);
+      $('syncWhy').style.display = why.length ? '' : 'none';
+      $('syncWhy').innerHTML = why.join(' · ');
       // 分片超过 2×intervalSec 未更新 ⇒ 该机器视为已过期（可能离场或同步中断）
       const expiredBefore = Date.now() / 1000 - 2 * (sy.intervalSec ?? 600);
       $('syncMachines').innerHTML = (sy.machines ?? []).map((m) => {
@@ -584,13 +640,25 @@
           <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}</span>
           <span class="when">${when}${expired ? ' · 已过期' : ''}</span></div>`;
       }).join('');
+      const basis = [`每 ${Math.round((sy.intervalSec ?? 600) / 60)} 分钟同步一轮`];
+      if (sy.lastSyncSec) basis.push(`上次完整成功 ${ago(sy.lastSyncSec)}`);
+      basis.push('配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即完全关闭）');
+      $('syncBasis').innerHTML = basis.join(' · ');
     }
 
-    // 总览页脚只留一行现状；公式与免责全文在「口径说明」页，多机明细在上方专卡。
+    // 总览页脚只留一行现状；公式与免责全文在「口径说明」页，多机明细在「多机」页。
     const foot = [];
     if (p.unitPriceUSD != null) foot.push(`单价 ${p.unitPriceUSD.toFixed(6)} $/点`);
     if (p.calibDropped > 0) foot.push(`已剔除他机观测 ${p.calibDropped} 段`);
     if (p.accountNotice) foot.push(p.accountNotice);
+    // 一行摘要 + 去哪看：点一下跳「多机」页（运维态明细不占总览的额度位置）
+    if (sy) {
+      const mark = sy.state === 'ok' ? '已接入'
+        : sy.state === 'error' ? '同步失败'
+        : sy.state === 'warn' ? (sy.pushOk ? '读不到他机' : '重试中')
+        : '连接中';
+      foot.push(`<span class="go${sy.state === 'error' ? ' bad' : ''}" id="footSync">多机 ×${(sy.machines ?? []).length} · ${mark} →</span>`);
+    }
     foot.push(`采集 ${ago(p.capturedAt)}`);
     $('foot').innerHTML = foot.join(' · ');
 
@@ -607,13 +675,8 @@
     const st2 = [];
     st2.push(`<b>账本</b> ${p.buckets ?? 0} 个分钟桶 · 价目 ${p.pricing ?? '-'}`);
     if (p.calibDropped > 0) st2.push(`<b>标定防线</b> 检测到他机同时使用，已剔除 ${p.calibDropped} 段受污染观测`);
-    if (p.sync) {
-      st2.push(`<b>多机</b> ${p.sync.state === 'error'
-        ? '同步失败：' + esc(p.sync.error ?? '')
-        : p.sync.state === 'ok'
-          ? `GitHub 已接入 · 已合并 ${p.sync.machines.length} 台机器的账本${p.sync.lastSyncSec ? ' · 同步于 ' + ago(p.sync.lastSyncSec) : ''}（美元支出为全机合计）`
-          : '连接中…（尚未完成同步）'}`);
-    }
+    // 同步现状不在这里重复（明细全在「多机」页），只交代它对美元口径的影响。
+    if (p.sync?.state === 'ok') st2.push(`<b>多机</b> 已合并 ${p.sync.machines.length} 台机器的账本，美元支出为全机合计`);
     if (p.accountNotice) st2.push(`<b>账号</b> ${p.accountNotice}`);
     $('specState').innerHTML = st2.join('<br>');
   }

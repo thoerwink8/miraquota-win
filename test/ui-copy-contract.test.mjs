@@ -62,11 +62,35 @@ test('speed surfaces drop repeated billing badges and keep expandable recent tas
   assert.match(widget, /r\.open = !r\.open/);
 });
 
-test('sync status shows a connection mark and per-machine push detail in the panel only', () => {
-  // 接入标记三态文案：绿=已接入、红=失败带原因、灰=连接中
-  assert.match(renderer, /● GitHub 已接入/);
-  assert.match(renderer, /● 同步失败：/);
-  assert.match(renderer, /● 连接中…/);
+test('multi-machine detail lives in its own tab, never in the overview cards', () => {
+  // 用户 2026-09-01：运维态信息不许占总览的额度位置，挪成独立页签
+  assert.doesNotMatch(renderer, /id="syncCard"/);
+  assert.match(renderer, /<button id="tabSync" style="display:none">多机<\/button>/);
+  assert.match(renderer, /sync: \['tabSync', 'pageSync'\]/);
+  // 未配置（payload 无 sync）时：页签不出现，且这一页不可被激活（记住的页签也挡回总览）
+  assert.match(renderer, /\$\('tabSync'\)\.style\.display = sy \? '' : 'none';/);
+  assert.match(renderer, /name === 'sync' && !syncAvailable/);
+  assert.match(renderer, /if \(!sy && \$\('pageSync'\)\.classList\.contains\('on'\)\) switchTab\('main'\)/);
+  // 总览页脚只留一行摘要 + 去哪看
+  assert.match(renderer, /多机 ×\$\{\(sy\.machines \?\? \[\]\)\.length\} · \$\{mark\} →/);
+  assert.match(renderer, /e\.target\.closest\('#footSync'\)/);
+  // 这一页要交代它在干什么：为什么合并、失败的后果、配置文件与周期
+  assert.match(renderer, /为什么要合并/);
+  assert.match(renderer, /<b>不会算错<\/b>/);
+  assert.match(renderer, /分钟同步一轮/);
+  assert.match(renderer, /~\/\.miraquota\/sync\.json/);
+});
+
+test('sync state copy keeps red for real trouble and shows the raw reason next to the plain one', () => {
+  // 四态四色：绿=已接入、黄=中间态（本机已上传 / 抖动重试）、红=要处置、灰=连接中
+  assert.match(renderer, /\.sync-state\.warn \{ color: var\(--warn\); \}/);
+  assert.match(renderer, /'GitHub 已接入'/);
+  assert.match(renderer, /'同步失败：' \+ esc\(sy\.errorHint \?\? sy\.error \?\? ''\)/);
+  assert.match(renderer, /'本机已上传，读取他机失败' : '同步重试中'/);
+  assert.match(renderer, /'连接中…'/);
+  // 人话归纳是导读，原始报错仍作次要小字并存
+  assert.match(renderer, /if \(sy\.error\) why\.push\(esc\(sy\.error\)\)/);
+  assert.match(renderer, /已连续 \$\{sy\.failStreak\} 轮未成功/);
   // 机器明细每台一行：本机标注 +「N 分钟前推送」+ 过期判定（2×intervalSec）
   assert.match(renderer, /（本机）/);
   assert.match(renderer, /推送/);
