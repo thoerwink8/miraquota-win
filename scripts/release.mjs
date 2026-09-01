@@ -97,4 +97,4 @@ const r = exists
       '--title', `MiraQuota ${version}`, '--generate-notes']);
 if (r.status !== 0) die('gh 发布失败');
 
-console.log(`[release] 已发布 ${tag}；各机器下次检查更新（启动后 15 秒 / 每 6 小时）即可收到`);
+console.log(`[release] 已发布 ${tag}；各机器下次检查更新（启动后 15 秒 / 每 30 分钟 / 打开面板时）即可收到`);

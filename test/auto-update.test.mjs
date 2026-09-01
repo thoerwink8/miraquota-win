@@ -71,7 +71,8 @@ test('checks are frequent enough that the badge is there when the user looks', (
   assert.ok(updater.includes("const EVERY_MS = 30 * 60 * 1000;"), "轮询间隔应为 30 分钟");
   assert.match(updater, /checkOnShow/);
   assert.match(updater, /ON_SHOW_MIN_GAP_MS/);
-  assert.match(main, /win.on('show', () => updater?.checkOnShow())/);
+  assert.ok(main.includes("win.on('show', () => updater?.checkOnShow())"),
+    '面板露面时要补查一次');
 });
 
 test('checking failures never reach the panel', () => {
