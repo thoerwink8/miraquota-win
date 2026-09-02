@@ -84,11 +84,15 @@ function printSnapshot(p) {
   const u = p.sync?.usage;
   if (u) {
     for (const m of u.machines) {
-      console.log(`${u.label} 机器 ${(m.id + (m.self ? '（本机）' : '')).padEnd(22)} ${Math.round(m.points).toLocaleString().padStart(9)} 点  ${m.usd.toFixed(2)}`);
+      console.log(`${u.label} 机器 ${(m.id + (m.self ? '（本机）' : '')).padEnd(22)} ${Math.round(m.points).toLocaleString().padStart(9)} 点  $${m.usd.toFixed(2)}`);
     }
+    for (const x of u.unpriced ?? []) console.log(`${u.label} 未定价 ${x.model.padEnd(20)} ${x.tokens.toLocaleString().padStart(9)} token`);
     if (u.unattributedPoints != null) {
-      console.log(`${u.label} 机器 ${'未接入'.padEnd(20)} ${Math.round(u.unattributedPoints).toLocaleString().padStart(9)} 点  ${u.unattributedUSD.toFixed(2)}`);
+      console.log(`${u.label} 机器 ${'未同步账本'.padEnd(18)} ${Math.round(u.unattributedPoints).toLocaleString().padStart(9)} 点  $${u.unattributedUSD.toFixed(2)}`);
     }
+  }
+  if (p.roster) {
+    console.log(p.roster.unpriced.length ? `价目 已启用模型中无价：${p.roster.unpriced.join(', ')}` : `价目 已启用 ${p.roster.models.length} 个模型都有价`);
   }
   for (const r of p.speed?.rows ?? []) {
     const ttft = r.ttft != null ? `首 ≈${r.ttft.toFixed(1)}s` : '首 -';

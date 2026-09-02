@@ -9,6 +9,9 @@
  *   local  连锚点都没有，按滚动窗口报本机支出
  */
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 import { Pricing } from './pricing.mjs';
 import { CostLedger } from './ledger.mjs';
@@ -26,6 +29,24 @@ import { evaluateCoherence, coherenceNotice, measureGroupRatio, weightedSpend } 
  * 反推不删——它与这个常量的偏离就是「账本漏了多少」的读数，降级为对账检查。
  */
 export const OFFICIAL_PER_POINT = 0.01;
+
+const MIRASIM_SETTING = join(homedir(), '.mirasim', 'setting.json');
+
+/**
+ * Mirasim「原生模型」页勾选的模型清单（本地 setting.json 的 enabledModels）。
+ * 用途只有一个：对表价目表，把「已启用但账本没价」的模型提前点名——它一旦经 relay 被用到，
+ * 账本只能记 token 记不了美元。用户 2026-09-02：本地就能读到支持的模型，别等漏了才知道。
+ * @returns { models: string[], unpriced: string[] } | null（文件不在或不可读）
+ */
+export function readEnabledModels(pricing, file = MIRASIM_SETTING) {
+  let root;
+  try { root = JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
+  const em = root?.enabledModels;
+  if (!em || typeof em !== 'object') return null;
+  const models = [...new Set(Object.values(em).flat().filter((m) => typeof m === 'string' && m))];
+  const unpriced = models.filter((m) => pricing.price(m) == null);
+  return { models, unpriced };
+}
 import { Settings } from './settings.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
 import { windowDuration, modelGroup } from './windows.mjs';
@@ -634,11 +655,16 @@ export class Engine {
       .sort((a, b) => b.points - a.points);
     const known = rows.reduce((a, b) => a + b.points, 0);
     const official = w.points?.used ?? null;
+    // 没价的调用：点扣了、美元算不出，只能给 token。它们也落在残差里，但至少有名字。
+    const unpriced = this.ledger.unpricedUsage(w.resetAt - w.durationSeconds, now);
     return {
       usage: {
         label: w.label, machines: rows,
+        ...(unpriced.length ? { unpriced } : {}),
         ...(official != null ? {
           officialPoints: official,
+          // 残差＝「账本没同步上来的机器」：没跑 MiraQuota 的人、关了同步的机器、分片过期的机器，
+          // 外加各机账本自己的时差漏记（用户 2026-09-02 拍板归成一类）。
           unattributedPoints: Math.max(0, official - known),
           unattributedUSD: Math.max(0, official - known) * OFFICIAL_PER_POINT,
         } : {}),
@@ -685,6 +711,15 @@ export class Engine {
       speed: this.#speedReport(),
       // 无同步配置时不出现该字段，显示面据此不画任何新 UI（硬性验收项）。
       ...(this.sync.enabled ? { sync: { ...this.sync.status(), ...this.#machineUsage(windows) } } : {}),
+      ...(this.#roster() ?? {}),
     };
+  }
+
+  #rosterAt = 0; #rosterCache = null;
+  /** 已启用模型对表价目表；文件小，一分钟读一次够了。 */
+  #roster() {
+    const now = Date.now();
+    if (now - this.#rosterAt > 60_000) { this.#rosterCache = readEnabledModels(this.pricing); this.#rosterAt = now; }
+    return this.#rosterCache ? { roster: this.#rosterCache } : null;
   }
 }

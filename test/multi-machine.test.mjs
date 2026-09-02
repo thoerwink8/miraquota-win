@@ -9,7 +9,8 @@ import { CostLedger } from '../provider/lib/ledger.mjs';
 import { LedgerSync, cleanMachineId, retryOnce, explainSyncError } from '../provider/lib/ledger-sync.mjs';
 import { Calibrator } from '../provider/lib/calibrator.mjs';
 import { PointsAttributor } from '../provider/lib/points-attrib.mjs';
-import { Engine } from '../provider/lib/engine.mjs';
+import { readEnabledModels, Engine } from '../provider/lib/engine.mjs';
+import { Pricing } from '../provider/lib/pricing.mjs';
 
 // 全部状态走注入的临时目录，不碰 ~/.miraquota；远端是本地 bare 仓，不依赖网络。
 const tmp = mkdtempSync(join(tmpdir(), 'mq-multi-'));
@@ -27,6 +28,13 @@ function syncConfig(name, remote, intervalSec = 600) {
 }
 
 /** 预置聚合态的账本（pricing 不参与查询，传空对象即可）。 */
+/** 带真价目表（内置官方价、无缓存）的空账本——测网关行解析要用到 pricing.cost */
+function pricedLedger(name) {
+  const file = join(tmp, `${name}-ledger.json`);
+  writeFileSync(file, JSON.stringify({ schemaVersion: 2 }));
+  return new CostLedger(new Pricing(join(tmp, 'no-cache.json')), file);
+}
+
 function ledgerWith(name, data) {
   const file = join(tmp, `${name}-ledger.json`);
   writeFileSync(file, JSON.stringify({ schemaVersion: 2, ...data }));
@@ -347,8 +355,11 @@ test('the 7d page can say which machine spent what, and what nobody claimed', ()
   const engine = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
   assert.ok(engine.includes('unattributedPoints: Math.max(0, official - known)'), '残差不给负数');
   const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
-  assert.match(renderer, /未接入/);
-  assert.match(renderer, /以及各机账本自己漏记的那部分/);
+  // 残差的名字是「未同步账本的机器」（用户 2026-09-02 拍板归成一类）：没跑 MiraQuota 的人、
+  // 关了同步或分片过期的机器、加各机账本的时差漏记。旧名「未接入」会让人只想到第一种。
+  assert.match(renderer, /未同步账本的机器/);
+  assert.doesNotMatch(renderer, /未接入/);
+  assert.match(renderer, /以及各机账本自己的时差漏记/);
 });
 
 test('a cold start uses the shards fetched by the previous round, before any network', async () => {
@@ -374,4 +385,44 @@ test('a cold start uses the shards fetched by the previous round, before any net
   const cached = await bRestarted.loadCachedShards();
   assert.equal(cached.length, 1);
   assert.equal(cached[0].machineId, 'a');
+});
+
+test('a relay call the price list cannot price is booked as tokens, never dropped', () => {
+  // 点已经扣了、美元算不出——记 token，让它在多机页有名有姓，而不是消失进残差。
+  // 回填让 token 变大时补差额；同一行重读不重复计。
+  const led = pricedLedger('unpriced');
+  const MIN = 29_100_000;
+  const row = (tok) => JSON.stringify({
+    id: 'u1', ts: new Date(MIN * 60 * 1000).toISOString(), agent: 'kimi', model: 'kimi-k3', status: 200,
+    viaRelay: true, leg: 'relay', upstreamHost: 'relay.mirasim.ai', providerCallId: 'pc1', input: tok, output: 0,
+  });
+  // 走 #parseGateway 的公开替身，和生产路径同一段代码
+  led.ingestGatewayLine(row(1000), 0);
+  led.ingestGatewayLine(row(1000), 0);      // 重读不重复
+  led.ingestGatewayLine(row(1500), 0);      // 回填变大补差额
+  assert.deepEqual(led.unpricedUsage((MIN - 1) * 60, (MIN + 1) * 60), [{ model: 'kimi-k3', tokens: 1500 }]);
+  assert.equal(led.spent((MIN - 1) * 60, (MIN + 1) * 60, { includeOpenMinute: true }), 0, '没价就没美元，不能瞎编');
+  // 分片带着 unpriced，他机的无价调用也能进这一行
+  assert.deepEqual(Object.keys(led.exportShard('me').unpriced), ['kimi-k3|' + MIN]);
+});
+
+test('dispatch calls land in their own family instead of vanishing', () => {
+  const led = pricedLedger('dispatch');
+  const MIN = 29_100_100;
+  led.ingestGatewayLine(JSON.stringify({
+    id: 'd1', ts: new Date(MIN * 60 * 1000).toISOString(), agent: 'claude', provider: 'anthropic', model: 'claude-haiku-4-5',
+    modelSource: 'dispatch', status: 200, viaRelay: true, leg: 'relay', upstreamHost: 'relay.mirasim.ai',
+    providerCallId: 'pd1', input: 1_000_000, output: 0,
+  }), 0);
+  assert.ok(led.familyIds().includes('dispatch'));
+  assert.ok(Math.abs(led.familySpent((MIN - 1) * 60, (MIN + 1) * 60, 'dispatch', { includeOpenMinute: true }) - 1) < 1e-9, 'haiku $1/M');
+});
+
+test('the enabled-model roster is checked against the price list', () => {
+  const file = join(tmp, 'setting.json');
+  writeFileSync(file, JSON.stringify({ enabledModels: { claude: ['claude-opus-5[1m]'], kimi: ['kimi-k3'], codex: [] } }));
+  const r = readEnabledModels(new Pricing(join(tmp, 'no-cache.json')), file);
+  assert.deepEqual(r.models, ['claude-opus-5[1m]', 'kimi-k3']);
+  assert.deepEqual(r.unpriced, ['kimi-k3']);
+  assert.equal(readEnabledModels(new Pricing(join(tmp, 'no-cache.json')), join(tmp, 'missing.json')), null);
 });

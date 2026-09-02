@@ -32,9 +32,14 @@ const FAMILY = [
   ['sonnet', 'claude-sonnet-5'], ['haiku', 'claude-haiku-4-5'],
 ];
 
+// 缓存里几百个 provider 对同一模型标价不一。官方源优先，其余按名字序兜底——兜底价只用来
+// 让 kimi/gemini/qwen/glm 这类模型「有个数」而不是整行消失（用户 2026-09-02）。
+const PREFERRED_PROVIDERS = ['anthropic', 'ai-router', 'openai', 'google', 'moonshotai', 'alibaba', 'zhipuai', 'deepseek', 'xai'];
+
 export class Pricing {
-  constructor() {
-    const loaded = Pricing.#loadCache() ?? {};
+  /** @param cachePath 测试注入用；默认读 Mirasim 的 models.dev 缓存 */
+  constructor(cachePath = MODELS_CACHE) {
+    const loaded = Pricing.#loadCache(cachePath) ?? {};
     // 内置官方价权威；缓存只补充未收录模型。冲突仅记录，不覆盖。
     this.table = { ...loaded, ...BUILTIN };
     this.source = Object.keys(loaded).length ? 'builtin(official) + cache补充' : 'builtin(official)';
@@ -46,13 +51,15 @@ export class Pricing {
     }
   }
 
-  static #loadCache() {
+  static #loadCache(cachePath) {
     try {
-      const root = JSON.parse(readFileSync(MODELS_CACHE, 'utf8'));
+      const root = JSON.parse(readFileSync(cachePath, 'utf8'));
       const out = {};
-      // Mirasim 官方 relay 会承载 Claude 与 GPT 等模型。Claude 价来自 anthropic，
-      // GPT 路由价来自 ai-router；同名冲突时后写不覆盖，最终内置官方表仍在构造器中最高优先。
-      for (const provider of ['anthropic', 'ai-router']) {
+      // 先官方源、再其余全部 provider；同名冲突先写者胜，内置官方表仍在构造器中最高优先。
+      // 早先只读 anthropic 与 ai-router，其他模型查不到价就整行被账本丢掉，还不出声。
+      const all = Object.keys(root?.data ?? {}).sort();
+      const providers = [...PREFERRED_PROVIDERS.filter((p) => all.includes(p)), ...all.filter((p) => !PREFERRED_PROVIDERS.includes(p))];
+      for (const provider of providers) {
         const models = root?.data?.[provider]?.models ?? {};
         for (const [id, m] of Object.entries(models)) {
           const c = m?.cost;
@@ -75,8 +82,10 @@ export class Pricing {
 
   /** 查价。未收录的标识按日期后缀、再按系列前缀归档，避免整条记录被丢弃造成低估。 */
   price(rawModel) {
-    const id = Pricing.normalize(rawModel);
+    let id = Pricing.normalize(rawModel);
     if (this.table[id]) return this.table[id];
+    // 「厂商/模型」写法先剥厂商再查
+    if (id.includes('/')) { const tail = id.slice(id.lastIndexOf('/') + 1); if (this.table[tail]) return this.table[tail]; id = tail; }
 
     const parts = id.split('-');
     while (parts.length > 2) {

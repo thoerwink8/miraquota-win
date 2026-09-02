@@ -15,7 +15,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { isBillableCloudUsage, modelFamily } from './model-families.mjs';
+import { isRelayCharged, modelFamily } from './model-families.mjs';
 
 const HOME = homedir();
 const CLAUDE_PROJECTS = join(HOME, '.claude', 'projects');
@@ -26,7 +26,7 @@ const STATE_FILE = join(STATE_DIR, 'ledger.json');
 const RETENTION = 8 * 86400;          // 覆盖 7d 窗口并留余量
 const GATEWAY_RESCAN = 1 << 20;       // 网关账本尾部重扫窗口
 const STATE_SCHEMA = 2;               // v2 扩展 GPT 定价后需重扫 transcript 补旧漏账
-const SHARD_SCHEMA = 1;               // 多机同步分片格式（见 ledger-sync.mjs / docs/MULTI-MACHINE.md）
+const SHARD_SCHEMA = 1;               // 多机同步分片格式（见 ledger-sync.mjs / docs/MULTI-MACHINE.md）；unpriced 字段可选，旧分片没有
 
 const num = (v) => {
   const n = typeof v === 'string' ? Number(v) : v;
@@ -58,6 +58,10 @@ export class CostLedger {
     this.seen = {};           // 账目键 → 入桶分钟
     this.booked = {};         // 账目键 → 已计金额（见更大值补差额）
     this.scopedSince = {};    // 组 → 起始分钟
+    // 经 relay 扣了点、但价目表没价的调用："模型|分钟" → token 数。没价就没美元，只能记 token；
+    // 记下来的意义是让它在面板上有名有姓，而不是消失进「未同步机器」那条残差里。
+    this.unpriced = {};
+    this.unpricedBooked = {};  // 账目键 → 已计 token（回填变大补差额）
     this.scopedGroups = [];
     this.gatewayScanned = {}; // 网关文件 → 上次 mtimeMs
     this.fullGatewayScanDone = false;
@@ -90,6 +94,8 @@ export class CostLedger {
       this.seen = p.seen ?? {};
       this.booked = p.booked ?? {};
       this.scopedSince = p.scopedSince ?? {};
+      this.unpriced = p.unpriced ?? {};
+      this.unpricedBooked = p.unpricedBooked ?? {};
       if ((p.schemaVersion ?? 1) < STATE_SCHEMA) {
         // 已计账目仍由 seen/booked 去重；只归零读取游标，让过去因未知模型价被跳过的记录重新定价。
         for (const path of Object.keys(this.cursors)) this.cursors[path] = { size: 0, offset: 0 };
@@ -105,6 +111,7 @@ export class CostLedger {
         cursors: this.cursors, buckets: this.buckets, scoped: this.scoped, family: this.family,
         familyBooked: this.familyBooked, familyLatest: this.familyLatest,
         seen: this.seen, booked: this.booked, scopedSince: this.scopedSince,
+        unpriced: this.unpriced, unpricedBooked: this.unpricedBooked,
       }));
     } catch { /* 落盘失败不阻断 */ }
   }
@@ -239,6 +246,9 @@ export class CostLedger {
     return changed;
   }
 
+  /** 喂一行网关账本（测试与重放用；生产路径走 refresh → #scanGateway）。 */
+  ingestGatewayLine(line, cutoff = 0) { return this.#parseGateway(line, cutoff); }
+
   #parseGateway(line, cutoff) {
     let root;
     try { root = JSON.parse(line); } catch { return false; }
@@ -259,10 +269,10 @@ export class CostLedger {
     const model = root.model ?? '';
     const usd = model ? this.pricing.cost(model, num(root.input), num(root.output),
       num(root.cacheRead), num(root.cacheWrite)) : null;
-    const billable = isBillableCloudUsage(root);
+    const billable = isRelayCharged(root);
     let familyChanged = false;
     if (billable) {
-      const family = modelFamily(model);
+      const family = root.modelSource === 'dispatch' ? { id: 'dispatch' } : modelFamily(model);
       const priorLatest = this.familyLatest[family.id] ?? 0;
       this.familyLatest[family.id] = Math.max(priorLatest, epoch);
       if (this.familyLatest[family.id] !== priorLatest) familyChanged = true;
@@ -280,7 +290,22 @@ export class CostLedger {
     // 直连/dispatch 请求不因模型缓存里有价格而混入官方计费家族。
     if (root.provider !== 'anthropic' && !billable) return familyChanged;
     // cost 对零 token 的已知模型返回 0——token 未回填的行此刻不入账，等回填后重读。
-    if (usd == null || usd <= 0) { this.unpricedRecords++; return false; }
+    if (usd == null) {
+      // 价目表没这个模型：点已经扣了，美元算不出，把 token 记下来（回填变大补差额）
+      const tok = num(root.input) + num(root.output);
+      if (billable && tok > 0) {
+        const priorTok = this.unpricedBooked[key] ?? 0;
+        if (tok > priorTok) {
+          const k = model + '|' + Math.floor(epoch / 60);
+          this.unpriced[k] = (this.unpriced[k] ?? 0) + (tok - priorTok);
+          this.unpricedBooked[key] = tok;
+          familyChanged = true;
+        }
+      }
+      this.unpricedRecords++;
+      return familyChanged;
+    }
+    if (usd <= 0) return familyChanged;
     if (prior == null && this.seen[key] != null) {
       // v1 已见过但未定价的 GPT 请求：v2 从 ai-router 获得价格后允许一次性补账。
       // 其他旧账目继续宁漏勿重；补账后 booked 会阻止后续重复。
@@ -314,8 +339,12 @@ export class CostLedger {
       if (m < minCut) delete this.family[k];
     }
     for (const id of Object.keys(this.familyLatest)) if (this.familyLatest[id] < cutoff) delete this.familyLatest[id];
+    for (const k of Object.keys(this.unpriced)) {
+      const m = Number(k.split('|').pop());
+      if (m < minCut) { delete this.unpriced[k]; }
+    }
     for (const k of Object.keys(this.seen)) if (this.seen[k] < minCut) {
-      delete this.seen[k]; delete this.booked[k]; delete this.familyBooked[k];
+      delete this.seen[k]; delete this.booked[k]; delete this.familyBooked[k]; delete this.unpricedBooked[k];
     }
     for (const k of Object.keys(this.cursors)) {
       try { statSync(k); } catch { delete this.cursors[k]; }
@@ -335,6 +364,7 @@ export class CostLedger {
       generatedAt: nowSec,
       coverage: { fromSec: nowSec - RETENTION, toSec: nowSec },
       buckets: this.buckets, scoped: this.scoped, family: this.family,
+      unpriced: this.unpriced,
     };
   }
 
@@ -348,6 +378,27 @@ export class CostLedger {
     this.#mergedIndex = null;
     this.#mergedScopedIndex = {};
     this.#mergedFamilyIndex = {};
+  }
+
+  /**
+   * 窗口内没价的调用，按模型汇总 token（本机 + 外机分片）。有价的不在这里——它们在 spent 里。
+   * @returns [{ model, tokens }] 按 token 降序
+   */
+  unpricedUsage(fromSec, toSec) {
+    const lo = Math.floor(fromSec / 60), hi = Math.floor(toSec / 60);
+    const sum = new Map();
+    const fold = (obj) => {
+      for (const [k, v] of Object.entries(obj ?? {})) {
+        const cut = k.lastIndexOf('|');
+        const m = Number(k.slice(cut + 1));
+        if (!Number.isFinite(m) || m < lo || m > hi) continue;
+        const model = k.slice(0, cut);
+        sum.set(model, (sum.get(model) ?? 0) + (Number(v) || 0));
+      }
+    };
+    fold(this.unpriced);
+    for (const s of this.foreignShards) fold(s.unpriced);
+    return [...sum.entries()].map(([model, tokens]) => ({ model, tokens })).sort((a, b) => b.tokens - a.tokens);
   }
 
   /**

@@ -12,6 +12,7 @@ const FAMILY_RULES = [
 
 /** 家族 id → 展示名（未知 id 首字母大写兜底）。 */
 export function familyLabel(id) {
+  if (id === 'dispatch') return '调度';   // Mirasim 自己发起的中继调用（标题、路由等），按来源而非模型归类
   const rule = FAMILY_RULES.find(([fid]) => fid === id);
   if (rule) return rule[1];
   const s = String(id || '');
@@ -25,6 +26,18 @@ export function modelFamily(rawModel) {
   const tail = model.slice(model.lastIndexOf('/') + 1).trim();
   const token = (tail.split(/[-_.\s]+/)[0] || 'other').toLowerCase();
   return { id: token.replace(/[^a-z0-9]+/g, '') || 'other', label: token[0]?.toUpperCase() + token.slice(1) };
+}
+
+/**
+ * 经官方 relay 且成功的调用——这是「会扣点」的全集，账本一行都不许静默丢
+ * （用户 2026-09-02：没统计到的东西要区分来源，先全记下来）。
+ * 与 isBillableCloudUsage 的差别只在 dispatch：那是 Mirasim 自己发的中继调用，
+ * 不该混进「用户选的计费家族」，但点数照扣，所以账本按来源单列一个家族。
+ */
+export function isRelayCharged(row) {
+  return row?.status === 200 && row?.viaRelay === true && row?.leg === 'relay'
+    && String(row?.upstreamHost || '').toLowerCase() === 'relay.mirasim.ai'
+    && typeof row?.model === 'string' && row.model.length > 0;
 }
 
 export function isBillableCloudUsage(row) {
