@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Inbox = '__INBOX_URL__'
+$Inbox = 'https://miraquota-inbox.miraquota.workers.dev'
 $Dir = Join-Path $env:USERPROFILE '.miraquota'
 $Cfg = Join-Path $Dir 'lite.json'
 $Insights = Join-Path $env:USERPROFILE '.mirasim\insights'

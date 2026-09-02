@@ -82,7 +82,7 @@ export default {
       if (req.method === 'GET' && path === '/lite.ps1') return text(LITE_PS1.replaceAll('__INBOX_URL__', url.origin));
       if (req.method === 'GET' && path === '/lite.bat') {
         // .bat 里 CRLF 是硬要求：cmd 对 LF 结尾的文件会吞掉某些行
-        return new Response(LITE_BAT.replaceAll('__INBOX_URL__', url.origin).replace(/\r?\n/g, '\r\n'), {
+        return new Response(LITE_BAT.replace(/set "INBOX=[^"]*"/, `set "INBOX=${url.origin}"`).replace(/\r?\n/g, '\r\n'), {
           headers: {
             'content-type': 'application/octet-stream',
             'content-disposition': 'attachment; filename="MiraQuota-Lite.bat"',

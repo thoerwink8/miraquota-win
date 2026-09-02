@@ -84,6 +84,8 @@ if (built.status !== 0) die('打包失败，未发版');
 const assets = [
   join(DIST, `MiraQuota-Setup-${version}.exe`),
   join(DIST, `MiraQuota-Setup-${version}.exe.blockmap`),
+  // 轻客户端也随版发：GitHub 国内能下，workers.dev 不一定能
+  join(DIST, '..', 'MiraQuota-Lite.bat'),
   join(DIST, 'latest.yml'),
 ];
 const missing = assets.filter((f) => !existsSync(f));

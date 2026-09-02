@@ -213,3 +213,17 @@ test('a git-channel machine also sees inbox people, and a dead inbox costs it no
     assert.deepEqual(await dead.loadCachedShards(), []);
   } finally { box.close(); }
 });
+
+test('the friend-facing BAT is a real file with the real address baked in, and stays in step', () => {
+  // 用户 2026-09-03：BAT 要放仓库里能直接复制给朋友——朋友拿到的是文件，不一定从 Worker 下，
+  // 所以地址必须烤在文件里，不能留占位符；根目录那份与 inbox/lite.bat 只能是同一份（CRLF 归一后）。
+  const root = readFileSync(new URL('../MiraQuota-Lite.bat', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../inbox/lite.bat', import.meta.url), 'utf8');
+  const ps1 = readFileSync(new URL('../inbox/lite.ps1', import.meta.url), 'utf8');
+  for (const s of [root, src, ps1]) { assert.ok(!s.includes('__INBOX_URL__'), '不许留占位符'); assert.ok(s.includes(DEFAULT_INBOX), '烤进默认收件口'); }
+  assert.equal(root.replace(/\r?\n/g, '\n'), src.replace(/\r?\n/g, '\n'), '两份 BAT 内容一致');
+  assert.ok(root.includes('\r\n'), 'cmd 要 CRLF');
+  assert.match(readFileSync(new URL('../.gitattributes', import.meta.url), 'utf8'), /\*\.bat text eol=crlf/);
+  const rel = readFileSync(new URL('../scripts/release.mjs', import.meta.url), 'utf8');
+  assert.ok(rel.includes("'MiraQuota-Lite.bat'"), '随版发到 GitHub Releases');
+});

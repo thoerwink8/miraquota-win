@@ -24,7 +24,8 @@ node scripts/inbox-deploy.mjs --invite <你定的邀请码>
 ## 别人怎么加入
 
 - **装了 MiraQuota 的人**：多机页 →「加入多机统计」→ 名字、口令、邀请码 → 登录并开始上传。
-- **不装软件的人**：浏览器打开 `<地址>/lite.bat` 下载，双击，按提示输三样东西。
+- **不装软件的人**：把仓库根目录的 `MiraQuota-Lite.bat` 直接发给他（每次 Release 的附件里也有一份；
+  `<地址>/lite.bat` 也能下但要代理），双击，按提示输三样东西。
   它会建一个每 10 分钟跑一次的计划任务（`MiraQuotaLite`），只上传每次调用的时间、模型、token 数。
   停掉：`powershell -File %USERPROFILE%\.miraquota\lite.ps1 -Uninstall`。
 

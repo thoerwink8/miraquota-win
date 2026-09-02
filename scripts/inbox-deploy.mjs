@@ -79,4 +79,11 @@ if (before !== url) {
   writeFileSync(syncPath, src);
   console.log(`[inbox] DEFAULT_INBOX ${before} → ${url}（记得提交并发版）`);
 }
-console.log(`[inbox] 体检：${url}/health · 轻客户端：${url}/lite.bat`);
+// 轻客户端里烤着地址（朋友拿到的是文件，不一定从 Worker 下）：地址变了三份一起改
+for (const f of ['inbox/lite.bat', 'inbox/lite.ps1', 'MiraQuota-Lite.bat']) {
+  const p = join(root, f);
+  const s = readFileSync(p, 'utf8');
+  const n = s.replace(/https:\/\/[a-z0-9.-]+\.workers\.dev\b|https:\/\/inbox\.[a-z0-9.-]+/g, url);
+  if (n !== s) { writeFileSync(p, n); console.log(`[inbox] 已更新 ${f} 里的地址`); }
+}
+console.log(`[inbox] 体检：${url}/health · 轻客户端：${url}/lite.bat · 仓库根目录 MiraQuota-Lite.bat 可直接发给朋友`);
