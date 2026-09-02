@@ -508,7 +508,7 @@ export class Engine {
       const pace = Math.min(100, Math.max(0, (now - rolled.start) / dur * 100));
       const breakdown = this.#familyBreakdown(rolled.start, now, group);
       return {
-        label: a.label, usedPercent, inferred: true,
+        label: a.label, usedPercent, inferred: true, durationSeconds: a.duration,
         confidence: est?.confidence ?? 'none', sampleCount: est?.observations ?? 0,
         spentUSD,
         ...(breakdown ?? {}),
@@ -612,6 +612,40 @@ export class Engine {
     });
   }
 
+  /**
+   * 7 天里每台机器各花了多少，外加一条「未接入」。
+   * 每台机器 = 它自己的账本按倍率折算 ÷ 0.01（折算后才与官方点数同尺）；
+   * 未接入 = 官方已用点 − 各机之和。
+   * 这条残差同时装着两样东西：真的没跑 MiraQuota 的人，和各机账本自己漏记的部分
+   * （未归因点数、relay 未回填、分片延迟，本机实测约 3.5%）。界面必须说清，
+   * 否则用户会把「我们的账本不准」读成「别人用了这么多」。
+   */
+  #machineUsage(windows) {
+    const w = windows.find((x) => x.label === '7d') ?? windows.find((x) => !x.modelGroup);
+    if (!w?.durationSeconds || !w.resetAt) return null;
+    const now = Date.now() / 1000;
+    const ratio = this.settings.ratioOf('fable');
+    const rows = this.ledger
+      .perMachineSpent(w.resetAt - w.durationSeconds, now, { group: 'fable', selfId: this.sync.machineId })
+      .map((r) => {
+        const usd = r.usd + (ratio > 0 ? (ratio - 1) * r.groupUSD : 0);
+        return { id: r.machineId, self: r.self, usd, points: usd / OFFICIAL_PER_POINT };
+      })
+      .sort((a, b) => b.points - a.points);
+    const known = rows.reduce((a, b) => a + b.points, 0);
+    const official = w.points?.used ?? null;
+    return {
+      usage: {
+        label: w.label, machines: rows,
+        ...(official != null ? {
+          officialPoints: official,
+          unattributedPoints: Math.max(0, official - known),
+          unattributedUSD: Math.max(0, official - known) * OFFICIAL_PER_POINT,
+        } : {}),
+      },
+    };
+  }
+
   /** 官方满额：预算点 ÷ 100 ÷ 档位倍率。预算点缺席（纯本机口径）时返回 null。 */
   #officialFull(budget, ratio) {
     if (!(budget > 0) || !(ratio > 0)) return null;
@@ -650,7 +684,7 @@ export class Engine {
       today: this.#todaySummary(Date.now() / 1000),
       speed: this.#speedReport(),
       // 无同步配置时不出现该字段，显示面据此不画任何新 UI（硬性验收项）。
-      ...(this.sync.enabled ? { sync: this.sync.status() } : {}),
+      ...(this.sync.enabled ? { sync: { ...this.sync.status(), ...this.#machineUsage(windows) } } : {}),
     };
   }
 }

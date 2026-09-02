@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -307,12 +307,48 @@ test('with sync configured the payload carries a sync status field', () => {
       machineId: 'engine',
     },
   });
-  assert.deepEqual(engine.payload().sync, {
+  // 只比同步状态本身：这个 Engine 读的是真机的账本与锚点（非隔离），
+  // 用量字段会随本机数据变，deepEqual 整块会被无关字段带崩。
+  const { usage, ...status } = engine.payload().sync;
+  assert.deepEqual(status, {
     state: 'connecting',
     pushOk: false,
     intervalSec: 600,
     machines: [{ id: 'engine', lastShardSec: null, self: true }],
   });
+});
+
+test('the 7d page can say which machine spent what, and what nobody claimed', () => {
+  // 官方点数只有账号级一个总数，拆不出用户；能拆的只有各机自己的账本。所以每台机器
+  // 用它自己的分片算，剩下的进「未接入」——那条残差同时装着没接入的人和账本漏记，
+  // 界面必须说清（本机实测账本偏低约 3%，残差在这个量级基本是漏记而非他人）。
+  const MIN = 29_000_000;
+  const led = ledgerWith('split', {
+    buckets: { [MIN]: 10, [MIN + 1]: 4 },
+    scoped: { [`fable|${MIN + 1}`]: 4 },      // 本机这 4 刀走 fable
+  });
+  led.adoptForeignShards([{
+    schemaVersion: 1, machineId: 'other', generatedAt: MIN * 60,
+    coverage: { fromSec: 0, toSec: MIN * 60 },
+    buckets: { [MIN]: 6 }, scoped: {}, family: {},
+  }]);
+  const rows = led.perMachineSpent((MIN - 10) * 60, (MIN + 2) * 60, { group: 'fable', selfId: 'me' });
+  assert.deepEqual(rows.map((r) => [r.machineId, r.self, r.usd, r.groupUSD]), [
+    ['me', true, 14, 4],
+    ['other', false, 6, 0],
+  ]);
+  // 折算后换算成点：本机 (14 + 1×4) ÷ 0.01 = 1800，他机 6 ÷ 0.01 = 600
+  const pts = (r) => (r.usd + r.groupUSD) / 0.01;
+  assert.equal(pts(rows[0]), 1800);
+  assert.equal(pts(rows[1]), 600);
+  // 合并口径不受影响：拆分走的是分片本体，不碰合并索引
+  assert.equal(led.spent((MIN - 10) * 60, (MIN + 2) * 60, { includeOpenMinute: true }), 20);
+
+  const engine = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
+  assert.ok(engine.includes('unattributedPoints: Math.max(0, official - known)'), '残差不给负数');
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  assert.match(renderer, /未接入/);
+  assert.match(renderer, /以及各机账本自己漏记的那部分/);
 });
 
 test('a cold start uses the shards fetched by the previous round, before any network', async () => {

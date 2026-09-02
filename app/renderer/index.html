@@ -166,6 +166,10 @@
   .sync-machine { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink2); margin-top: 4px; }
   .sync-machine .id { font-weight: 600; color: var(--ink); }
   .sync-machine .when { color: var(--ink3); }
+  /* 用量紧跟机器名，和右侧的推送时间分属两栏——一眼看「谁花的」而不用横扫 */
+  .sync-machine .use { margin-left: 8px; font-weight: 700; color: var(--accent); }
+  .sync-machine.off .id { color: var(--ink3); font-weight: 500; }
+  .sync-machine.off .use { color: var(--ink2); }
   .sync-machine.expired .id, .sync-machine.expired .when { color: var(--ink3); font-weight: 500; }
   .sync-why { font-size: 10.5px; color: var(--ink3); margin-top: 5px; line-height: 1.5; word-break: break-all; }
 
@@ -301,6 +305,11 @@
           「本机账本$ ÷ 账号已用点」系统性偏低，合并后单价、归因、活跃强度才与官方同口径。<br>
           <b>失败会怎样</b>：只是样本变少，美元退回本机口径，<b>不会算错</b>——点数与百分比始终直连云端。
           黄色不用管，红色才看网络与凭据。<br>
+          <b>每台机器的 7 天用量</b>：各机自己的账本（fable 按倍率折算）÷ 100，与官方点数同尺。
+          <b>「未接入」是残差</b>——账号已用点减掉各机之和，它同时装着两样东西：真的没跑 MiraQuota
+          的人，<b>以及各机账本自己漏记的那部分</b>（未归因点数、relay 未回填、分片最多落后一轮）。
+          本机实测账本偏低约 3%，所以残差在 3% 上下时基本是漏记、不是别人；明显超出才说明有人在共用。
+          官方接口只给账号级总数，拆不出用户，这是能做到的最细粒度。<br>
           <b>怎么同步的</b>：每台机器只写自己的 <code>machine/&lt;机器名&gt;</code> 分支，单提交覆盖不留历史；
           读他机只取远程分支内容，不动本机工作区。
         </div>
@@ -709,13 +718,23 @@
       $('syncWhy').innerHTML = why.join(' · ');
       // 分片超过 2×intervalSec 未更新 ⇒ 该机器视为已过期（可能离场或同步中断）
       const expiredBefore = Date.now() / 1000 - 2 * (sy.intervalSec ?? 600);
+      // 每台机器 7 天用量：官方点数只有账号级总数，拆不出人；能拆的只有各机自己的账本。
+      // 「未接入」是残差（官方已用点 − 各机之和），装着两样东西——没跑 MiraQuota 的人，
+      // 和各机账本自己漏记的部分。所以它旁边必须有那句说明，不能让人读成纯他人用量。
+      const use = sy.usage;
+      const amount = (pts, usd) => MODE === 'pts' ? `${fmtK(pts)} 点` : money(usd, 0);
+      const useOf = (id) => (use?.machines ?? []).find((x) => x.id === id);
       $('syncMachines').innerHTML = (sy.machines ?? []).map((m) => {
         const expired = m.lastShardSec != null && m.lastShardSec < expiredBefore;
         const when = m.lastShardSec == null ? '尚未推送' : `${ago(m.lastShardSec)}推送`;
+        const u = useOf(m.id);
         return `<div class="sync-machine${expired ? ' expired' : ''}">
-          <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}</span>
+          <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}${u ? `<span class="use">${amount(u.points, u.usd)}</span>` : ''}</span>
           <span class="when">${when}${expired ? ' · 已过期' : ''}</span></div>`;
-      }).join('');
+      }).join('') + (use?.unattributedPoints >= 1
+        ? `<div class="sync-machine off"><span class="id">未接入<span class="use">${amount(use.unattributedPoints, use.unattributedUSD)}</span></span>
+           <span class="when">账号已用 ${amount(use.officialPoints, use.officialPoints / 100)}</span></div>`
+        : '');
       // 他机那一行的时间是「我这边最近一轮读到的那份分片的生成时刻」，不是对方的实时推送时刻：
       // 同步按 intervalSec 节流，所以最多落后一轮。不写清楚，两台机器对看时数字对不上。
       const basis = [`每 ${Math.round((sy.intervalSec ?? 600) / 60)} 分钟同步一轮`,

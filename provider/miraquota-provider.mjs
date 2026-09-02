@@ -81,6 +81,15 @@ function printSnapshot(p) {
       console.log(`          余 $${w.remainingUSD.toFixed(0)}${eta}`);
     }
   }
+  const u = p.sync?.usage;
+  if (u) {
+    for (const m of u.machines) {
+      console.log(`${u.label} 机器 ${(m.id + (m.self ? '（本机）' : '')).padEnd(22)} ${Math.round(m.points).toLocaleString().padStart(9)} 点  ${m.usd.toFixed(2)}`);
+    }
+    if (u.unattributedPoints != null) {
+      console.log(`${u.label} 机器 ${'未接入'.padEnd(20)} ${Math.round(u.unattributedPoints).toLocaleString().padStart(9)} 点  ${u.unattributedUSD.toFixed(2)}`);
+    }
+  }
   for (const r of p.speed?.rows ?? []) {
     const ttft = r.ttft != null ? `首 ≈${r.ttft.toFixed(1)}s` : '首 -';
     const rate = r.rate != null ? `出字 ${r.rate.toFixed(0)} tok/s` : '出字 -';

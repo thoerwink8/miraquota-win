@@ -351,6 +351,32 @@ export class CostLedger {
   }
 
   /**
+   * 按机器拆开的窗口支出——多机页要回答「谁花的」。
+   * 官方点数只有账号级一个总数，拆不出人；能拆的只有各机自己的账本（本机 + 同步来的分片）。
+   * 这里不走合并索引：合并的意义就是抹掉机器边界，正好和这个问题相反。
+   * @returns [{ machineId, self, usd, groupUSD }]，本机 machineId 由调用方给。
+   */
+  perMachineSpent(fromSec, toSec, { group = null, selfId = null } = {}) {
+    const lo = Math.floor(fromSec / 60), hi = Math.floor(toSec / 60);
+    const head = group ? group.toLowerCase() + '|' : null;
+    const sum = (obj, pre) => {
+      let t = 0;
+      for (const [k, v] of Object.entries(obj ?? {})) {
+        if (pre != null && !k.startsWith(pre)) continue;
+        const m = Number(pre != null ? k.slice(pre.length) : k);
+        if (Number.isFinite(m) && m >= lo && m <= hi) t += Number(v) || 0;
+      }
+      return t;
+    };
+    const row = (src, machineId, self) => ({
+      machineId, self,
+      usd: sum(src.buckets, null),
+      groupUSD: head ? sum(src.scoped, head) : 0,
+    });
+    return [row(this, selfId, true), ...this.foreignShards.map((s) => row(s, s.machineId, false))];
+  }
+
+  /**
    * 在场外机分片的覆盖区间（标定覆盖门用）。分片过老（generatedAt 早于保留窗）
    * 视为该机器已离场，不再参与「全覆盖」判定——它的账本早就不新鲜了。
    */
