@@ -109,20 +109,21 @@ test('the measured ratio pairs the scoped window with the pool window of the sam
   assert.equal(measureGroupRatio([withFiveHour[0], merged7d[1]], ledger, now, 'fable'), null);
 });
 
-test('every window reports the total-ratio full value, median only as fallback', () => {
-  // 2026-09-02 用户拍板：满额改用「整窗支出 ÷ 整窗点数 × 预算点」，与官方 5600 对得上。
-  // 总窗乘折算后的基准单价；档位窗用它自己的支出与点数（它的点已按倍率扣过，不再折算）。
+test('full quota comes from the official points/100 rule on every payload path', () => {
+  // 2026-09-02 用户向官方求证：额度点 ÷ 100 = 美元额度。此前靠账本反推，两处硬伤——
+  // 账本漏一点满额同倍缩水（实测 -3.5%），且 Mirasim 一停就退到另一套中位数算法
+  // （用户截图里 7d 报 $2837 而非 $5600）。现在三条路径同一个数，且不依赖账本。
   const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
-  // 面板上每个数都由同一个模型推出来：总窗 = 基准单价 × 预算点，档位窗 = 基准单价 ÷ 倍率
-  // × 预算点。用户 2026-09-02 指出：档位窗若走自己的实测比值，改设置时它不动，看着像 bug。
-  assert.ok(src.includes("? (rate != null && groupRatio > 0 ? rate / groupRatio * w.budget"),
-    '档位窗满额要跟着设置的倍率走');
-  assert.ok(src.includes(": (rate != null ? rate * w.budget : null)"), '总窗要乘折算后的基准单价');
-  assert.ok(src.includes("(spent > 0 && w.used > 0 ? spent / w.used * w.budget : null))"),
-    '基准单价给不出时才退回该档位自己的实测比值');
-  assert.ok(src.includes("fullUSD: ratioFull, basis: 'ratio'"), '总额比值优先');
-  assert.ok(src.includes("fullUSD: est.fullUSD, basis: 'median'"), '给不出时才退回中位数');
-  assert.match(src, /conservativeUSD/);
+  assert.ok(src.includes('export const OFFICIAL_PER_POINT = 0.01;'), '官方汇率是常量，不再反推');
+  assert.ok(src.includes('return budget * OFFICIAL_PER_POINT / ratio;'), '档位窗要除倍率');
+  // 实测路径与推算路径都必须走同一个 #officialFull——分家就是上次那个 bug
+  assert.equal((src.match(/#officialFull\(/g) ?? []).length, 3, '定义 1 处 + 两条路径各调 1 次');
+  assert.ok(src.includes("fullUSD: ratioFull, basis: 'official'"));
+  assert.ok(src.includes("fullUSD: est.fullUSD, basis: 'median'"), '纯本机口径没有预算点，才退中位数');
+  for (const [pts, usd] of [[560000, 5600], [156800, 1568], [296800, 2968]]) {
+    assert.equal(pts * 0.01, usd, '官方三个窗口的点数都整除 100');
+  }
+  assert.equal(296800 * 0.01 / 2, 1484, 'fable 子上限真能花掉的 API 用量');
 });
 
 test('a ratio that contradicts the measured one is called out on the scoped card', () => {
@@ -164,19 +165,16 @@ test('each window shows the ratio-weighted spend next to the raw ledger spend', 
   assert.match(renderer, /折算 <b>/);
 });
 
-test('the panel cross-checks the reverse-inferred price against the official 1/100 anchor', () => {
-  // 官方三个窗口的点数都恰好整除 100：560000→5600、156800→1568、296800→2968。
-  // 本机反推 ≈0.0100 与之吻合，这是「5600 到底对不对」的直接证据。仍然反推而不是写死——
-  // 写死 0.01 会让账本漏计/超算再也无法被发现（反推与官方的偏离就是那道检查）。
-  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
-  assert.ok(renderer.includes('const OFFICIAL_PER_POINT = 0.01;'));
-  assert.match(renderer, /点数 ÷ 100 = 美元/);
-  assert.match(renderer, /本机反推偏离/);
+test('the reverse-inferred price survives as a ledger health check, not as the basis', () => {
+  // 反推不删：它与官方 0.01 的偏离＝本机账本漏了多少（未归因点数、relay 未回填、
+  // 他机分片延迟）。删掉它，账本再漏也没人报警——但它不能再当满额的地基。
   const engine = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
-  assert.ok(!engine.includes('0.01;'), '引擎里不许出现写死单价——美元一律由账本反推');
-  for (const [pts, usd] of [[560000, 5600], [156800, 1568], [296800, 2968]]) {
-    assert.equal(pts * 0.01, usd);
-  }
+  assert.ok(engine.includes('out.unitPriceUSD = OFFICIAL_PER_POINT;'), '对外单价给官方值');
+  assert.ok(engine.includes('out.ledgerPerPoint = rate;'), '反推值另开字段');
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  assert.match(renderer, /账本对表/);
+  assert.ok(renderer.includes('p.ledgerPerPoint.toFixed(6)'));
+  assert.ok(renderer.includes("if (dev < -2) t +="), '偏低要说清主行数字该往上看');
 });
 
 test('the ratio field says which unit it wants, so nobody types the per-token 4', () => {

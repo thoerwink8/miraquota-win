@@ -24,7 +24,7 @@
  * v23 将满额标签改为「官≈」（官方点数反推）与「预≈」（本机账本预测），并统一顺序。
  * v24 跟随桌面端计费家族选择，为最近 5 种具体模型标出当前家族并展开最近 5 个任务。
  * v25 多机账本同步启用时在账本行加一段状态（×N 机器 / 同步失败）；无同步配置零变化。
- * v26 满额收敛成一个数「满额≈」（整窗支出 ÷ 整窗点数 × 预算点，fable 按倍率折算），
+ * v27 满额走官方除法「额度点 ÷ 100」（2026-09-02 向官方求证），档位窗再除倍率，不再带 ≈；
  *     取代 v21/v23 的两口径并列——改口径后两者只差折算，并排摆着让人不知信哪个。
  * v20 满额不可用时主行改用点数：兜底满额来自本机账本反推的每点美元，账本失真会把满额
  * 同倍放大，而卡面只有一个 `~` 前缀。provider 侧判出账本与点数不自洽即不再给 fullUSD，
@@ -926,7 +926,7 @@
       setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(w.spentUSD ?? 0));
       // 满额只给一个数（2026-09-02，与桌面面板同步）：原来的「官≈/预≈」两口径在
       // 改用总额比值后只差 fable 折算，摆两个数只会让人问哪个对。
-      setText(c.full, w.fullUSD != null ? '/ 满额≈' + usd(w.fullUSD) : '/ 满额标定中');
+      setText(c.full, w.fullUSD != null ? '/ 满额 ' + usd(w.fullUSD) : '/ 满额标定中');
       setText(c.pc, (w.inferred ? '≈' : '') + pct(w.usedPercent));
       setTone(c.pc, 'pc', tone);
       setStyle(c.fill, 'width', Math.min(100, Math.max(0, w.usedPercent)) + '%');
@@ -1075,7 +1075,7 @@
     }
     setHidden(els.rowFull, !d.unitPriceUSD && !d.unitPriceNotice);
     if (d.unitPriceUSD) {
-      setText(els.metaFull, `回归标定优先 · 兜底 额度点 × $${d.unitPriceUSD.toFixed(6)}`);
+      setText(els.metaFull, `额度点 ÷ 100（官方）` + (d.ledgerPerPoint != null ? ` · 账本反推 ${d.ledgerPerPoint.toFixed(6)}` : ''));
     } else if (d.unitPriceNotice) {
       setText(els.metaFull, d.unitPriceNotice);
     }

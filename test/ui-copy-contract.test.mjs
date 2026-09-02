@@ -17,12 +17,13 @@ test('account-level dollar values are visibly approximate in the embedded widget
   assert.match(widget, /`余 ≈\$\{usd\(w\.remainingUSD\)\}`/);
 });
 
-test('each card shows exactly one full-quota number, in both display faces', () => {
-  // 2026-09-02 用户拍板：满额统一走总额比值口径后，原来的「官≈/预≈」两个数只差
-  // fable 折算，并排摆着只会让人问哪个对。中位数退到 tooltip 当保守参考。
-  assert.match(renderer, /点数反推/);
-  assert.match(renderer, /<span class="tag">满额≈<\/span>/);
-  assert.match(widget, /'\/ 满额≈' \+ usd\(w\.fullUSD\)/);
+test('each card shows exactly one full-quota number, and it no longer wears the ≈', () => {
+  // 2026-09-02：满额改走官方「额度点 ÷ 100」后就是精确值，再挂 ≈ 是自贬。
+  // 余 / 账号级已用同样由官方点数直接除得，一并脱掉推断标记。
+  assert.ok(renderer.includes('<span class="tag">满额</span>'));
+  assert.doesNotMatch(renderer, /满额≈/);
+  assert.ok(widget.includes("'/ 满额 ' + usd(w.fullUSD)"));
+  assert.doesNotMatch(widget, /满额≈/);
   // 旧的两口径字段整条链路都不该再有（payload 也不再产出它）
   for (const src of [renderer, widget, engine]) assert.doesNotMatch(src, /fullUSDOfficial/);
 });

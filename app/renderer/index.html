@@ -278,9 +278,10 @@
       <div class="card"><div class="hint">
         <b>精确</b>（无标记）——点数与百分比来自 <code>/v1/limits</code>，账号级权威；美元主行是本机账本
         token × 官方 API 价，可与 Mirasim「流量监控 → 估算成本」逐笔核对。<br>
-        <b>推算</b>（带 ≈）——满额 / 余 / 账号级已用。云端只给点数、不给汇率，只能<b>点数反推</b>：
-        账本$ ÷ 已用点 × 预算点。带 ⁻ 的是档位窗，分桶自档位声明起才累积，此口径系统性偏低。<br>
-        <b>折算</b>——fable 每美元扣 2 倍点，主行的账本原值要放大后才与满额同口径，故并排给「折算」。<br>
+        <b>满额 / 余 / 账号级已用</b>——官方口径：额度点 ÷ 100 = 美元（官方已确认）。档位卡再除以倍率，
+        给的是「拿这个档位真能花掉多少」——fable 子上限 296,800 点只兑得出 $1,484。<br>
+        <b>折算</b>（仅总窗）——fable 每美元扣 2 倍点，主行的账本原值放大后才与满额同尺。<br>
+        <b>账本对表</b>——本机账本反推的单价与官方 0.01 的偏离，就是账本漏计的幅度，在上面「单价」里。<br>
         <b>美元性质</b>——按官方 API 价折算的等价估值，不是订阅账单。<br>
         <b>分家族</b>——美元是账本实测；点数按同期各家族账本占比归因，同期无本机支出的记「未归因」（他机用量）。归因自本版部署起累积。<br>
         <b>今天</b>——自然日 0 点起。点数含其他设备，美元只算本机，两者不能互相换算。<br>
@@ -476,12 +477,12 @@
       // （用户 2026-08-28 指出重叠且该位置应给满额）。
       // 满额只给一个数（2026-09-02）：原来并排「官≈/预≈」两个口径，改成总额比值后
       // 两者只差 fable 折算，摆两个数只会让人问哪个对。中位数退到 tooltip 当保守参考。
-      fullText = w.fullUSD != null ? ` / <span class="tag">满额≈</span><b>${money(w.fullUSD, 0)}</b>` : ' / 满额标定中';
+      fullText = w.fullUSD != null ? ` / <span class="tag">满额</span><b>${money(w.fullUSD, 0)}</b>` : ' / 满额标定中';
       const infer = [];
       if (w.remainingUSD != null) infer.push(`余 <b>${money(w.remainingUSD, 0)}</b>`);
       if (w.scaledSpentUSD != null) infer.push(`账号级已用 <b>${money(w.scaledSpentUSD)}</b>`);
       remainText = infer.length ? `推算 ${infer.join(' · ')}` : '';
-      fullTitle = '满额≈整窗折算后支出 ÷ 官方已用点 × 预算点'
+      fullTitle = '满额 = 官方预算点 ÷ 100' + (w.modelGroup ? ' ÷ 档位倍率（该档位真能花掉的 API 用量）' : '')
         + (w.conservativeUSD != null ? ` · 保守估计（分段单价中位数）${money(w.conservativeUSD, 0)}` : '')
         + ' · 非云端账单';
       subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`] : [];
@@ -731,7 +732,7 @@
 
     // 总览页脚只留一行现状；公式与免责全文在「口径说明」页，多机明细在「多机」页。
     const foot = [];
-    if (p.unitPriceUSD != null) foot.push(`单价 ${p.unitPriceUSD.toFixed(6)} $/点`);
+    if (p.unitPriceUSD != null) foot.push(`单价 ${p.unitPriceUSD.toFixed(4)} $/点`);
     if (p.calibDropped > 0) foot.push(`已剔除他机观测 ${p.calibDropped} 段`);
     if (p.accountNotice) foot.push(p.accountNotice);
     // 一行摘要 + 去哪看：点一下跳「多机」页（运维态明细不占总览的额度位置）
@@ -748,18 +749,20 @@
     const spec = [];
     if (p.unitPriceUSD != null) {
       const c = p.unitPriceCalc;
-      let t = `<b>单价</b> ${p.unitPriceUSD.toFixed(6)} $/点`;
-      if (c) t += ` ＝ ${WINDOW_NAME[c.label] ?? c.label}窗本机账本 ${money(c.usd)} ÷ 同期已用 ${Math.round(c.points)} 点`;
+      let t = `<b>单价</b> ${p.unitPriceUSD.toFixed(4)} $/点（官方：额度点 ÷ 100 = 美元）`;
       // 折算过就把原始账本值一并交代：否则用户会拿这个数去对账本，怎么对都对不上
       if (c?.adjustments?.length) {
         const parts = c.adjustments.map((a) => `${a.group} ${money(a.usd)}×${a.ratio}`).join('、');
-        t += `<br><b>档位折算</b> 账本原值 ${money(c.rawUSD)}，其中 ${parts}（官方按倍率扣点，倍率可在本页顶部改）`;
+        t += `<br><b>档位折算</b> 账本原值 ${money(c.rawUSD)}，其中 ${parts}`;
       }
-      // 官方基准是整数 $0.01/点（560000 点 ÷ 100 = 官方宣称的 5600 刀，5h、fable 窗同样整除）。
-      // 我们仍然从账本反推而不是写死 0.01——反推是唯一能发现账本漏计/超算的检查，偏离多少就摆多少。
-      const dev = (p.unitPriceUSD - OFFICIAL_PER_POINT) / OFFICIAL_PER_POINT * 100;
-      t += `<br><b>对表官方</b> 官方基准 ${OFFICIAL_PER_POINT.toFixed(4)} $/点（点数 ÷ 100 = 美元），本机反推偏离 ${dev >= 0 ? '+' : ''}${dev.toFixed(1)}%`;
-      if (p.unitPriceSpread != null) t += `<br><b>交叉校验</b> 5h/7d 两窗单价离散 ${p.unitPriceSpread.toFixed(2)}×（超过 4× 判不自洽，停用美元显示）`;
+      // 反推值不再当地基，改当体检：它与官方 0.01 的偏离＝本机账本漏了多少（未归因点数、
+      // relay 未回填、他机分片延迟）。负偏离越大，主行那个「账本花费」越偏低。
+      if (p.ledgerPerPoint != null) {
+        const dev = (p.ledgerPerPoint - OFFICIAL_PER_POINT) / OFFICIAL_PER_POINT * 100;
+        t += `<br><b>账本对表</b> 本机反推 ${p.ledgerPerPoint.toFixed(6)} $/点，偏离 ${dev >= 0 ? '+' : ''}${dev.toFixed(1)}%`;
+        if (c) t += `（${WINDOW_NAME[c.label] ?? c.label}窗账本 ${money(c.usd)} ÷ 已用 ${Math.round(c.points)} 点）`;
+        if (dev < -2) t += '——账本偏低，主行的花费数字要按这个幅度往上看';
+      }
       spec.push(t);
     }
     if (p.unitPriceNotice) spec.push(`<b>单价</b> ${p.unitPriceNotice}`);

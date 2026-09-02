@@ -17,6 +17,15 @@ import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
 import { evaluateCoherence, coherenceNotice, measureGroupRatio, weightedSpend } from './coherence.mjs';
+
+/**
+ * 官方汇率：额度点 ÷ 100 = 美元（560000→5600、156800→1568、296800→2968 三窗都整除）。
+ * 2026-09-02 用户向官方求证确认。此前满额靠「本机账本 ÷ 已用点」反推，有两处硬伤：
+ * 账本漏一点满额就同倍缩水（实测偏 -3.5%），而 Mirasim 一停就退到另一套中位数算法
+ * （实测报 2837 而非 5600）。改成官方除法后三条 payload 路径同一个数，且不依赖账本。
+ * 反推不删——它与这个常量的偏离就是「账本漏了多少」的读数，降级为对账检查。
+ */
+export const OFFICIAL_PER_POINT = 0.01;
 import { Settings } from './settings.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
 import { windowDuration, modelGroup } from './windows.mjs';
@@ -412,19 +421,13 @@ export class Engine {
         ? (group ? spent * (this.settings.ratioOf(group) || 1)
           : weightedSpend(this.ledger, start, now, this.settings.groupPointCost).usd)
         : spent;
-      // 满额口径：整窗支出 ÷ 整窗点数 × 预算点（2026-09-02 用户拍板，与官方宣称对得上）。
-      // 总窗 = 折算后的基准单价 × 预算点；档位窗 = 基准单价 ÷ 该档位倍率 × 预算点——
-      // 面板上每个数都由同一个模型（基准单价 + 倍率表）推出来，改设置时整块一起动。
-      // 早先档位窗走的是它自己的实测比值，与设置无关，导致「改了倍率有的动有的不动」
-      // （用户 2026-09-02 指出）。倍率设成实测值时两种算法只差 0.1%，不丢精度。
-      // 基准单价给不出时才退回该档位自己的实测比值——宁可用实测，也不要没有数。
+      // 满额 = 预算点 ÷ 100 ÷ 该档位倍率（2026-09-02 用户向官方确认后拍板）。
+      // 档位窗除以倍率，给的是「拿这个档位真能花掉多少 API 用量」——fable 每花 1 美元扣
+      // 2 点，296800 点的子上限只兑得出 $1484。用户 2026-09-02 在两个口径里选了这个：
+      // 这张卡整块活在「真实 fable 美元」这把尺上，能直接跟主行的账本花费比。
       const groupRatio = group ? this.settings.ratioOf(group) : 1;
-      const ratioFull = group
-        ? (rate != null && groupRatio > 0 ? rate / groupRatio * w.budget
-          : (spent > 0 && w.used > 0 ? spent / w.used * w.budget : null))
-        : (rate != null ? rate * w.budget : null);
       const { fullUSD, confidence, sampleCount, dropped, basis, conservativeUSD } =
-        this.#fullOf(w.label, w.budget, group, ratioFull);
+        this.#fullOf(w.label, w.budget, group, this.#officialFull(w.budget, groupRatio));
       calibDropped += dropped;
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
       const eta = this.#eta(w, now);
@@ -433,7 +436,8 @@ export class Engine {
       return {
         label: w.label, usedPercent, inferred: false, confidence, sampleCount,
         spentUSD: spent,
-        ...(spent > 0 && Math.abs(weighted - spent) / spent > 0.005 ? { weightedSpentUSD: weighted } : {}),
+        ...(!group && spent > 0 && Math.abs(weighted - spent) / spent > 0.005
+          ? { weightedSpentUSD: weighted } : {}),
         ...(breakdown ?? {}),
         ...(dur != null ? { durationSeconds: dur } : {}),
 
@@ -460,8 +464,9 @@ export class Engine {
       : limits.degraded ? '上游降级运行中' : null;
 
     const out = this.#base(level, this.last.at, windows);
+    out.unitPriceUSD = OFFICIAL_PER_POINT;
     if (rate != null) {
-      out.unitPriceUSD = rate;
+      out.ledgerPerPoint = rate;
       // 公式素材：单价 = 基准窗账本支出 ÷ 同期已用点数；spread 是跨窗交叉校验的离散倍数
       out.unitPriceCalc = {
         usd: coherence.basis.usd, points: coherence.basis.points, label: coherence.basis.label,
@@ -484,8 +489,11 @@ export class Engine {
       const rolled = AnchorStore.rollWindow(a, now);
       if (!rolled) return null;
       const group = a.modelScoped ? modelGroup(a.label) : null;
+      // 锚点带着官方预算点，所以 Mirasim 不在跑时满额照样精确（旧代码在这里退回中位数，
+      // 与实测路径两套算法，用户 2026-09-02 截图里 7d 报 $2837 而非 $5600 就是这里）。
       const est = this.calibrator.estimate(a.label, this.ledger, a.budget, group);
-      const fullUSD = est?.fullUSD ?? null;
+      const fullUSD = this.#officialFull(a.budget, group ? this.settings.ratioOf(group) : 1)
+        ?? est?.fullUSD ?? null;
       let usedPercent;
       if (!rolled.rolled) {
         const spentSince = this.ledger.spent(a.capturedAt, now, { includeOpenMinute: true, group });
@@ -604,16 +612,22 @@ export class Engine {
     });
   }
 
+  /** 官方满额：预算点 ÷ 100 ÷ 档位倍率。预算点缺席（纯本机口径）时返回 null。 */
+  #officialFull(budget, ratio) {
+    if (!(budget > 0) || !(ratio > 0)) return null;
+    return budget * OFFICIAL_PER_POINT / ratio;
+  }
+
   #fullOf(label, budget, group, ratioFull) {
     const est = this.calibrator.estimate(label, this.ledger, budget, group, this.settings.groupPointCost);
     const dropped = est?.foreignDropped ?? 0;
     if (ratioFull != null) {
       return {
-        fullUSD: ratioFull, basis: 'ratio', conservativeUSD: est?.fullUSD ?? null,
+        fullUSD: ratioFull, basis: 'official', conservativeUSD: est?.fullUSD ?? null,
         confidence: est?.confidence ?? 'low', sampleCount: est?.observations ?? 0, dropped,
       };
     }
-    // 总额比值给不出（点数样本太少、或跨窗离散判不自洽）才退回中位数：宁可保守，不要没有数
+    // 官方预算点缺席（纯本机滚动窗口）才退回中位数：宁可保守，不要没有数
     if (est) {
       return {
         fullUSD: est.fullUSD, basis: 'median', conservativeUSD: null,

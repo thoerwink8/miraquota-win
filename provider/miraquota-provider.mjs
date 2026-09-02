@@ -64,7 +64,7 @@ const fmtReset = (t) => {
 function printSnapshot(p) {
   console.log(`通道 ${p.stateLabel}${p.detail ? ' · ' + p.detail : ''}${p.accountNotice ? ' · ' + p.accountNotice : ''}`);
   console.log(`价目表 ${p.pricing ?? '-'} · 分钟桶 ${p.buckets ?? 0}`);
-  if (p.unitPriceUSD != null) console.log(`单价 ${p.unitPriceUSD.toFixed(6)} 美元/额度点（账本支出 ÷ 已用点数反推）`);
+  if (p.unitPriceUSD != null) console.log(`单价 ${p.unitPriceUSD.toFixed(4)} 美元/额度点（官方：点数 ÷ 100）` + (p.ledgerPerPoint != null ? ` · 账本反推 ${p.ledgerPerPoint.toFixed(6)}` : ''));
   else if (p.unitPriceNotice) console.log(`单价 ${p.unitPriceNotice}`);
   if (!p.windows.length) return console.log('无窗口');
   for (const w of p.windows) {
