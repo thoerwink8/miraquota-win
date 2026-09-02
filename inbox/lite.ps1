@@ -131,6 +131,7 @@ Say ''
 Say '这个小工具会把本机 Mirasim 的用量记录每 10 分钟上传到收件口，' 'White'
 Say '让共用这个额度的人在 MiraQuota 里看到「谁花了多少」。' 'White'
 Say '只上传每次调用的时间、模型、token 数；不上传对话内容。' 'DarkGray'
+Say '收件口在 workers.dev，国内网络要先开代理，否则会连不上。' 'Yellow'
 Say ''
 
 $existing = Load-Config

@@ -42,3 +42,9 @@ node scripts/inbox-deploy.mjs --invite <你定的邀请码>
   同一机器 45 秒内只收一次；两周不上传的机器自动消失。
 - 不保证：名字是真的——fxc 说自己是 fxc，Worker 只能记住「以后只有这个口令能用 fxc」。
   朋友圈里够用；要防人，只有 GitHub 登录那条路。
+
+## 网络
+
+收件口在 `*.workers.dev`，国内实测 DNS 被投毒、直连不通（经代理可用），`api.cloudflare.com` 不受影响。
+2026-09-03 用户拍板暂不绑自有域名。要过墙：把一个域名托管到 Cloudflare，在 Worker 设置里加
+Custom Domain，然后 `node scripts/inbox-deploy.mjs` 会把新地址写回 `DEFAULT_INBOX`（代码不用改）。

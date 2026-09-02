@@ -302,7 +302,8 @@
       <div class="card" id="syncLoginCard" style="display:none">
         <div class="head"><span class="label">加入多机统计</span></div>
         <div class="hint">共用这份额度的人各自登录后，这里就能看到「谁花了多少」。没有 GitHub 也行：
-        名字自己起、口令自己定，第一次要一个邀请码（找额度的主人要）。只上传每次调用的时间、模型、token 数。</div>
+        名字自己起、口令自己定，第一次要一个邀请码（找额度的主人要）。只上传每次调用的时间、模型、token 数。<br>
+        <b>国内网络需开代理</b>：收件口在 workers.dev，实测直连被 DNS 投毒（2026-09-03 用户拍板暂不绑自有域名）。</div>
         <div class="cfg"><span class="k">名字</span><input id="loginAccount" placeholder="fxc" maxlength="24" autocomplete="off"></div>
         <div class="cfg"><span class="k">口令</span><input id="loginPass" type="password" placeholder="至少 4 位" autocomplete="off"></div>
         <div class="cfg" id="loginInviteRow"><span class="k">邀请码</span><input id="loginInvite" placeholder="名字第一次用才需要" autocomplete="off"></div>
