@@ -5,10 +5,11 @@ compatibility_date = "2026-06-01"
 # 账号口令哈希与分片都存这一个 KV。部署脚本（scripts/inbox-deploy.mjs）会自动建并回填 id。
 [[kv_namespaces]]
 binding = "ACCOUNTS"
-id = "REPLACE_WITH_KV_ID"
+id = "9abd8c0a7299475f87373f6da17d96ff"
 
 # 唯一的秘密：邀请码。部署脚本会问一次并 secret put。
 
 [[rules]]
 type = "Text"
 globs = ["**/*.ps1", "**/*.bat"]
+fallthrough = true

@@ -45,7 +45,7 @@ export const DEFAULT_REMOTE = 'https://github.com/thoerwink8/miraquota-ledger.gi
  * 默认收件口。部署 inbox/ 后把 workers.dev 地址填到这里；多机页的登录框预填它、允许改。
  * 地址本身不是秘密（Worker 只认名字+口令+邀请码），放在公开代码里没关系。
  */
-export const DEFAULT_INBOX = 'https://miraquota-inbox.REPLACE-ME.workers.dev';
+export const DEFAULT_INBOX = 'https://miraquota-inbox.miraquota.workers.dev';
 /** 探测超时；托盘常驻应用后台跑，宁可等久一点也不要因为网络慢误判成「不能接」。 */
 const PROBE_TIMEOUT_MS = 20_000;
 const ACCOUNT_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
