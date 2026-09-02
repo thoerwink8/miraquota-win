@@ -267,6 +267,13 @@
         「全用非 fable 时的等价支出」重算，与官方「不用 fable 时一周 5600 刀」同口径。
         改完立即生效并记在 <code>~/.miraquota/settings.json</code>，版本更新不会丢。</div>
       </div>
+      <div class="card">
+        <div class="cfg">
+          <span class="k">版本 <span id="cfgVer"></span></span>
+          <button id="btnCheck">检查更新</button>
+        </div>
+        <div class="cfg-note" id="checkNote">启动时与打开本面板时会自动查一次；平时每 6 小时兜底查一次。</div>
+      </div>
       <div class="card"><div class="hint" id="specPrice"></div></div>
       <div class="card"><div class="hint" id="specState"></div></div>
       <div class="card"><div class="hint">
@@ -768,6 +775,22 @@
    * 点它由主进程弹确认框再装——角标就在关闭按钮旁边，误点直接重启应用太粗暴。
    * 只在「已下载」时出现：还在下载时点了也没得装。
    */
+  /**
+   * 面板里的检查更新按钮（2026-09-02 用户拍板：与其把轮询调密，不如给个看得见的按钮）。
+   * 托盘右键那个入口太深，用户想「现在就看看有没有新版」时找不到。
+   */
+  $("btnCheck").onclick = async () => {
+    $("checkNote").textContent = "正在检查……";
+    const st = await window.miraquota.checkUpdate?.().catch(() => null);
+    $("checkNote").textContent = {
+      none: "已是最新版本。",
+      checking: "正在检查……",
+      downloading: "发现新版 v" + (st?.version ?? "") + "，正在后台下载。",
+      ready: "新版 v" + (st?.version ?? "") + " 已下载，点标题栏的角标安装。",
+      error: "检查失败：" + (st?.hint ?? st?.message ?? "原因未知"),
+      dev: "开发态不检查更新。",
+    }[st?.phase] ?? "检查没有回应，稍后再试。";
+  };
   function renderUpdate(st) {
     const badge = $('newVer');
     const ready = st?.phase === 'ready';
@@ -811,6 +834,7 @@
     if (!v) return;
     APP_VER = v;
     $('ver').textContent = 'v' + v;
+    $('cfgVer').textContent = 'v' + v;
     renderUpdate();      // 版本号回来得比更新状态晚时，把「旧 → 新」补上
   }).catch(() => {});
   // 倒计时与「N 秒前」每秒走动，数据本身由主进程心跳推送。

@@ -65,14 +65,15 @@ test('the whole update prompt is one badge in the title bar', () => {
   assert.match(badgeCss, /-webkit-app-region: no-drag/);
 });
 
-test('checks are frequent enough that the badge is there when the user looks', () => {
-  // 用户 2026-09-02 报「最新 0.9.12，我这看不到提示」：实例启动后查过一次（那时它就是最新），
-  // 下一次要等 6 小时。半小时一轮 + 面板露面时补查（带节流），才对得上「随时打开看一眼」。
-  assert.ok(updater.includes("const EVERY_MS = 30 * 60 * 1000;"), "轮询间隔应为 30 分钟");
+test('checks happen when the user is actually there, not by polling harder', () => {
+  // 用户 2026-09-02 拍板：轮询频率不必高（6 小时兜底就行），关键是三个「用户在场」的时机——
+  // 启动、打开面板、点面板里的按钮。此前把轮询调到 30 分钟是在补设计缺陷，已回退。
+  assert.ok(updater.includes('const EVERY_MS = 6 * 60 * 60 * 1000;'), '兜底轮询 6 小时');
   assert.match(updater, /checkOnShow/);
-  assert.match(updater, /ON_SHOW_MIN_GAP_MS/);
-  assert.ok(main.includes("win.on('show', () => updater?.checkOnShow())"),
-    '面板露面时要补查一次');
+  assert.ok(main.includes("win.on('show', () => updater?.checkOnShow())"), '面板露面时补查一次');
+  assert.match(renderer, /id="btnCheck"/);                       // 面板里看得见的按钮
+  assert.match(renderer, /window\.miraquota\.checkUpdate/);
+  assert.match(main, /检查更新/);                                 // 托盘那个入口保留
 });
 
 test('checking failures never reach the panel', () => {
