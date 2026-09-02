@@ -190,3 +190,26 @@ test('the default inbox is a real https url and the login card only shows when s
   const preload = readFileSync(new URL('../app/preload.cjs', import.meta.url), 'utf8');
   assert.match(preload, /syncLogin: \(opts\) => ipcRenderer\.invoke\('sync:login', opts\)/);
 });
+
+test('a git-channel machine also sees inbox people, and a dead inbox costs it nothing', async () => {
+  // 分片存在 Worker 的 KV 里、不在仓里，git fetch 拿不到——git 通道顺带读一次收件口，
+  // 两条通道的人才在同一张多机页上。收件口读不到只是少几台机器，不记 error。
+  const box = await fakeInbox();
+  try {
+    const MIN = 29_400_000;
+    const lite = new LedgerSync({ configFile: join(tmp, 'lite-sync.json'), repoDir: join(tmp, 'lite-repo'), machineId: 'laptop', installId: 'dddd0000dddd0000', cacheFile: join(tmp, 'lite-cache.json'), retryDelayMs: 1 });
+    assert.equal((await lite.login({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', invite: 'code' })).ok, true);
+    await lite.run(pricedLedger('lite', { buckets: { [MIN]: 3 } }), MIN * 60);
+    // git 通道的机器：上一轮已把收件口分片落进缓存 → 冷启动（不起 git 仓、不联网）就能拿到
+    writeFileSync(join(tmp, 'owner-sync.json'), JSON.stringify({ remote: join(tmp, 'nowhere.git') }));
+    writeFileSync(join(tmp, 'owner-cache.json'), JSON.stringify([...box.shards.values()]));
+    const owner = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), repoDir: join(tmp, 'owner-repo'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache.json'), inboxUrl: box.url });
+    assert.equal(owner.mode, 'git');
+    const got = await owner.loadCachedShards();
+    assert.deepEqual(got.map((s) => [s.machineId, s.account]), [['laptop', 'fxc']]);
+    assert.deepEqual(owner.status().machines.map((m) => [m.id, m.account, m.self]), [['desk', null, true], ['laptop', 'fxc', false]]);
+    // 收件口挂了：冷启动只读缓存，不抛；没缓存就是空
+    const dead = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), repoDir: join(tmp, 'owner-repo'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache2.json'), inboxUrl: 'http://127.0.0.1:9' });
+    assert.deepEqual(await dead.loadCachedShards(), []);
+  } finally { box.close(); }
+});

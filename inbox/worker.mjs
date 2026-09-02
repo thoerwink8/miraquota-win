@@ -2,24 +2,26 @@
  * MiraQuota 账本收件口（Cloudflare Worker）。
  *
  * 为什么有它（2026-09-02 用户拍板）：共享额度的人没有 GitHub，也不想每加一个人就去开令牌。
- * 于是钥匙只放一处——这里的 GH_TOKEN 能写账本仓；客户端零仓库凭据，只带
- * 「名字 + 自设口令 + 一次性邀请码」，都只在首次输入。加人、换令牌都不动客户端。
+ * 客户端零仓库凭据，只带「名字 + 自设口令 + 一次性邀请码」，都只在首次输入。
+ *
+ * 分片存哪：**直接存 KV**，不写 GitHub 仓。早先设计是 Worker 持一把仓库令牌代写，但细粒度
+ * 令牌只能在网页上手工建、一年一换——正是用户不想做的那类事。存 KV 后 Worker 一个秘密都
+ * 不需要（邀请码除外），部署只剩「登录 Cloudflare 点一次同意」。git 通道的机器读账本时
+ * 顺带也来这里拿一次分片（只读、无鉴权），两条通道的人在同一张多机页上。
  *
  * 身份模型：机器靠随机 installId；人靠自报名字 + 自设口令（PBKDF2 哈希存 KV）。
  * 名字全局唯一——同一个名字只能注册一次（用户 2026-09-02：服务端不能有重名），
  * 之后只有知道口令的人能以这个名字上传。名字是自报的，Worker 保证不了第一次报的是真的。
  *
- * 写入仓库走 Git Data API 造一个**无父提交**并强制更新分支：与 git 客户端的
- * 「单提交覆盖不留历史」同一语义，仓库体积恒定。
- *
  * 接口：
  *   POST /register {account, passphrase, invite}   → 201 / 403 邀请码错 / 409 名字已占
  *   POST /login    {account, passphrase}           → 204 / 401
  *   PUT  /shard    头 x-account / x-passphrase，体分片 JSON（≤3MB） → 204 / 401 / 400 / 429
- *   GET  /shards                                   → 全部分片数组（60 秒缓存）
+ *   GET  /shards                                   → 全部分片数组
  *   GET  /lite.bat  GET /lite.ps1                  → 双击即用的轻客户端及其脚本
  *   GET  /health
- * 环境：GH_TOKEN（秘密，仅账本仓 contents 读写）、INVITE_CODE（秘密）、GH_REPO（变量）、ACCOUNTS（KV）。
+ * 环境：INVITE_CODE（秘密）、ACCOUNTS（KV：账号 + 分片）。
+ * KV 键：acct:<名字> → 口令哈希；shard:<名字>--<installId 前 12 位> → 分片 JSON；last:… → 限频。
  */
 import LITE_PS1 from './lite.ps1';
 import LITE_BAT from './lite.bat';
@@ -28,74 +30,24 @@ import { ACCOUNT_RE, hashPassphrase, verifyPassphrase, validateShard, branchFor 
 
 const MAX_BODY = 3 << 20;
 const MIN_UPLOAD_GAP_MS = 45_000;
-const CACHE_MS = 60_000;
-
-let shardsCache = { at: 0, body: null };
+const SHARD_TTL_SEC = 14 * 86400;   // 两周没再上传的机器自动消失（账本本来只留 8 天）
 
 const json = (status, obj) => new Response(JSON.stringify(obj), {
-  status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' },
+});
+const text = (body) => new Response(body, {
+  headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
 });
 
-async function gh(env, method, path, body) {
-  const r = await fetch(`https://api.github.com/repos/${env.GH_REPO}${path}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${env.GH_TOKEN}`, accept: 'application/vnd.github+json',
-      'user-agent': 'miraquota-inbox', 'x-github-api-version': '2022-11-28',
-      ...(body ? { 'content-type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (r.status === 404) return null;
-  if (!r.ok) throw new Error(`GitHub ${method} ${path} → ${r.status} ${(await r.text()).slice(0, 200)}`);
-  return r.status === 204 ? {} : r.json();
-}
-
-/** 无父提交 + 强制更新分支：远端分支永远只有一个提交。 */
-async function publishShard(env, branch, shardText) {
-  const blob = await gh(env, 'POST', '/git/blobs', { content: shardText, encoding: 'utf-8' });
-  const tree = await gh(env, 'POST', '/git/trees', {
-    tree: [{ path: 'shard.json', mode: '100644', type: 'blob', sha: blob.sha }],
-  });
-  const now = new Date().toISOString();
-  const commit = await gh(env, 'POST', '/git/commits', {
-    message: `shard ${branch.slice('machine/'.length)} @ ${now}`,
-    tree: tree.sha, parents: [],
-    author: { name: 'miraquota-inbox', email: 'miraquota@local', date: now },
-  });
-  const ref = await gh(env, 'GET', `/git/ref/heads/${branch}`);
-  if (ref) await gh(env, 'PATCH', `/git/refs/heads/${branch}`, { sha: commit.sha, force: true });
-  else await gh(env, 'POST', '/git/refs', { ref: `refs/heads/${branch}`, sha: commit.sha });
-}
-
-async function listShards(env) {
-  if (shardsCache.body && Date.now() - shardsCache.at < CACHE_MS) return shardsCache.body;
-  const refs = (await gh(env, 'GET', '/git/matching-refs/heads/machine/')) ?? [];
-  const out = [];
-  for (const ref of refs) {
-    const branch = ref.ref.replace(/^refs\/heads\//, '');
-    try {
-      const r = await fetch(`https://api.github.com/repos/${env.GH_REPO}/contents/shard.json?ref=${encodeURIComponent(branch)}`, {
-        headers: {
-          authorization: `Bearer ${env.GH_TOKEN}`, accept: 'application/vnd.github.raw+json',
-          'user-agent': 'miraquota-inbox', 'x-github-api-version': '2022-11-28',
-        },
-      });
-      if (!r.ok) continue;
-      const shard = await r.json();
-      if (shard && shard.machineId) out.push(shard);
-    } catch { /* 单个分片坏不影响其余 */ }
-  }
-  shardsCache = { at: Date.now(), body: out };
-  return out;
-}
+/** 分片的 KV 键与仓库分支名同构：machine/<名字>--<installId12> → shard:<名字>--<installId12>。 */
+const shardKey = (account, installId) => 'shard:' + branchFor(account, installId).slice('machine/'.length);
 
 async function readJSON(req) {
   const len = Number(req.headers.get('content-length') || 0);
   if (len > MAX_BODY) return { err: json(413, { error: `分片超过 ${MAX_BODY >> 20} MB` }) };
-  const text = await req.text();
-  if (text.length > MAX_BODY) return { err: json(413, { error: `分片超过 ${MAX_BODY >> 20} MB` }) };
-  try { return { body: JSON.parse(text), text }; } catch { return { err: json(400, { error: '不是合法 JSON' }) }; }
+  const raw = await req.text();
+  if (raw.length > MAX_BODY) return { err: json(413, { error: `分片超过 ${MAX_BODY >> 20} MB` }) };
+  try { return { body: JSON.parse(raw), raw }; } catch { return { err: json(400, { error: '不是合法 JSON' }) }; }
 }
 
 async function authenticate(env, account, passphrase) {
@@ -105,16 +57,28 @@ async function authenticate(env, account, passphrase) {
   return verifyPassphrase(passphrase, rec);
 }
 
-const text = (body) => new Response(body, {
-  headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
-});
+async function listShards(env) {
+  const out = [];
+  let cursor;
+  do {
+    const page = await env.ACCOUNTS.list({ prefix: 'shard:', cursor });
+    for (const k of page.keys) {
+      try {
+        const s = await env.ACCOUNTS.get(k.name, 'json');
+        if (s && s.machineId) out.push(s);
+      } catch { /* 单个分片坏不影响其余 */ }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return out;
+}
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/+$/, '') || '/';
     try {
-      if (req.method === 'GET' && path === '/health') return json(200, { ok: true, repo: env.GH_REPO });
+      if (req.method === 'GET' && path === '/health') return json(200, { ok: true, store: 'kv' });
       if (req.method === 'GET' && path === '/lite.ps1') return text(LITE_PS1.replaceAll('__INBOX_URL__', url.origin));
       if (req.method === 'GET' && path === '/lite.bat') {
         // .bat 里 CRLF 是硬要求：cmd 对 LF 结尾的文件会吞掉某些行
@@ -146,15 +110,14 @@ export default {
       if (req.method === 'PUT' && path === '/shard') {
         const account = req.headers.get('x-account') ?? '';
         if (!(await authenticate(env, account, req.headers.get('x-passphrase')))) return json(401, { error: '名字或口令不对' });
-        const { body, text: raw, err } = await readJSON(req); if (err) return err;
+        const { body, raw, err } = await readJSON(req); if (err) return err;
         const why = validateShard(body, account);
         if (why) return json(400, { error: why });
         const gapKey = `last:${account}:${body.installId}`;
         const last = Number(await env.ACCOUNTS.get(gapKey)) || 0;
         if (Date.now() - last < MIN_UPLOAD_GAP_MS) return json(429, { error: '上传太频繁，稍后再试' });
-        await publishShard(env, branchFor(account, body.installId), raw);
+        await env.ACCOUNTS.put(shardKey(account, body.installId), raw, { expirationTtl: SHARD_TTL_SEC });
         await env.ACCOUNTS.put(gapKey, String(Date.now()), { expirationTtl: 3600 });
-        shardsCache.at = 0;
         return new Response(null, { status: 204 });
       }
       if (req.method === 'GET' && path === '/shards') return json(200, await listShards(env));

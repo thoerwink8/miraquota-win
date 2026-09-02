@@ -7,8 +7,9 @@
  *  - git 通道 { remote }：本机 GitHub 凭据直推私有仓，每台机器只写 machine/<machineId> 分支，
  *    单提交覆盖不留历史（首次 commit，之后 commit --amend + push --force），仓库体积恒定；
  *  - 收件口通道 { inbox, account, passphrase }（2026-09-02 用户拍板）：没有 GitHub 的人走这里。
- *    客户端零仓库凭据，只带自报名字 + 自设口令，HTTP 推给 Cloudflare Worker，
- *    由它持唯一的仓库令牌代写（见 inbox/worker.mjs）。读他机也从收件口一次拿全。
+ *    客户端零仓库凭据，只带自报名字 + 自设口令，HTTP 推给 Cloudflare Worker，分片存它的 KV
+ *    （见 inbox/worker.mjs），Worker 也不需要 GitHub 令牌。读他机从收件口一次拿全；
+ *    git 通道的机器读远端分支之余也顺带读一次收件口，两条通道的人在同一张多机页上。
  *  - 文件不存在、或既无 remote 也无 inbox ⇒ 功能完全关闭，零副作用。
  *
  * 故障呈现取舍（2026-09-01 实测：本地代理偶发 SSL_ERROR_SYSCALL，紧接着的六次访问全成功）：
@@ -144,11 +145,13 @@ export class LedgerSync {
    * @param opts.machineId  机器短名（默认 os.hostname() 清洗）
    * @param opts.installId  安装 id（默认读/生成 ~/.miraquota/install.json）
    * @param opts.cacheFile  收件口分片缓存（默认 ~/.miraquota/inbox-shards.json）
+   * @param opts.inboxUrl   git 通道顺带读分片的收件口（默认 DEFAULT_INBOX；传 null 关掉）
    * @param opts.retryDelayMs 单轮内重试的等待（测试注入用，默认 2 秒）
    */
   constructor({ configFile = CONFIG_FILE, repoDir = REPO_DIR, machineId = cleanMachineId(),
-    installId = null, installFile = INSTALL_FILE, cacheFile = INBOX_CACHE,
+    installId = null, installFile = INSTALL_FILE, cacheFile = INBOX_CACHE, inboxUrl = DEFAULT_INBOX,
     retryDelayMs = RETRY_DELAY_MS } = {}) {
+    this.inboxUrl = inboxUrl;
     this.configFile = configFile;
     this.repoDir = repoDir;
     this.machineId = machineId;
@@ -300,7 +303,31 @@ export class LedgerSync {
   async #fetchForeign() {
     await git(this.repoDir, ['fetch', '--quiet', '--prune', 'origin',
       '+refs/heads/machine/*:refs/remotes/origin/machine/*']);
-    return this.#readForeignRefs();
+    return this.#mergeShards(await this.#readForeignRefs(), await this.#readInboxQuietly());
+  }
+
+  /**
+   * git 通道的机器也看得见收件口的人：分片存在 Worker 的 KV 里，不在仓里，所以 fetch 拿不到。
+   * 这是附加来源——读不到只是少几台机器，不记 error、不改状态色。
+   */
+  async #readInboxQuietly() {
+    if (!this.inboxUrl || /REPLACE-ME/.test(this.inboxUrl)) return [];
+    try {
+      const all = await http(`${this.inboxUrl}/shards`, { timeout: 10_000 });
+      const shards = (Array.isArray(all) ? all : []).filter((s) => this.#isForeign(s));
+      try { writeFileSync(this.cacheFile, JSON.stringify(shards)); } catch { /* 缓存可有可无 */ }
+      return shards;
+    } catch { return []; }
+  }
+
+  /** 同一台机器（installId，老分片退回主机名）只留 generatedAt 最新的一份。 */
+  #mergeShards(...lists) {
+    const byKey = new Map();
+    for (const s of lists.flat()) {
+      const k = s.installId ?? s.machineId;
+      if (!byKey.has(k) || (s.generatedAt ?? 0) > (byKey.get(k).generatedAt ?? 0)) byKey.set(k, s);
+    }
+    return [...byKey.values()];
   }
 
   /** 收件口：发布就是一次 PUT；分片里带 account/installId，Worker 据此定分支名。 */
@@ -341,12 +368,14 @@ export class LedgerSync {
   async loadCachedShards() {
     if (!this.enabled) return [];
     try {
+      const cached = () => {
+        try { return JSON.parse(readFileSync(this.cacheFile, 'utf8')).filter((s) => this.#isForeign(s)); } catch { return []; }
+      };
       let shards;
       if (this.mode === 'inbox') {
-        shards = JSON.parse(readFileSync(this.cacheFile, 'utf8')).filter((s) => this.#isForeign(s));
+        shards = cached();
       } else {
-        if (!existsSync(join(this.repoDir, '.git'))) return [];
-        shards = await this.#readForeignRefs();
+        shards = this.#mergeShards(existsSync(join(this.repoDir, '.git')) ? await this.#readForeignRefs() : [], cached());
       }
       if (shards.length) this.shards = shards;
       return shards;
