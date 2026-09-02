@@ -130,7 +130,7 @@ test('a ratio that contradicts the measured one is called out on the scoped card
   // 实测口径（该档位自己的支出 ÷ 自己的点数），设置只改总窗。两者矛盾时必须说出来，
   // 否则用户只看到两个对不上的数，不知道是自己的设置与事实不符。
   const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
-  assert.match(renderer, /设置 \$\{cost\.ratio\}× 与实测/);
+  assert.match(renderer, /设置 \$\{cost\.ratio\}× ≠ 实测/);
   assert.ok(renderer.includes('Math.abs(cost.measured - cost.ratio) / cost.measured > 0.15'),
     '偏差超过 15% 才提示，免得实测噪声天天报警');
 });
@@ -177,4 +177,16 @@ test('the panel cross-checks the reverse-inferred price against the official 1/1
   for (const [pts, usd] of [[560000, 5600], [156800, 1568], [296800, 2968]]) {
     assert.equal(pts * 0.01, usd);
   }
+});
+
+test('the ratio field says which unit it wants, so nobody types the per-token 4', () => {
+  // 「fable 2 倍」和「fable 4 倍」都对，看单位：每美元 2 倍（官方说法，也是这个设置的口径），
+  // 每 token 4 倍（fable 标价 $10/$50 本身就是 opus $5/$25 的两倍，之上再罚两倍）。
+  // 填错一个字所有美元数翻倍，而且不会报错——只能靠这行字挡住。
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  const card = renderer.split('id="cfgCard"')[1].split('</div>\n      </div>')[0];
+  assert.match(card, /每美元/);
+  assert.match(card, /每 token/);
+  assert.match(card, /4 倍/);
+  assert.ok(card.includes('填 2'), '要直说填哪个数，不能只讲道理');
 });

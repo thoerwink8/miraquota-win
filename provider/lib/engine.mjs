@@ -522,7 +522,7 @@ export class Engine {
     const pcR = this.#pointCost(this.anchors.anchors, this.anchors.capturedAt);
     if (pcR) out.pointCost = pcR;
     out.measured = false;
-    out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见，实际用量可能更高`;
+    out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见`;
     return out;
   }
 

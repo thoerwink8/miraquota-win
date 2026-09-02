@@ -251,7 +251,7 @@
       <div class="card" id="simCard"><div class="empty">正在读取额度……</div></div>
       <div class="card">
         <div class="hint" id="simBasis"></div>
-        <div class="hint">「均速外推」照最近几天的整体节奏（空闲时间摊薄在内）；「每天 N 小时」按近 3 天每活跃小时的实测点数消耗推演（账本里有支出的分钟才算活跃）。到重置时间还没打满就显示「到期耗不尽」——窗口一重置额度即回满。</div>
+        <div class="hint">「均速外推」照最近几天的整体节奏（含空闲）；「每天 N 小时」按近 3 天每活跃小时的实测消耗推演（有支出的分钟才算活跃）。到重置还打不满就写「到期耗不尽」。</div>
       </div>
     </div>
     <div class="page" id="pageSpec">
@@ -262,31 +262,29 @@
           <button id="btnRatio">保存</button>
         </div>
         <div class="cfg-note" id="fableMeasured"></div>
-        <div class="hint">官方口径：fable 资源紧张，同样一份用量按 <b>2 倍</b>扣点，所以 fable 用得越多、
-        额度折算出来的美元越少。这里改的是折算倍率——所有美元数字（满额、已用、剩余）都按
-        「全用非 fable 时的等价支出」重算，与官方「不用 fable 时一周 5600 刀」同口径。
-        改完立即生效并记在 <code>~/.miraquota/settings.json</code>，版本更新不会丢。</div>
+        <div class="hint">这里填的是<b>每美元</b>口径的倍率——<b>填 2</b>（官方：同样一份支出，fable 扣 2 倍点）。
+        换成<b>每 token</b>口径是 <b>4 倍</b>：fable 标价 $10/$50 本身就是 opus $5/$25 的两倍，之上再罚两倍。
+        别把 4 填进来，所有美元数会一起翻倍。改完立即生效，存在 <code>~/.miraquota/settings.json</code>。</div>
       </div>
       <div class="card">
         <div class="cfg">
           <span class="k">版本 <span id="cfgVer"></span></span>
           <button id="btnCheck">检查更新</button>
         </div>
-        <div class="cfg-note" id="checkNote">启动时与打开本面板时会自动查一次；平时每 6 小时兜底查一次。</div>
+        <div class="cfg-note" id="checkNote">启动、打开本面板时各查一次，另有 6 小时兜底轮询。</div>
       </div>
       <div class="card"><div class="hint" id="specPrice"></div></div>
       <div class="card"><div class="hint" id="specState"></div></div>
       <div class="card"><div class="hint">
-        界面上的数字分两类，标记区分：<br>
-        <b>精确（无标记）</b>——① 点数/百分比：来自 Mirasim <code>/v1/limits</code>，账号级权威；② 美元主行：本机账本 token × 官方 API 价直接求和，可与 Mirasim「设置 → 流量监控 → 估算成本」列逐笔核对（同一份账本、同一张价目表）。<br>
-        <b>推算（带 ≈）</b>——满额$ / 余$ / 账号级已用$。额度上限以「点」计价，云端不提供点→美元的官方汇率（<code>/v1/limits</code> 是唯一接口，无成本端点），只能反推。满额给出<b>两个口径对照</b>：<br>
-        　·「<b>标定</b>」逐对「Δ本机账本$ ÷ Δ已用点数」取按点数加权的中位数，抗单点失真与他机污染；<br>
-        　·「<b>点数反推</b>」直接用账号级已用点数反推：本机账本$ ÷ 已用点数 × 预算点，使用官方点数但不是云端美元账单。<br>
-        　两者接近＝账本与点数自洽，可放心用；分歧大＝至少一侧失真（多机同时用、或账本尚未回填）。带 ⁻ 号表示该窗口是模型档位窗，分桶自档位声明起才累积，此口径系统性偏低。<br>
-        <b>美元性质</b>：按官方 API 价折算的等价估值，不是订阅账单——订阅按窗口额度计费，不按 token 扣款。<br>
-        <b>分家族</b>：窗口卡末行按模型家族（Claude / GPT …）拆分。美元＝该家族账本实测；点数＝官方点数增量按同期各家族账本美元占比归因（增量静置 5 分钟等 relay 回填 token 再分摊）。同期无任何账本支出的增量记「未归因」（他机用量）。点数归因自本版部署起累积，更早的用量拆不出家族。<br>
-        <b>今天</b>：自然日 0 点起。点数＝官方点数增量逐段累加（账号级，含其他设备；本机停机时段按前后差值补账，重置瞬间跨越的一小段宁漏勿错）；美元＝本机账本。两者口径不同，不能互相换算核对。<br>
-        <b>多机</b>：本机并发多会话已全量计入账本；其他设备的用量只体现在点数、不入本机账本。标定对此有两道防线——检测到他机活跃段整段剔除，聚合取中位数。
+        <b>精确</b>（无标记）——点数与百分比来自 <code>/v1/limits</code>，账号级权威；美元主行是本机账本
+        token × 官方 API 价，可与 Mirasim「流量监控 → 估算成本」逐笔核对。<br>
+        <b>推算</b>（带 ≈）——满额 / 余 / 账号级已用。云端只给点数、不给汇率，只能<b>点数反推</b>：
+        账本$ ÷ 已用点 × 预算点。带 ⁻ 的是档位窗，分桶自档位声明起才累积，此口径系统性偏低。<br>
+        <b>折算</b>——fable 每美元扣 2 倍点，主行的账本原值要放大后才与满额同口径，故并排给「折算」。<br>
+        <b>美元性质</b>——按官方 API 价折算的等价估值，不是订阅账单。<br>
+        <b>分家族</b>——美元是账本实测；点数按同期各家族账本占比归因，同期无本机支出的记「未归因」（他机用量）。归因自本版部署起累积。<br>
+        <b>今天</b>——自然日 0 点起。点数含其他设备，美元只算本机，两者不能互相换算。<br>
+        <b>多机</b>——他机用量只进点数、不进本机账本；标定会整段剔除他机活跃期。
       </div></div>
     </div>
     <div class="page" id="pageSync">
@@ -298,13 +296,12 @@
       <div class="card">
         <div class="hint" id="syncBasis"></div>
         <div class="hint">
-          <b>为什么要合并</b>：点数是账号级的，账本是本机级的。多台机器共用同一份额度时，
-          「本机账本$ ÷ 账号已用点」系统性偏低；把各机分片合并后，标定单价、家族归因、活跃强度才与官方点数同口径。<br>
-          <b>失败会怎样</b>：只是可用样本变少——美元与标定退回本机口径，<b>不会算错</b>；
-          官方点数与百分比始终直连云端，不经这条同步链。所以黄色不用管（本机数据已上传，或只是抖动重试），
-          红色才需要看一眼网络与凭据。<br>
-          <b>怎么同步的</b>：每台机器只写自己的 <code>machine/&lt;机器名&gt;</code> 分支，单提交覆盖不留历史，仓库体积恒定；
-          读他机只取远程分支的文件内容，不动本机工作区。
+          <b>为什么要合并</b>：点数是账号级的，账本是本机级的。多机共用一份额度时
+          「本机账本$ ÷ 账号已用点」系统性偏低，合并后单价、归因、活跃强度才与官方同口径。<br>
+          <b>失败会怎样</b>：只是样本变少，美元退回本机口径，<b>不会算错</b>——点数与百分比始终直连云端。
+          黄色不用管，红色才看网络与凭据。<br>
+          <b>怎么同步的</b>：每台机器只写自己的 <code>machine/&lt;机器名&gt;</code> 分支，单提交覆盖不留历史；
+          读他机只取远程分支内容，不动本机工作区。
         </div>
       </div>
     </div>
@@ -484,9 +481,9 @@
       if (w.remainingUSD != null) infer.push(`余 <b>${money(w.remainingUSD, 0)}</b>`);
       if (w.scaledSpentUSD != null) infer.push(`账号级已用 <b>${money(w.scaledSpentUSD)}</b>`);
       remainText = infer.length ? `推算 ${infer.join(' · ')}` : '';
-      fullTitle = '满额≈整窗账本支出（fable 按倍率折算）÷ 官方已用点 × 预算点，与官方宣称同口径'
+      fullTitle = '满额≈整窗折算后支出 ÷ 官方已用点 × 预算点'
         + (w.conservativeUSD != null ? ` · 保守估计（分段单价中位数）${money(w.conservativeUSD, 0)}` : '')
-        + ' · 不是云端美元账单';
+        + ' · 非云端账单';
       subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`] : [];
       // 折算后支出与满额同口径（点数口径）；主行的账本原值是真实花费，两者差的就是 fable 的额外扣点。
       // 不摆这个数，用户会拿 $426 去比 $5580 得出「才用了 7.6%」，而官方计数器是 11.6%。
@@ -532,8 +529,7 @@
     if (cost.measured && Math.abs(cost.measured - cost.ratio) / cost.measured > 0.15) {
       // 满额跟着设置走，所以这里给的是「按实测应该是多少」——设置离事实多远，一眼看得到
       const measuredFull = w.points.used > 0 ? (w.spentUSD ?? 0) / w.points.used * w.points.budget : null;
-      return `<div class="row fam"><span>设置 ${cost.ratio}× 与实测 ${cost.measured.toFixed(2)}× 不符：`
-        + `本卡按设置给 ${money(w.fullUSD, 0)}`
+      return `<div class="row fam"><span>设置 ${cost.ratio}× ≠ 实测 ${cost.measured.toFixed(2)}×：现给 ${money(w.fullUSD, 0)}`
         + (measuredFull ? `，按实测应是 ${money(measuredFull, 0)}` : '') + `</span></div>`;
     }
     if (!(cost.ratio > 1)) return "";
@@ -648,7 +644,7 @@
     $('simCard').innerHTML = sims.length ? sims.join('') : '<div class="empty">暂无可预演的窗口（需要一段使用记录）</div>';
     const anyRate = ws.find((w) => w.exhaust?.rate);
     $('simBasis').textContent = anyRate
-      ? `活跃口径：近 3 天本机活跃 ${anyRate.exhaust.rate.activeHours3d.toFixed(1)} 小时，今天已活跃 ${anyRate.exhaust.rate.activeHoursToday.toFixed(1)} 小时。强度 = 期间账号消耗点数 ÷ 本机活跃小时（多机同时用会抬高本机口径的强度）。`
+      ? `活跃口径：近 3 天 ${anyRate.exhaust.rate.activeHours3d.toFixed(1)} 小时，今天 ${anyRate.exhaust.rate.activeHoursToday.toFixed(1)} 小时。强度 = 账号消耗点数 ÷ 本机活跃小时（多机同用会抬高）。`
       : '';
 
     const sp = p.speed;
