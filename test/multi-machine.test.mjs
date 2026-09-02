@@ -35,6 +35,9 @@ function pricedLedger(name) {
   return new CostLedger(new Pricing(join(tmp, 'no-cache.json')), file);
 }
 
+/** 机器行去掉收件口身份字段（key/account），老测试只比 id/时间/本机标记 */
+const bare = (rows) => rows.map(({ id, lastShardSec, self }) => ({ id, lastShardSec, self }));
+
 function ledgerWith(name, data) {
   const file = join(tmp, `${name}-ledger.json`);
   writeFileSync(file, JSON.stringify({ schemaVersion: 2, ...data }));
@@ -69,7 +72,7 @@ test('two machines publish shards over a bare git remote and read each other', a
   const ra = await syncA.run(ledgerA, T + 1);
   assert.equal(ra.error, undefined);
   // 机器明细：本机 lastShardSec = 发布成功时刻，外机 = 其分片的 generatedAt
-  assert.deepEqual(ra.machines, [
+  assert.deepEqual(bare(ra.machines), [
     { id: 'alpha', lastShardSec: T + 1, self: true },
     { id: 'beta', lastShardSec: T, self: false },
   ]);
@@ -127,7 +130,7 @@ test('a broken remote is reported in status without throwing, and one failure is
   assert.equal(r.pushOk, false);
   assert.equal(r.failStreak, 1);
   // 不抛异常、不阻断；push 没成功 ⇒ 本机尚无成功发布时刻
-  assert.deepEqual(r.machines, [{ id: 'broken', lastShardSec: null, self: true }]);
+  assert.deepEqual(bare(r.machines), [{ id: 'broken', lastShardSec: null, self: true }]);
 
   const r2 = await sync.run(fakeLedger(), 1000 + 600);
   assert.equal(r2.state, 'error');    // 连续 2 轮失败 ⇒ 才进故障态（UI 红）
@@ -153,7 +156,7 @@ test('publish succeeding while fetch fails is a middle state, never red', async 
   assert.equal(r.pushOk, true);       // 本机分片确实上传了
   assert.ok(r.error);                 // 读取失败仍记原因
   assert.equal(r.state, 'warn');      // 但不是整体失败（UI 黄，不是红）
-  assert.deepEqual(r.machines, [{ id: 'half', lastShardSec: T, self: true }]);
+  assert.deepEqual(bare(r.machines), [{ id: 'half', lastShardSec: T, self: true }]);
   assert.equal((await git('-C', good, 'rev-list', '--count', 'machine/half')).trim(), '1');
 
   // 连续多轮只有读取失败也不报红——本机数据没丢，只是合并样本少
@@ -198,15 +201,15 @@ test('retryOnce runs the second attempt and reports the latest reason when both 
 test('common git failures get a plain-language reading, unknown ones stay raw', () => {
   // 人话归纳只是导读，原文另存 sync.error（UI 当次要小字），归纳不出来时返回 null
   assert.equal(explainSyncError("fatal: unable to access 'https://github.com/x/y.git/': OpenSSL SSL_read: SSL_ERROR_SYSCALL"),
-    '网络连不上 GitHub（代理或网络问题）');
+    '网络连不上（代理或网络问题）');
   assert.equal(explainSyncError('fatal: unable to access: Could not resolve host: github.com'),
-    '网络连不上 GitHub（代理或网络问题）');
+    '网络连不上（代理或网络问题）');
   assert.equal(explainSyncError('fatal: Authentication failed for https://github.com/x/y.git/'),
     '凭据无效或无权限');
   // 权限类常同时含 unable to access，必须判成权限而不是网络
   assert.equal(explainSyncError("remote: Permission to x/y.git denied\nfatal: unable to access ...: The requested URL returned error: 403"),
     '凭据无效或无权限');
-  assert.equal(explainSyncError("remote: Repository not found."), '仓库地址不对或已不存在');
+  assert.equal(explainSyncError("remote: Repository not found."), '仓库/收件口地址不对或已不存在');
   assert.equal(explainSyncError('fatal: 某个没见过的毛病'), null);
 });
 
@@ -318,8 +321,9 @@ test('with sync configured the payload carries a sync status field', () => {
   // 只比同步状态本身：这个 Engine 读的是真机的账本与锚点（非隔离），
   // 用量字段会随本机数据变，deepEqual 整块会被无关字段带崩。
   const { usage, ...status } = engine.payload().sync;
-  assert.deepEqual(status, {
+  assert.deepEqual({ ...status, machines: bare(status.machines) }, {
     state: 'connecting',
+    mode: 'git',
     pushOk: false,
     intervalSec: 600,
     machines: [{ id: 'engine', lastShardSec: null, self: true }],

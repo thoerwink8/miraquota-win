@@ -71,10 +71,11 @@ test('multi-machine detail lives in its own tab, never in the overview cards', (
   assert.doesNotMatch(renderer, /id="syncCard"/);
   assert.match(renderer, /<button id="tabSync" style="display:none">多机<\/button>/);
   assert.match(renderer, /sync: \['tabSync', 'pageSync'\]/);
-  // 未配置（payload 无 sync）时：页签不出现，且这一页不可被激活（记住的页签也挡回总览）
-  assert.match(renderer, /\$\('tabSync'\)\.style\.display = sy \? '' : 'none';/);
+  // 未配置且没有登录入口时：页签不出现，且这一页不可被激活（记住的页签也挡回总览）。
+  // 有登录入口（payload 带 syncLogin）时页签出现，但只给登录卡（2026-09-02 收件口）。
+  assert.ok(renderer.includes("$('tabSync').style.display = (sy || canLogin) ? '' : 'none';"));
   assert.match(renderer, /name === 'sync' && !syncAvailable/);
-  assert.match(renderer, /if \(!sy && \$\('pageSync'\)\.classList\.contains\('on'\)\) switchTab\('main'\)/);
+  assert.ok(renderer.includes("if (!sy && !canLogin && $('pageSync').classList.contains('on')) switchTab('main');"));
   // 总览页脚只留一行摘要 + 去哪看
   assert.match(renderer, /多机 ×\$\{\(sy\.machines \?\? \[\]\)\.length\} · \$\{mark\} →/);
   assert.match(renderer, /e\.target\.closest\('#footSync'\)/);

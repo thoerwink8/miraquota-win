@@ -168,6 +168,12 @@
   .sync-machine .when { color: var(--ink3); }
   /* 用量紧跟机器名，和右侧的推送时间分属两栏——一眼看「谁花的」而不用横扫 */
   .sync-machine .use { margin-left: 8px; font-weight: 700; color: var(--accent); }
+  /* 按人分组：组名一行，下面缩进列机器 */
+  .sync-group { font-size: 11px; font-weight: 700; color: var(--ink2); margin-top: 8px; }
+  .sync-machine.grouped { padding-left: 10px; }
+  #syncLoginCard .cfg { margin-top: 6px; }
+  #syncLoginCard .cfg .k { min-width: 44px; }
+  #syncLoginCard input.wide { width: 100%; }
   .sync-machine.off .id { color: var(--ink3); font-weight: 500; }
   .sync-machine.off .use { color: var(--ink2); }
   .sync-machine.expired .id, .sync-machine.expired .when { color: var(--ink3); font-weight: 500; }
@@ -293,12 +299,23 @@
       </div></div>
     </div>
     <div class="page" id="pageSync">
-      <div class="card">
+      <div class="card" id="syncLoginCard" style="display:none">
+        <div class="head"><span class="label">加入多机统计</span></div>
+        <div class="hint">共用这份额度的人各自登录后，这里就能看到「谁花了多少」。没有 GitHub 也行：
+        名字自己起、口令自己定，第一次要一个邀请码（找额度的主人要）。只上传每次调用的时间、模型、token 数。</div>
+        <div class="cfg"><span class="k">名字</span><input id="loginAccount" placeholder="fxc" maxlength="24" autocomplete="off"></div>
+        <div class="cfg"><span class="k">口令</span><input id="loginPass" type="password" placeholder="至少 4 位" autocomplete="off"></div>
+        <div class="cfg" id="loginInviteRow"><span class="k">邀请码</span><input id="loginInvite" placeholder="名字第一次用才需要" autocomplete="off"></div>
+        <div class="cfg"><span class="k">收件口</span><input id="loginInbox" class="wide" autocomplete="off"></div>
+        <div class="cfg"><span class="k"></span><button id="btnLogin">登录并开始上传</button></div>
+        <div class="cfg-note" id="loginNote"></div>
+      </div>
+      <div class="card" id="syncStatusCard">
         <div class="head"><span class="label">同步状态</span><span class="sp" style="flex:1"></span><span class="sync-state" id="syncState"></span></div>
         <div class="sync-why" id="syncWhy" style="display:none"></div>
         <div id="syncMachines"></div>
       </div>
-      <div class="card">
+      <div class="card" id="syncBasisCard">
         <div class="hint" id="syncBasis"></div>
         <div class="hint">
           <b>为什么要合并</b>：点数是账号级的，账本是本机级的。多机共用一份额度时
@@ -697,15 +714,25 @@
     // 多机页：payload 无 sync 字段（未配置）时页签与页面都不出现，不显示任何新 UI。
     const sy = p.sync;
     syncAvailable = !!sy;
-    $('tabSync').style.display = sy ? '' : 'none';
-    if (!sy && $('pageSync').classList.contains('on')) switchTab('main');
+    const canLogin = !sy && !!p.syncLogin;
+    syncAvailable = !!sy || canLogin;
+    $('tabSync').style.display = (sy || canLogin) ? '' : 'none';
+    if (!sy && !canLogin && $('pageSync').classList.contains('on')) switchTab('main');
+    // 没同步 ⇒ 只给登录卡；有同步 ⇒ 状态卡 + 说明卡
+    $('syncLoginCard').style.display = canLogin ? '' : 'none';
+    $('syncStatusCard').style.display = sy ? '' : 'none';
+    $('syncBasisCard').style.display = sy ? '' : 'none';
+    if (canLogin) {
+      restoreTab(); tabRestored = true;
+      if (!$('loginInbox').value) $('loginInbox').value = p.syncLogin.inbox ?? '';
+    }
     if (sy) {
       restoreTab();       // 上次停在多机页：这一刻才知道它可用，补一次恢复
       tabRestored = true; // 可用性已知，恢复到此为止（之后只跟用户点击走）
       const stEl = $('syncState');
       stEl.className = 'sync-state ' + sy.state;
       stEl.innerHTML = '● ' + (
-        sy.state === 'ok' ? 'GitHub 已接入'
+        sy.state === 'ok' ? (sy.mode === 'inbox' ? `收件口已接入 · ${esc(sy.account ?? '')}` : 'GitHub 已接入')
           : sy.state === 'error' ? '同步失败：' + esc(sy.errorHint ?? sy.error ?? '')
           : sy.state === 'warn' ? (sy.pushOk ? '本机已上传，读取他机失败' : '同步重试中')
           : '连接中…');
@@ -723,14 +750,29 @@
       // 分片过期的机器，外加各机账本的时差漏记（用户 2026-09-02 拍板归成一类）。旁边必须有说明。
       const use = sy.usage;
       const amount = (pts, usd) => MODE === 'pts' ? `${fmtK(pts)} 点` : money(usd, 0);
-      const useOf = (id) => (use?.machines ?? []).find((x) => x.id === id);
-      $('syncMachines').innerHTML = (sy.machines ?? []).map((m) => {
+      const useOf = (key) => (use?.machines ?? []).find((x) => (x.key ?? x.id) === key);
+      const machineRow = (m, grouped) => {
         const expired = m.lastShardSec != null && m.lastShardSec < expiredBefore;
         const when = m.lastShardSec == null ? '尚未推送' : `${ago(m.lastShardSec)}推送`;
-        const u = useOf(m.id);
-        return `<div class="sync-machine${expired ? ' expired' : ''}">
+        const u = useOf(m.key ?? m.id);
+        return `<div class="sync-machine${expired ? ' expired' : ''}${grouped ? ' grouped' : ''}">
           <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}${u ? `<span class="use">${amount(u.points, u.usd)}</span>` : ''}</span>
           <span class="when">${when}${expired ? ' · 已过期' : ''}</span></div>`;
+      };
+      // 按人分组（收件口登录的机器带 account）；没登录的机器（git 通道）归「额度主人」
+      const groups = new Map();
+      for (const m of sy.machines ?? []) {
+        const g = m.account ?? '';
+        if (!groups.has(g)) groups.set(g, []);
+        groups.get(g).push(m);
+      }
+      const hasAccounts = [...groups.keys()].some((k) => k);
+      $('syncMachines').innerHTML = [...groups.entries()].map(([g, ms]) => {
+        const sum = ms.reduce((a, m) => { const u = useOf(m.key ?? m.id); return u ? { p: a.p + u.points, u: a.u + u.usd } : a; }, { p: 0, u: 0 });
+        const head = hasAccounts
+          ? `<div class="sync-group">${g ? esc(g) : '额度主人（GitHub 直连）'}${sum.p > 0 ? `<span class="use">${amount(sum.p, sum.u)}</span>` : ''}</div>`
+          : '';
+        return head + ms.map((m) => machineRow(m, hasAccounts)).join('');
       }).join('')
         // 没价的调用：点扣了、美元算不出，只能给 token 数。有名字总比消失进残差里强。
         + (use?.unpriced ?? []).map((x) => `<div class="sync-machine off"><span class="id">未定价 · ${esc(x.model)}<span class="use">${fmtK(x.tokens)} token</span></span>
@@ -746,7 +788,9 @@
       if (sy.lastSyncSec) basis.push(`上次完整成功 ${ago(sy.lastSyncSec)}`);
       // 自动接入的机器要把「怎么接上的」和「怎么关掉」一起说清楚：此时删文件会被重新接回，
       // 真正的关闭是把文件内容改成 {"autoJoin": false}（文件在就不再自动探测）。
-      basis.push(sy.autoJoined
+      basis.push(sy.mode === 'inbox'
+        ? `以「${esc(sy.account ?? '')}」登录收件口 <code>${esc(sy.inbox ?? '')}</code> · 配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即退出）`
+        : sy.autoJoined
         ? '本机未配置，探到默认仓可读后自动接入 · 配置在 <code>~/.miraquota/sync.json</code>'
           + '（要关掉就把内容改成 <code>{"autoJoin": false}</code>；直接删会在 1 小时内自动接回）'
         : '配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即完全关闭）');
@@ -868,6 +912,24 @@
     tip.textContent = ok ? '已保存' : '没存上（值要在 0.1–10 之间）';
     $('fableMeasured').replaceChildren(tip);
     if (ok) cfgReady = false;   // 下一帧用落盘后的真值回填，确保显示的就是生效的
+  };
+
+  // 多机页登录：先试名字+口令；名字没注册时才要邀请码（第二次点才带上）
+  $('btnLogin').onclick = async () => {
+    const note = $('loginNote');
+    const opts = {
+      inbox: $('loginInbox').value.trim(), account: $('loginAccount').value.trim().toLowerCase(),
+      passphrase: $('loginPass').value, invite: $('loginInvite').value.trim(),
+    };
+    note.textContent = '正在连接收件口…';
+    const r = await window.miraquota.syncLogin?.(opts).catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+    if (r?.ok) {
+      note.textContent = r.registered ? '已注册并登录，开始上传。' : '已登录，开始上传。';
+      $('loginPass').value = '';
+    } else {
+      note.textContent = r?.error ?? '没成功';
+      if (r?.needInvite) $('loginInvite').focus();
+    }
   };
 
   let latest = null;

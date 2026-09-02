@@ -1,0 +1,19 @@
+name = "miraquota-inbox"
+main = "worker.mjs"
+compatibility_date = "2026-06-01"
+
+# 部署前：npx wrangler kv namespace create ACCOUNTS，把返回的 id 填到下面
+[[kv_namespaces]]
+binding = "ACCOUNTS"
+id = "REPLACE_WITH_KV_ID"
+
+[vars]
+GH_REPO = "thoerwink8/miraquota-ledger"
+
+# 秘密（不进仓库）：
+#   npx wrangler secret put GH_TOKEN      只对账本仓 contents 读写的细粒度令牌
+#   npx wrangler secret put INVITE_CODE   口头告诉圈里人的邀请码，定一次
+
+[[rules]]
+type = "Text"
+globs = ["**/*.ps1", "**/*.bat"]

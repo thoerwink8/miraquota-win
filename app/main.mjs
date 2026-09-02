@@ -151,6 +151,12 @@ if (!app.requestSingleInstanceLock()) {
       if (ok) await tick().catch(() => {});
       return ok;
     });
+    // 多机页登录（收件口）：成功就立刻重画，用户马上看到状态从「未同步」变「连接中」
+    ipcMain.handle('sync:login', async (_e, opts) => {
+      const r = await engine.loginSync(opts ?? {});
+      if (r?.ok) await tick().catch(() => {});
+      return r;
+    });
     ipcMain.handle('theme:get', () => applyTheme(readUI().theme));
     ipcMain.handle('theme:set', (_e, v) => {
       const t = applyTheme(v);

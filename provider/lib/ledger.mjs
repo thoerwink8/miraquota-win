@@ -357,10 +357,13 @@ export class CostLedger {
   // MARK: 多机分片（详见 docs/MULTI-MACHINE.md）
 
   /** 本机账本聚合态 → 同步分片。只含本机桶——外机分片单独存放，不回流串账。 */
-  exportShard(machineId, nowSec = Date.now() / 1000) {
+  exportShard(machineId, nowSec = Date.now() / 1000, identity = {}) {
     return {
       schemaVersion: SHARD_SCHEMA,
       machineId,
+      // 收件口模式的身份：account 是自报名字，installId 是首次运行生成的随机 id（同名主机不撞）
+      ...(identity.account ? { account: identity.account } : {}),
+      ...(identity.installId ? { installId: identity.installId } : {}),
       generatedAt: nowSec,
       coverage: { fromSec: nowSec - RETENTION, toSec: nowSec },
       buckets: this.buckets, scoped: this.scoped, family: this.family,
@@ -374,6 +377,7 @@ export class CostLedger {
    */
   adoptForeignShards(shards) {
     this.foreignShards = (Array.isArray(shards) ? shards : [])
+      .map((s) => (s?.schemaVersion === 2 ? this.#materialize(s) : s))
       .filter((s) => s && s.schemaVersion === SHARD_SCHEMA && s.machineId);
     this.#mergedIndex = null;
     this.#mergedScopedIndex = {};
@@ -407,7 +411,7 @@ export class CostLedger {
    * 这里不走合并索引：合并的意义就是抹掉机器边界，正好和这个问题相反。
    * @returns [{ machineId, self, usd, groupUSD }]，本机 machineId 由调用方给。
    */
-  perMachineSpent(fromSec, toSec, { group = null, selfId = null } = {}) {
+  perMachineSpent(fromSec, toSec, { group = null, selfId = null, self = null } = {}) {
     const lo = Math.floor(fromSec / 60), hi = Math.floor(toSec / 60);
     const head = group ? group.toLowerCase() + '|' : null;
     const sum = (obj, pre) => {
@@ -419,12 +423,49 @@ export class CostLedger {
       }
       return t;
     };
-    const row = (src, machineId, self) => ({
-      machineId, self,
+    const row = (src, machineId, isSelf, identity) => ({
+      machineId, self: isSelf,
+      account: identity?.account ?? null,
+      installId: identity?.installId ?? null,
       usd: sum(src.buckets, null),
       groupUSD: head ? sum(src.scoped, head) : 0,
     });
-    return [row(this, selfId, true), ...this.foreignShards.map((s) => row(s, s.machineId, false))];
+    const me = self ?? { machineId: selfId };
+    return [row(this, me.machineId ?? selfId, true, me),
+      ...this.foreignShards.map((s) => row(s, s.machineId, false, s))];
+  }
+
+  #materialized = new Map();
+  /**
+   * 轻客户端只传原始行（时间、模型、token），定价在这里做——它机器上不带价目表，
+   * 价目变了也不用管它。落成与本机同构的 v1 分片，后面所有查询不用知道它的出身。
+   * 与本机 #parseGateway 同一套规则：dispatch 归「调度」家族，没价的记 unpriced。
+   */
+  #materialize(raw) {
+    const key = `${raw.installId ?? raw.machineId}|${raw.generatedAt}`;
+    const hit = this.#materialized.get(key);
+    if (hit) return hit;
+    const out = {
+      schemaVersion: SHARD_SCHEMA, machineId: raw.machineId, generatedAt: raw.generatedAt,
+      coverage: raw.coverage, account: raw.account, installId: raw.installId, fromRows: true,
+      buckets: {}, scoped: {}, family: {}, unpriced: {},
+    };
+    const bump = (obj, k, v) => { obj[k] = (obj[k] ?? 0) + v; };
+    for (const r of Array.isArray(raw.rows) ? raw.rows : []) {
+      if (typeof r?.t !== 'number' || typeof r?.m !== 'string') continue;
+      const minute = Math.floor(r.t / 60);
+      const usd = this.pricing.cost(r.m, num(r.i), num(r.o), num(r.cr), num(r.cw));
+      if (usd == null) { const tok = num(r.i) + num(r.o); if (tok > 0) bump(out.unpriced, `${r.m}|${minute}`, tok); continue; }
+      if (usd <= 0) continue;
+      bump(out.buckets, String(minute), usd);
+      const lower = r.m.toLowerCase();
+      for (const g of this.scopedGroups) if (lower.includes(g)) bump(out.scoped, `${g}|${minute}`, usd);
+      const fam = r.src === 'dispatch' ? 'dispatch' : modelFamily(r.m).id;
+      bump(out.family, `${fam}|${minute}`, usd);
+    }
+    this.#materialized.clear();       // 只留最新一代，避免旧分片越攒越多
+    this.#materialized.set(key, out);
+    return out;
   }
 
   /**

@@ -15,7 +15,7 @@ import { join } from 'node:path';
 
 import { Pricing } from './pricing.mjs';
 import { CostLedger } from './ledger.mjs';
-import { LedgerSync } from './ledger-sync.mjs';
+import { LedgerSync, DEFAULT_INBOX } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
@@ -647,10 +647,12 @@ export class Engine {
     const now = Date.now() / 1000;
     const ratio = this.settings.ratioOf('fable');
     const rows = this.ledger
-      .perMachineSpent(w.resetAt - w.durationSeconds, now, { group: 'fable', selfId: this.sync.machineId })
+      .perMachineSpent(w.resetAt - w.durationSeconds, now, {
+        group: 'fable', self: { machineId: this.sync.machineId, ...this.sync.identity },
+      })
       .map((r) => {
         const usd = r.usd + (ratio > 0 ? (ratio - 1) * r.groupUSD : 0);
-        return { id: r.machineId, self: r.self, usd, points: usd / OFFICIAL_PER_POINT };
+        return { id: r.machineId, key: r.installId ?? r.machineId, account: r.account, self: r.self, usd, points: usd / OFFICIAL_PER_POINT };
       })
       .sort((a, b) => b.points - a.points);
     const known = rows.reduce((a, b) => a + b.points, 0);
@@ -711,8 +713,25 @@ export class Engine {
       speed: this.#speedReport(),
       // 无同步配置时不出现该字段，显示面据此不画任何新 UI（硬性验收项）。
       ...(this.sync.enabled ? { sync: { ...this.sync.status(), ...this.#machineUsage(windows) } } : {}),
+      // 没同步时给登录入口（收件口地址可改）：没有 GitHub 的人从这里进（2026-09-02）
+      ...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX } } : {}),
       ...(this.#roster() ?? {}),
     };
+  }
+
+  /**
+   * 多机页登录框 → 收件口。成功后立刻跑一轮同步并放宽归因静置，用户不用等 10 分钟才看到机器。
+   * @returns LedgerSync.login 的结果
+   */
+  async loginSync(opts) {
+    const r = await this.sync.login(opts);
+    if (r.ok) {
+      this.pointsAttrib.relaxSettle(this.sync.intervalSec);
+      this.#shardsWarmed = false;
+      this.#syncKickedAt = 0;
+      this.#maybeSync(Date.now() / 1000);
+    }
+    return r;
   }
 
   #rosterAt = 0; #rosterCache = null;

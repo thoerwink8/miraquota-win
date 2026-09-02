@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('miraquota', {
   promptUpdate: () => ipcRenderer.invoke('update:prompt'),
   checkUpdate: () => ipcRenderer.invoke('update:check'),
   setPointCost: (group, ratio) => ipcRenderer.invoke('settings:pointCost', group, ratio),
+  syncLogin: (opts) => ipcRenderer.invoke('sync:login', opts),
   minimize: () => ipcRenderer.send('win:min'),
   hide: () => ipcRenderer.send('win:hide'),
   quit: () => ipcRenderer.send('app:quit'),
