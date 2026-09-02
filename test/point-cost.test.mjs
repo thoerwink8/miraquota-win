@@ -134,3 +134,47 @@ test('a ratio that contradicts the measured one is called out on the scoped card
   assert.ok(renderer.includes('Math.abs(cost.measured - cost.ratio) / cost.measured > 0.15'),
     '偏差超过 15% 才提示，免得实测噪声天天报警');
 });
+
+test('the ratio setting stays visible when Mirasim is not running', () => {
+  // 用户 2026-09-02 报「最近没使用就不展示 fable 倍率」——真实原因不是用量：pointCost
+  // 只在实测路径生成，Mirasim 一停就整个字段消失，界面把整张配置卡都藏了。设置是设置，
+  // 连不连得上都该看得见、改得动；实测值给不出时要说清是没连上还是样本薄。
+  const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
+  assert.ok(src.includes('#pointCost(windows, atSec)'), '三条路径共用一个 pointCost 生成器');
+  assert.ok(src.includes("this.#pointCost(this.anchors.anchors, this.anchors.capturedAt)"),
+    '推算路径用锚点采集时刻算实测——拿陈旧点数配当下账本会算出假倍率');
+  assert.ok(src.includes('this.#pointCost(this.anchors.anchors, null)'),
+    '本机路径没有官方点数，只回设置值');
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  assert.ok(renderer.includes("latest?.measured === false"), '要分开「没连上」和「样本不够」');
+  assert.match(renderer, /Mirasim 未运行，实测倍率暂不可给/);
+});
+
+test('each window shows the ratio-weighted spend next to the raw ledger spend', () => {
+  // 用户 2026-09-02：「7d 统计口径要结合 fable 额外倍数，把真实倍率后的花费算进去」。
+  // 主行仍是账本原值（真实花费，可与 Mirasim 逐笔核对），但它与满额不同口径：满额是点数
+  // 口径。少了折算值，$426 比 $5580 会被读成 7.6%，而官方计数器写着 11.6%。
+  const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
+  assert.ok(src.includes('weightedSpentUSD: weighted'), '窗口要带折算后支出');
+  assert.ok(src.includes('weightedSpend(this.ledger, start, now, this.settings.groupPointCost).usd'),
+    '总窗折算走同一个 weightedSpend，与单价、满额同源');
+  assert.ok(src.includes('spent * (this.settings.ratioOf(group) || 1)'), '档位窗按自己的倍率折算');
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  assert.ok(renderer.includes('w.weightedSpentUSD != null'));
+  assert.match(renderer, /折算 <b>/);
+});
+
+test('the panel cross-checks the reverse-inferred price against the official 1/100 anchor', () => {
+  // 官方三个窗口的点数都恰好整除 100：560000→5600、156800→1568、296800→2968。
+  // 本机反推 ≈0.0100 与之吻合，这是「5600 到底对不对」的直接证据。仍然反推而不是写死——
+  // 写死 0.01 会让账本漏计/超算再也无法被发现（反推与官方的偏离就是那道检查）。
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  assert.ok(renderer.includes('const OFFICIAL_PER_POINT = 0.01;'));
+  assert.match(renderer, /点数 ÷ 100 = 美元/);
+  assert.match(renderer, /本机反推偏离/);
+  const engine = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
+  assert.ok(!engine.includes('0.01;'), '引擎里不许出现写死单价——美元一律由账本反推');
+  for (const [pts, usd] of [[560000, 5600], [156800, 1568], [296800, 2968]]) {
+    assert.equal(pts * 0.01, usd);
+  }
+});

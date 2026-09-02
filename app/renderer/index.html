@@ -336,6 +336,9 @@
 
   const WINDOW_NAME = { '5h': '5 小时', '7d': '7 天', '7d_fable': '7 天 · Fable' };
   const CONF = { none: '无样本', low: '标定中', medium: '收敛中', high: '高置信' };
+  // 官方基准单价：额度点 ÷ 100 = 美元（560000→5600、156800→1568，官方三个窗口都整除）。
+  // 只当对表参照用，实际显示的美元一律由本机账本反推——写死会掩盖账本自己的漏计。
+  const OFFICIAL_PER_POINT = 0.01;
   const money = (v, digits = 1) => '$' + Number(v).toFixed(digits);
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
@@ -485,6 +488,11 @@
         + (w.conservativeUSD != null ? ` · 保守估计（分段单价中位数）${money(w.conservativeUSD, 0)}` : '')
         + ' · 不是云端美元账单';
       subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`] : [];
+      // 折算后支出与满额同口径（点数口径）；主行的账本原值是真实花费，两者差的就是 fable 的额外扣点。
+      // 不摆这个数，用户会拿 $426 去比 $5580 得出「才用了 7.6%」，而官方计数器是 11.6%。
+      if (w.weightedSpentUSD != null) {
+        subBits.push(`<span title="账本 ${money(w.spentUSD ?? 0)} 按档位倍率折算后的点数口径花费，与满额同口径">折算 <b>${money(w.weightedSpentUSD)}</b></span>`);
+      }
       if (elapsedDays >= 0.5) subBits.push(`日均 ${money((w.spentUSD ?? 0) / elapsedDays)}`);
     }
 
@@ -751,6 +759,10 @@
         const parts = c.adjustments.map((a) => `${a.group} ${money(a.usd)}×${a.ratio}`).join('、');
         t += `<br><b>档位折算</b> 账本原值 ${money(c.rawUSD)}，其中 ${parts}（官方按倍率扣点，倍率可在本页顶部改）`;
       }
+      // 官方基准是整数 $0.01/点（560000 点 ÷ 100 = 官方宣称的 5600 刀，5h、fable 窗同样整除）。
+      // 我们仍然从账本反推而不是写死 0.01——反推是唯一能发现账本漏计/超算的检查，偏离多少就摆多少。
+      const dev = (p.unitPriceUSD - OFFICIAL_PER_POINT) / OFFICIAL_PER_POINT * 100;
+      t += `<br><b>对表官方</b> 官方基准 ${OFFICIAL_PER_POINT.toFixed(4)} $/点（点数 ÷ 100 = 美元），本机反推偏离 ${dev >= 0 ? '+' : ''}${dev.toFixed(1)}%`;
       if (p.unitPriceSpread != null) t += `<br><b>交叉校验</b> 5h/7d 两窗单价离散 ${p.unitPriceSpread.toFixed(2)}×（超过 4× 判不自洽，停用美元显示）`;
       spec.push(t);
     }
@@ -813,9 +825,13 @@
     $('cfgCard').style.display = fable ? '' : 'none';
     if (!fable) return;
     if (!cfgReady) { $('fableRatio').value = fable.ratio; cfgReady = true; }   // 别打断正在输入的用户
+    // 实测给不出有两种原因，说法必须分开：没连上（等 Mirasim 起来就有）和样本薄（等用量）。
+    // 早先一律说「样本还不够」，而真实原因往往是 Mirasim 没在跑——用户据此以为是「最近没用 fable」。
     $('fableMeasured').textContent = fable.measured
       ? `（本机实测 ${fable.measured.toFixed(2)}×：非 fable 单价 ÷ fable 单价，两个数各出自一个官方计数器）`
-      : '（样本还不够，实测倍率暂不可给）';
+      : latest?.measured === false
+        ? '（Mirasim 未运行，实测倍率暂不可给；下面这个设置照常生效）'
+        : '（样本还不够，实测倍率暂不可给）';
   }
   $('btnRatio').onclick = async () => {
     const ok = await window.miraquota.setPointCost?.('fable', Number($('fableRatio').value));

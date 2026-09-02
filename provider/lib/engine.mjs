@@ -16,7 +16,7 @@ import { LedgerSync } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
-import { evaluateCoherence, coherenceNotice, measureGroupRatio } from './coherence.mjs';
+import { evaluateCoherence, coherenceNotice, measureGroupRatio, weightedSpend } from './coherence.mjs';
 import { Settings } from './settings.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
 import { windowDuration, modelGroup } from './windows.mjs';
@@ -404,6 +404,14 @@ export class Engine {
       const dur = windowDuration(w.label);
       const start = dur ? w.resetAt - dur : null;
       const spent = start != null ? this.ledger.spent(start, now, { includeOpenMinute: true, group }) : 0;
+      // 折算后支出：账本原值按档位倍率放大，就是「这些花费实际扣掉多少点」的美元等价。
+      // 主行给的是**真实花费**（可与 Mirasim 逐笔核对，零推断），但它与满额不同口径——
+      // 满额是点数口径。两个口径并排摆出来，用户才知道 $426 的用量为什么顶掉 $644 的额度。
+      // （用户 2026-09-02：「7d 统计口径要把真实倍率后的花费算进去」。）
+      const weighted = start != null
+        ? (group ? spent * (this.settings.ratioOf(group) || 1)
+          : weightedSpend(this.ledger, start, now, this.settings.groupPointCost).usd)
+        : spent;
       // 满额口径：整窗支出 ÷ 整窗点数 × 预算点（2026-09-02 用户拍板，与官方宣称对得上）。
       // 总窗 = 折算后的基准单价 × 预算点；档位窗 = 基准单价 ÷ 该档位倍率 × 预算点——
       // 面板上每个数都由同一个模型（基准单价 + 倍率表）推出来，改设置时整块一起动。
@@ -425,6 +433,7 @@ export class Engine {
       return {
         label: w.label, usedPercent, inferred: false, confidence, sampleCount,
         spentUSD: spent,
+        ...(spent > 0 && Math.abs(weighted - spent) / spent > 0.005 ? { weightedSpentUSD: weighted } : {}),
         ...(breakdown ?? {}),
         ...(dur != null ? { durationSeconds: dur } : {}),
 
@@ -461,15 +470,8 @@ export class Engine {
       };
       if (coherence.spread != null) out.unitPriceSpread = coherence.spread;
     } else { const n = coherenceNotice(coherence); if (n) out.unitPriceNotice = n; }
-    // 档位倍率：配置值与实测值（各出自一个独立的官方计数器）一起给界面，用户能自己对表。
-    const scopedGroups = [...new Set(limits.windows.filter((w) => w.modelScoped)
-      .map((w) => modelGroup(w.label)).filter(Boolean))];
-    if (scopedGroups.length) {
-      out.pointCost = scopedGroups.map((g) => {
-        const m = measureGroupRatio(limits.windows, this.ledger, now, g);
-        return { group: g, ratio: this.settings.ratioOf(g), ...(m ? { measured: m.measured } : {}) };
-      });
-    }
+    const pc = this.#pointCost(limits.windows, now);
+    if (pc) out.pointCost = pc;
     if (notice) out.accountNotice = notice;
     if (calibDropped > 0) out.calibDropped = calibDropped;
     if (stale) out.detail = `接口已 ${Math.round(age / 60)} 分钟未回传，显示最后一次实测值`;
@@ -516,6 +518,9 @@ export class Engine {
     const ageMin = Math.round((now - this.anchors.capturedAt) / 60);
     const ageText = ageMin >= 60 ? `${(ageMin / 60).toFixed(1)} 小时` : `${ageMin} 分钟`;
     const out = this.#base('reckoned', this.anchors.capturedAt, windows);
+    // 锚点自带 used/budget/modelScoped，实测倍率按采集时刻算（那一刻账本与官方计数器同期）
+    const pcR = this.#pointCost(this.anchors.anchors, this.anchors.capturedAt);
+    if (pcR) out.pointCost = pcR;
     out.measured = false;
     out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见，实际用量可能更高`;
     return out;
@@ -537,6 +542,8 @@ export class Engine {
       };
     });
     const out = this.#base('local', now, windows);
+    const pcL = this.#pointCost(this.anchors.anchors, null);
+    if (pcL) out.pointCost = pcL;
     out.measured = false;
     out.detail = this.everConnected
       ? '接口不可达且无窗口锚点，仅按本机滚动窗口统计支出'
@@ -579,6 +586,24 @@ export class Engine {
    * 或跨窗离散判不自洽）时才用它，此时宁可保守也不要没有数。
    * 回归标定的观测数仍然照常汇报——它是「这个数有多少实测撑着」的唯一来源。
    */
+  /**
+   * 档位倍率：配置值与实测值（各出自一个独立的官方计数器）一起给界面，用户能自己对表。
+   * 三条 payload 路径都要给——这是个**设置**，Mirasim 没在跑时用户照样该能看见和改。
+   * （用户 2026-09-02 指出：没连上时整张配置卡消失，看着像「最近没用 fable 就不显示倍率」。）
+   * 实测值要官方计数器与账本对齐的那一刻：实测态用 now，推算态用锚点采集时刻——
+   * 拿陈旧的点数配到当下的账本会算出一个假倍率，宁可只给设置值。
+   * @param windows 有 used/budget/modelScoped 的窗口数组；给不出就传 null（只回设置值）
+   */
+  #pointCost(windows, atSec) {
+    const groups = [...new Set((windows ?? []).filter((w) => w.modelScoped)
+      .map((w) => modelGroup(w.label)).filter(Boolean))];
+    if (!groups.length) return null;
+    return groups.map((g) => {
+      const m = atSec != null ? measureGroupRatio(windows, this.ledger, atSec, g) : null;
+      return { group: g, ratio: this.settings.ratioOf(g), ...(m ? { measured: m.measured } : {}) };
+    });
+  }
+
   #fullOf(label, budget, group, ratioFull) {
     const est = this.calibrator.estimate(label, this.ledger, budget, group, this.settings.groupPointCost);
     const dropped = est?.foreignDropped ?? 0;
