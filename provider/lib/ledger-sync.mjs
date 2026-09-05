@@ -29,6 +29,13 @@ const INSTALL_FILE = join(homedir(), '.miraquota', 'install.json');
 const INBOX_CACHE = join(homedir(), '.miraquota', 'inbox-shards.json');
 const SHARD_FILE = 'shard.json';
 const DEFAULT_INTERVAL = 600;   // 秒；sync.json 未写 intervalSec 时的节流间隔
+/**
+ * 「有账号额度在手/急着要账号额度」那几轮的快节奏（秒）。账本迟到十分钟无所谓——
+ * 它是流水，补上就行；账号额度不一样，本机 Mirasim 没在跑时它是**唯一**的额度来源，
+ * 十分钟前的数字直接印在卡片主行上。sync.json 写 quotaIntervalSec 可覆盖（想关掉就填成
+ * 和 intervalSec 一样大）。
+ */
+const DEFAULT_QUOTA_INTERVAL = 120;
 const RETRY_DELAY_MS = 2000;    // 单轮内退避重试的等待
 const ERROR_STREAK = 2;         // 连续失败达到这个轮数才进 error（红），此前是重试中（黄）
 const HTTP_TIMEOUT_MS = 30_000;
@@ -174,15 +181,20 @@ export class LedgerSync {
       const c = JSON.parse(readFileSync(this.configFile, 'utf8'));
       const interval = Number(c?.intervalSec);
       const intervalSec = Number.isFinite(interval) && interval > 0 ? interval : DEFAULT_INTERVAL;
+      const quota = Number(c?.quotaIntervalSec);
+      // 快节奏不该反过来比常规轮还慢，min() 兜住配错的情况
+      const quotaIntervalSec = Number.isFinite(quota) && quota > 0
+        ? Math.min(quota, intervalSec) : Math.min(DEFAULT_QUOTA_INTERVAL, intervalSec);
       if (typeof c?.inbox === 'string' && c.inbox.trim() && ACCOUNT_RE.test(c.account ?? '')
         && typeof c.passphrase === 'string' && c.passphrase.length >= 4) {
-        return { mode: 'inbox', inbox: c.inbox.trim().replace(/\/+$/, ''), account: c.account, passphrase: c.passphrase, intervalSec };
+        return { mode: 'inbox', inbox: c.inbox.trim().replace(/\/+$/, ''), account: c.account, passphrase: c.passphrase, intervalSec, quotaIntervalSec };
       }
       if (typeof c?.remote !== 'string' || !c.remote.trim()) return null;
       return {
         mode: 'git',
         remote: c.remote.trim(),
         intervalSec,
+        quotaIntervalSec,
         // 自动接入写下的来源标记，重启后仍认得出（UI 据此说明这台机器是自己接上的）
         ...(typeof c.autoJoinedAt === 'string' ? { autoJoinedAt: c.autoJoinedAt } : {}),
       };
@@ -192,6 +204,8 @@ export class LedgerSync {
   get enabled() { return !!this.config; }
   get mode() { return this.config?.mode ?? null; }
   get intervalSec() { return this.config?.intervalSec ?? DEFAULT_INTERVAL; }
+  /** 带着账号额度那几轮的间隔（见 DEFAULT_QUOTA_INTERVAL）。 */
+  get quotaIntervalSec() { return this.config?.quotaIntervalSec ?? Math.min(DEFAULT_QUOTA_INTERVAL, this.intervalSec); }
   /** 分片上的身份：收件口模式带 account，两种模式都带 installId。 */
   get identity() {
     return { installId: this.installId, ...(this.config?.mode === 'inbox' ? { account: this.config.account } : {}) };
@@ -431,6 +445,28 @@ export class LedgerSync {
     this.lastError = err;
     this.failStreak = err ? this.failStreak + 1 : 0;
     return { ...this.status(nowSec), shards: this.shards };
+  }
+
+  /**
+   * 只读一轮：不发布本机分片，只把他机分片重新拉一遍。
+   *
+   * 用在「本机 Mirasim 没在跑」的时候——这台机器自己的账本几乎不动（没有 relay 在扣点），
+   * 没什么可发的，但账号额度得跟上还在跑的那台机器。省掉 push 那半程，git 通道就只剩
+   * 一次 fetch，快节奏拉取（quotaIntervalSec）才不至于把远端仓刷成提交流水。
+   *
+   * 失败静默：状态色仍由 run() 那条主链判——一次额外的读取失败不该让界面变红，
+   * 上一轮读到的分片也照旧留在内存里参与合并。
+   * @returns 读到的外机分片；失败返回 null（调用方据此不动任何状态）
+   */
+  async refreshOnly(nowSec = Date.now() / 1000) {
+    if (!this.enabled) return null;
+    try {
+      const inbox = this.mode === 'inbox';
+      if (!inbox) await this.#ensureRepo();
+      this.shards = await (inbox ? this.#fetchInbox() : this.#fetchForeign());
+      this.lastSyncSec = nowSec;
+      return this.shards;
+    } catch { return null; }
   }
 
   /**

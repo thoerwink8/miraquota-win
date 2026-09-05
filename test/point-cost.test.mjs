@@ -142,7 +142,8 @@ test('the ratio setting stays visible when Mirasim is not running', () => {
   // 连不连得上都该看得见、改得动；实测值给不出时要说清是没连上还是样本薄。
   const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
   assert.ok(src.includes('#pointCost(windows, atSec)'), '三条路径共用一个 pointCost 生成器');
-  assert.ok(src.includes("this.#pointCost(this.anchors.anchors, this.anchors.capturedAt)"),
+  // src 是「这次用的那份锚点」——本机锚点或他机送来的账号额度快照，两者都自带采集时刻
+  assert.ok(src.includes("this.#pointCost(src.anchors, src.capturedAt)"),
     '推算路径用锚点采集时刻算实测——拿陈旧点数配当下账本会算出假倍率');
   assert.ok(src.includes('this.#pointCost(this.anchors.anchors, null)'),
     '本机路径没有官方点数，只回设置值');

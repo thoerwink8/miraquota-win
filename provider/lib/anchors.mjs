@@ -16,7 +16,26 @@ import { windowDuration } from './windows.mjs';
 
 const STATE_DIR = join(homedir(), '.miraquota');
 const STATE_FILE = join(STATE_DIR, 'anchor.json');
-const MAX_AGE = 30 * 86400;   // 锚点过老时滚动误差累积，不再采信
+export const ANCHOR_MAX_AGE = 30 * 86400;   // 锚点过老时滚动误差累积，不再采信
+
+/**
+ * 一组 /v1/limits 窗口 → 锚点数组。纯函数，不碰落盘状态。
+ * 本机实测走 AnchorStore.update()；他机分片里的账号额度快照直接走这里成锚点——
+ * 额度点是账号级的，哪台机器读到的都是同一份（见 docs/MULTI-MACHINE.md）。
+ */
+export function anchorsFrom(windows, capturedSec) {
+  return (Array.isArray(windows) ? windows : []).map((w) => ({
+    label: String(w?.label ?? ''),
+    resetAt: w?.resetAt,
+    duration: windowDuration(w?.label),
+    capturedAt: capturedSec,
+    usedPercent: Math.min(100, w?.used / w?.budget * 100),
+    budget: w?.budget,
+    used: w?.used,
+    modelScoped: !!w?.modelScoped,
+  })).filter((a) => a.duration && a.budget > 0
+    && Number.isFinite(a.usedPercent) && Number.isFinite(a.resetAt));
+}
 
 export class AnchorStore {
   constructor() {
@@ -31,16 +50,7 @@ export class AnchorStore {
 
   /** 实测快照到达时更新。重置时刻未变时限频落盘（10 分钟刷一次龄期）。 */
   update(windows, capturedSec) {
-    const fresh = windows.map((w) => ({
-      label: w.label,
-      resetAt: w.resetAt,
-      duration: windowDuration(w.label),
-      capturedAt: capturedSec,
-      usedPercent: Math.min(100, w.used / w.budget * 100),
-      budget: w.budget,
-      used: w.used,
-      modelScoped: !!w.modelScoped,
-    })).filter((a) => a.duration);
+    const fresh = anchorsFrom(windows, capturedSec);
     if (!fresh.length) return;
     const changed = fresh.length !== this.anchors.length
       || fresh.some((a) => !this.anchors.find((b) => b.label === a.label && b.resetAt === a.resetAt));
@@ -58,7 +68,7 @@ export class AnchorStore {
   #lastWrite;
 
   get usable() {
-    return this.anchors.length > 0 && Date.now() / 1000 - this.capturedAt < MAX_AGE;
+    return this.anchors.length > 0 && Date.now() / 1000 - this.capturedAt < ANCHOR_MAX_AGE;
   }
 
   /** 把锚点滚动到覆盖 now 的窗口，返回 { start, end, rolled }。rolled=窗口已换代。 */

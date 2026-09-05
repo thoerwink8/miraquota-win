@@ -50,7 +50,7 @@ export function readEnabledModels(pricing, file = MIRASIM_SETTING) {
 import { Settings } from './settings.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
 import { windowDuration, modelGroup } from './windows.mjs';
-import { AnchorStore } from './anchors.mjs';
+import { AnchorStore, anchorsFrom, ANCHOR_MAX_AGE } from './anchors.mjs';
 
 const CHANNEL_DEFAULT = 4970;
 const STALE_AFTER = 90;      // 秒；超过转 stale
@@ -158,6 +158,8 @@ export class Engine {
     this.speed = null;
     this.cachedRouter = null;
     this.last = null;           // { at, limits }
+    // 他机分片带来的账号级额度快照（最新的一份）：本机连不上 Mirasim 时的额度来源
+    this.foreignLimits = null;  // { capturedAt, windows, machineId, account, suspended… }
     this.pointsTrail = {};
     this.everConnected = false;
   }
@@ -167,6 +169,8 @@ export class Engine {
   #shardsWarmed = false;
   #autoJoinBusy = false;
   #autoJoinAt = 0;
+  #quotaPullBusy = false;
+  #quotaPullAt = 0;
 
   /**
    * 没配置多机同步时，隔一阵静默探一次默认仓能不能读，能读就自己接上（见 ledger-sync）。
@@ -195,26 +199,77 @@ export class Engine {
     this.#shardsWarmed = true;
     try {
       const shards = await this.sync.loadCachedShards();
-      if (shards.length) this.ledger.adoptForeignShards(shards);
+      if (shards.length) this.#adoptShards(shards);
     } catch { /* 读缓存失败就等正常那一轮，不影响主流程 */ }
   }
 
+  /** 外机分片到手：账本合并 + 挑出最新的账号额度快照。两处入口共用。 */
+  #adoptShards(shards) {
+    this.ledger.adoptForeignShards(shards);
+    this.#adoptForeignLimits(shards);
+  }
+
   /**
-   * 多机账本同步：按 intervalSec 节流触发，异步跑完把外机分片交给账本合并。
+   * 他机分片里的账号级额度快照，取 capturedAt 最新的一份。
+   * 只进不退：某一轮读不到分片（网络抖动、那台机器暂时离场）时留住上一份，
+   * 否则界面会从「他机 2 分钟前的数」猛地退回本机那份陈旧锚点。龄期由显示面判。
+   */
+  #adoptForeignLimits(shards) {
+    let best = null;
+    for (const s of Array.isArray(shards) ? shards : []) {
+      const l = s?.limits;
+      if (!Array.isArray(l?.windows) || !l.windows.length || !(l.capturedAt > 0)) continue;
+      if (!best || l.capturedAt > best.capturedAt) {
+        best = {
+          capturedAt: l.capturedAt, windows: l.windows,
+          machineId: s.machineId ?? null, account: s.account ?? null,
+          suspended: !!l.suspended, unmetered: !!l.unmetered, degraded: !!l.degraded,
+        };
+      }
+    }
+    if (best && !(this.foreignLimits?.capturedAt > best.capturedAt)) this.foreignLimits = best;
+  }
+
+  /**
+   * 多机账本同步：按节流间隔触发，异步跑完把外机分片交给账本合并。
    * 失败不阻断主流程，只更新 sync 状态（payload 里可见）。
+   *
+   * 手里有账号额度快照（本机连着 Mirasim）时走 quotaIntervalSec 的快节奏：分片里那块
+   * 额度是别的机器唯一的额度来源，压着十分钟不发，对面主行印的就是十分钟前的数。
    */
   #maybeSync() {
     if (!this.sync.enabled) { this.#maybeAutoJoin(Date.now() / 1000); return; }
     if (this.#syncBusy) return;
     const now = Date.now() / 1000;
-    if (now - this.#syncKickedAt < this.sync.intervalSec) return;
+    const limits = this.#shardLimits();
+    const every = limits ? this.sync.quotaIntervalSec : this.sync.intervalSec;
+    if (now - this.#syncKickedAt < every) return;
     this.#syncKickedAt = now;
     this.#syncBusy = true;
     const speed = this.#shardSpeed();
-    this.sync.run(this.ledger, now, speed ? { speed } : null)
-      .then((r) => { if (r) this.ledger.adoptForeignShards(r.shards); })
+    this.sync.run(this.ledger, now, (speed || limits) ? { ...(speed ? { speed } : {}), ...(limits ? { limits } : {}) } : null)
+      .then((r) => { if (r) this.#adoptShards(r.shards); })
       .catch(() => { /* run 自吞错误，这里兜底防未处理拒绝 */ })
       .finally(() => { this.#syncBusy = false; });
+  }
+
+  /**
+   * 本机 Mirasim 没在跑时的额度补给：按 quotaIntervalSec 只读拉一次他机分片。
+   *
+   * 不这么做，额度要等下一轮完整同步（默认 10 分钟）才刷新，而这台机器此刻**只有**
+   * 他机数据可用。只读省掉 push：本机没有 relay 在扣点，账本几乎不动，没什么可发的。
+   * 本机连得上 Mirasim 时一次都不会发生（那时额度是自己实测的）。
+   */
+  #maybeQuotaPull(now) {
+    if (!this.sync.enabled || this.#quotaPullBusy || this.#syncBusy) return;
+    if (this.last && now - this.last.at <= RECKON_AFTER) return;
+    if (now - this.#quotaPullAt < this.sync.quotaIntervalSec) return;
+    this.#quotaPullAt = now;
+    this.#quotaPullBusy = true;
+    this.sync.refreshOnly(now)
+      .then((shards) => { if (shards) this.#adoptShards(shards); })
+      .catch(() => { /* refreshOnly 自吞错误，这里兜底防未处理拒绝 */ })
+      .finally(() => { this.#quotaPullBusy = false; });
   }
 
   /**
@@ -259,6 +314,30 @@ export class Engine {
     const r = this.#speedReport();
     if (!r?.rows?.length) return null;
     return { rows: r.rows, sampleTotal: r.sampleTotal ?? 0 };
+  }
+
+  /**
+   * 随分片发出去的账号级额度快照：额度点是账号级的（同一个 userId 的所有设备共用一个池），
+   * 哪台机器读到的都是同一份——所以只要有一台还连着 Mirasim，没连上的机器就不必退回
+   * 自己那份陈旧锚点去猜满额（用户 2026-09-05：另一台在跑，总额度也要随时同步）。
+   *
+   * capturedAt 是**读到那一刻**，不是发分片这一刻：对面据此判龄期、与自己的锚点比新旧，
+   * 差一步就会把陈旧数据当成新鲜的。太老的不发——那时对面自己的锚点多半还更近。
+   */
+  #shardLimits(nowSec = Date.now() / 1000) {
+    if (!this.last?.limits?.windows?.length) return null;
+    if (nowSec - this.last.at > ANCHOR_MAX_AGE) return null;
+    const { windows, suspended, unmetered, degraded } = this.last.limits;
+    return {
+      capturedAt: this.last.at,
+      windows: windows.map((w) => ({
+        label: w.label, used: w.used, budget: w.budget, resetAt: w.resetAt,
+        ...(w.modelScoped ? { modelScoped: true } : {}),
+      })),
+      ...(suspended ? { suspended: true } : {}),
+      ...(unmetered ? { unmetered: true } : {}),
+      ...(degraded ? { degraded: true } : {}),
+    };
   }
 
   async #discoverChannelPort(processes) {
@@ -418,6 +497,7 @@ export class Engine {
     this.#speedRefresh();   // 必须在 #maybeSync 之前：分片要带这一轮的速度，否则首轮发出去的是空速度
     await this.#warmShards();
     this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
+    this.#maybeQuotaPull(Date.now() / 1000);   // 本机没实测时，额度从还在跑的那台机器补
     this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
     return !!this.last;
   }
@@ -428,8 +508,26 @@ export class Engine {
     const age = this.last ? now - this.last.at : Infinity;
 
     if (this.last && age <= RECKON_AFTER) return this.#measuredPayload(now, age);
+    const remote = this.#remoteAnchors(now);
+    if (remote) return this.#reckonedPayload(now, remote);
     if (this.anchors.usable) return this.#reckonedPayload(now);
     return this.#localPayload(now);
+  }
+
+  /**
+   * 他机快照当锚点：只在它比本机锚点**更新**时才用。
+   *
+   * 两份锚点是同一个东西的两次读数（账号级额度），差别只在读的时刻与读的人，所以判据
+   * 只有一条——谁更近。本机刚断线时自己的锚点更近，走本机那条；断了半天而他机一直在跑，
+   * 走他机那条，连满额换了档位都跟着变。
+   */
+  #remoteAnchors(now) {
+    const f = this.foreignLimits;
+    if (!f || now - f.capturedAt >= ANCHOR_MAX_AGE) return null;
+    if (this.anchors.usable && this.anchors.capturedAt >= f.capturedAt) return null;
+    const anchors = anchorsFrom(f.windows, f.capturedAt);
+    if (!anchors.length) return null;
+    return { anchors, capturedAt: f.capturedAt, machineId: f.machineId, account: f.account, from: f };
   }
 
   #measuredPayload(now, age) {
@@ -516,9 +614,13 @@ export class Engine {
     return out;
   }
 
-  /** 锚点推算：窗口边界滚动 + 本机账本。同窗口期内以锚点百分比为基线（更准），滚动后纯本机口径。 */
-  #reckonedPayload(now) {
-    const windows = this.anchors.anchors.map((a) => {
+  /**
+   * 锚点推算：窗口边界滚动 + 账本。同窗口期内以锚点百分比为基线（更准），滚动后纯账本口径。
+   * @param remote 他机送来的账号额度快照当锚点时传入（见 #remoteAnchors）；否则用本机锚点
+   */
+  #reckonedPayload(now, remote = null) {
+    const src = remote ?? { anchors: this.anchors.anchors, capturedAt: this.anchors.capturedAt };
+    const windows = src.anchors.map((a) => {
       const rolled = AnchorStore.rollWindow(a, now);
       if (!rolled) return null;
       const group = a.modelScoped ? modelGroup(a.label) : null;
@@ -556,14 +658,30 @@ export class Engine {
       };
     }).filter(Boolean);
 
-    const ageMin = Math.round((now - this.anchors.capturedAt) / 60);
+    const ageMin = Math.round((now - src.capturedAt) / 60);
     const ageText = ageMin >= 60 ? `${(ageMin / 60).toFixed(1)} 小时` : `${ageMin} 分钟`;
-    const out = this.#base('reckoned', this.anchors.capturedAt, windows);
+    const out = this.#base('reckoned', src.capturedAt, windows);
     // 锚点自带 used/budget/modelScoped，实测倍率按采集时刻算（那一刻账本与官方计数器同期）
-    const pcR = this.#pointCost(this.anchors.anchors, this.anchors.capturedAt);
+    const pcR = this.#pointCost(src.anchors, src.capturedAt);
     if (pcR) out.pointCost = pcR;
     out.measured = false;
-    out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见`;
+    if (remote) {
+      const who = remote.account && remote.account !== remote.machineId
+        ? `${remote.account}·${remote.machineId}` : (remote.machineId ?? '另一台机器');
+      // 他机读到的是**账号级**额度，他人占用已经计在里面了——这跟本机锚点那条不是一回事，
+      // 文案必须分开写，否则用户会以为这个数照样看不见别人。
+      out.detail = `本机 Mirasim 未运行，按「${who}」${ageText}前读到的账号额度推算；他人占用已计到那一刻`;
+      out.reckonFrom = {
+        machineId: remote.machineId, account: remote.account,
+        capturedAt: remote.capturedAt, ageSeconds: now - remote.capturedAt,
+      };
+      const n = remote.from.suspended ? '账号被暂停，额度数字仅供参考'
+        : remote.from.unmetered ? '账号不计量，额度上限不适用'
+        : remote.from.degraded ? '上游降级运行中' : null;
+      if (n) out.accountNotice = n;
+    } else {
+      out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见`;
+    }
     return out;
   }
 
