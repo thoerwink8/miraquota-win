@@ -146,7 +146,12 @@ cat "$HOME/.ssh/miraquota-ledger.pub"`)).trim();
     await run('gh', ['api', `repos/${owner}/${name}/keys`, '-f', `title=${title}`, '-f', `key=${pub}`, '-F', 'read_only=false']);
     say(`部署密钥已装到 ${owner}/${name}（标题 ${title}，可写，仅此仓）`);
   } catch (e) {
-    if (/already in use|key is already/i.test(e.message)) say(`部署密钥已在 ${owner}/${name} 上（跳过）`);
+    // 重复添加同一把公钥，GitHub 只回 422 Validation Failed，正文里的「key is already in use」
+    // gh 不一定带出来——所以别猜报错文本，直接去仓上核对这把公钥在不在。
+    const installed = await run('gh', ['api', `repos/${owner}/${name}/keys`, '--jq', '.[].key'])
+      .then((s) => s.split('\n').some((k) => k.trim() && pub.startsWith(k.trim())))
+      .catch(() => false);
+    if (installed) say(`部署密钥已在 ${owner}/${name} 上（跳过）`);
     else { console.error(`装部署密钥失败（本机 gh 要有该仓的管理权）：\n${e.message}`); process.exit(1); }
   }
 
