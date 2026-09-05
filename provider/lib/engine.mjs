@@ -15,7 +15,7 @@ import { join } from 'node:path';
 
 import { Pricing } from './pricing.mjs';
 import { CostLedger } from './ledger.mjs';
-import { LedgerSync, DEFAULT_INBOX } from './ledger-sync.mjs';
+import { LedgerSync, DEFAULT_INBOX, DEFAULT_HUB } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
@@ -859,7 +859,7 @@ export class Engine {
       // 无同步配置时不出现该字段，显示面据此不画任何新 UI（硬性验收项）。
       ...(this.sync.enabled ? { sync: { ...this.sync.status(), ...this.#machineUsage(windows) } } : {}),
       // 没同步时给登录入口（收件口地址可改）：没有 GitHub 的人从这里进（2026-09-02）
-      ...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX } } : {}),
+      ...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX, hub: DEFAULT_HUB } } : {}),
       ...(this.#roster() ?? {}),
     };
   }

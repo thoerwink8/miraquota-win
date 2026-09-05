@@ -53,6 +53,12 @@ export const DEFAULT_REMOTE = 'https://github.com/thoerwink8/miraquota-ledger.gi
  * 地址本身不是秘密（Worker 只认名字+口令+邀请码），放在公开代码里没关系。
  */
 export const DEFAULT_INBOX = 'https://miraquota-inbox.miraquota.workers.dev';
+/**
+ * 默认自建服务器（hub）。2026-09-05 部署，见 server/README.md。
+ * 地址不是秘密（写接口要 token，token 只在那台机器的 config.json 里），
+ * 预填它是为了新机器只用粘一个 token，不用记地址。
+ */
+export const DEFAULT_HUB = 'https://156.224.28.95.sslip.io/mq';
 /** 探测超时；托盘常驻应用后台跑，宁可等久一点也不要因为网络慢误判成「不能接」。 */
 const PROBE_TIMEOUT_MS = 20_000;
 const ACCOUNT_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
@@ -284,6 +290,47 @@ export class LedgerSync {
     this.autoJoined = false;
     this.lastError = null; this.failStreak = 0;
     return { ok: true, registered };
+  }
+
+  /**
+   * 接上自建服务器（多机页那张卡）：地址 + token，先探一次 /health 再写配置。
+   * 探通才写——写完才发现地址错了，用户看到的是「同步失败」而不是「地址填错了」。
+   * 成功即切到 hub 模式，git 仓与收件口那两条通道自动让位。
+   * @returns { ok: true } | { ok: false, error }
+   */
+  async connectHub({ hub = DEFAULT_HUB, token = '' } = {}) {
+    const base = String(hub ?? '').trim().replace(/\/+$/, '');
+    token = String(token ?? '').trim();
+    if (!/^https?:\/\//.test(base)) return { ok: false, error: '服务器地址要以 http(s):// 开头' };
+    try {
+      const h = await http(`${base}/health`, { timeout: 15_000 });
+      if (h?.name !== 'miraquota-hub') return { ok: false, error: '这个地址不是 MiraQuota 服务器' };
+    } catch (e) {
+      return { ok: false, error: explainSyncError(e.message) ?? e.message };
+    }
+    // token 对不对要用写接口验：/health 是不鉴权的，探通了不代表推得上去
+    try {
+      await http(`${base}/shard`, {
+        method: 'PUT',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        body: JSON.stringify({
+          schemaVersion: SHARD_SCHEMA, machineId: this.machineId, installId: this.installId,
+          generatedAt: Date.now() / 1000, coverage: { fromSec: 0, toSec: 0 },
+          buckets: {}, scoped: {}, family: {}, unpriced: {},
+        }),
+      });
+    } catch (e) {
+      if (e.status === 401) return { ok: false, error: 'token 不对（去服务器的 config.json 里看）' };
+      return { ok: false, error: explainSyncError(e.message) ?? e.message };
+    }
+    try {
+      mkdirSync(dirname(this.configFile), { recursive: true });
+      writeFileSync(this.configFile, JSON.stringify({ hub: base, token, intervalSec: DEFAULT_INTERVAL }, null, 2) + '\n');
+    } catch (e) { return { ok: false, error: `配置写不进去：${e.message}` }; }
+    this.config = this.#loadConfig();
+    this.autoJoined = false;
+    this.lastError = null; this.failStreak = 0;
+    return { ok: true };
   }
 
   /** 同步仓就绪：init + repo 级身份（不碰全局配置）+ origin 对齐 sync.json 的 remote。 */

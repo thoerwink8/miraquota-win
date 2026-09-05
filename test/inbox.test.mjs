@@ -186,9 +186,14 @@ test('the default inbox is a real https url and the login card only shows when s
   assert.ok(renderer.includes("$('syncLoginCard').style.display = canLogin ? '' : 'none';"));
   assert.match(renderer, /window\.miraquota\.syncLogin\?\./);
   const engine = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
-  assert.ok(engine.includes("...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX } } : {}),"));
+  // 同一张卡上还有自建服务器那条（推荐路径），两个地址一起预填
+  assert.ok(engine.includes("...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX, hub: DEFAULT_HUB } } : {}),"));
   const preload = readFileSync(new URL('../app/preload.cjs', import.meta.url), 'utf8');
   assert.match(preload, /syncLogin: \(opts\) => ipcRenderer\.invoke\('sync:login', opts\)/);
+  assert.match(preload, /syncHub: \(opts\) => ipcRenderer\.invoke\('sync:hub', opts\)/);
+  assert.match(renderer, /id="syncHubCard"/);
+  assert.match(renderer, /id="btnHub"/);
+  assert.ok(renderer.includes("$('syncHubCard').style.display = canLogin ? '' : 'none';"));
 });
 
 test('a git-channel machine also sees inbox people, and a dead inbox costs it nothing', async () => {

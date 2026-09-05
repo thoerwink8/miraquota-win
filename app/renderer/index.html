@@ -314,8 +314,19 @@
       </div></div>
     </div>
     <div class="page" id="pageSync">
+      <div class="card" id="syncHubCard" style="display:none">
+        <div class="head"><span class="label">连自建服务器</span></div>
+        <div class="hint">推荐这条：账本与账号额度都汇总在自己的服务器上，各机秒级同步，
+        口径只算一遍。地址已预填，只要粘一个 token（在服务器的
+        <code>/var/lib/miraquota-hub/config.json</code> 里）。<br>
+        接上之后就不再走 GitHub 仓与收件口——那两条是没有服务器时的替代品。</div>
+        <div class="cfg"><span class="k">地址</span><input id="hubUrl" class="wide" autocomplete="off"></div>
+        <div class="cfg"><span class="k">token</span><input id="hubToken" type="password" class="wide" autocomplete="off"></div>
+        <div class="cfg"><span class="k"></span><button id="btnHub">连上并开始上传</button></div>
+        <div class="cfg-note" id="hubNote"></div>
+      </div>
       <div class="card" id="syncLoginCard" style="display:none">
-        <div class="head"><span class="label">加入多机统计</span></div>
+        <div class="head"><span class="label">加入多机统计（没有服务器时）</span></div>
         <div class="hint">共用这份额度的人各自登录后，这里就能看到「谁花了多少」。没有 GitHub 也行：
         名字自己起、口令自己定，第一次要一个邀请码（找额度的主人要）。只上传每次调用的时间、模型、token 数。<br>
         <b>国内网络需开代理</b>：收件口在 workers.dev，实测直连被 DNS 投毒（2026-09-03 用户拍板暂不绑自有域名）。</div>
@@ -693,7 +704,11 @@
     const st = $('state');
     st.textContent = p.stateLabel ?? '—';
     st.className = 'badge ' + (p.state ?? '');
-    $('detail').textContent = p.detail ?? '';
+    // 数据来自服务器时说一句：本机 Mirasim 没开却显示精确值，不说明来源会被当成出错了
+    const via = p.fromHub
+      ? `服务器汇总 · ${p.fromHub.machines} 台机器${p.fromHub.ageSeconds > 90 ? ` · ${Math.round(p.fromHub.ageSeconds)} 秒前` : ''}`
+      : '';
+    $('detail').textContent = [p.detail, via].filter(Boolean).join('　·　');
 
     const ws = p.windows ?? [];
     $('cards').innerHTML = ws.length
@@ -779,11 +794,13 @@
     if (!sy && !canLogin && $('pageSync').classList.contains('on')) switchTab('main');
     // 没同步 ⇒ 只给登录卡；有同步 ⇒ 状态卡 + 说明卡
     $('syncLoginCard').style.display = canLogin ? '' : 'none';
+    $('syncHubCard').style.display = canLogin ? '' : 'none';
     $('syncStatusCard').style.display = sy ? '' : 'none';
     $('syncBasisCard').style.display = sy ? '' : 'none';
     if (canLogin) {
       restoreTab(); tabRestored = true;
       if (!$('loginInbox').value) $('loginInbox').value = p.syncLogin.inbox ?? '';
+      if (!$('hubUrl').value) $('hubUrl').value = p.syncLogin.hub ?? '';
     }
     if (sy) {
       restoreTab();       // 上次停在多机页：这一刻才知道它可用，补一次恢复
@@ -974,6 +991,16 @@
     tip.textContent = ok ? '已保存' : '没存上（值要在 0.1–10 之间）';
     $('fableMeasured').replaceChildren(tip);
     if (ok) cfgReady = false;   // 下一帧用落盘后的真值回填，确保显示的就是生效的
+  };
+
+  // 连自建服务器：探通 /health 再验 token，都过了才写配置（错在哪一步说哪一步）
+  $('btnHub').onclick = async () => {
+    const note = $('hubNote');
+    note.textContent = '正在连接服务器…';
+    const r = await window.miraquota.syncHub?.({ hub: $('hubUrl').value.trim(), token: $('hubToken').value.trim() })
+      .catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+    if (r?.ok) { note.textContent = '已接上，开始上传。'; $('hubToken').value = ''; }
+    else note.textContent = r?.error ?? '没成功';
   };
 
   // 多机页登录：先试名字+口令；名字没注册时才要邀请码（第二次点才带上）

@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 import { Engine } from '../provider/lib/engine.mjs';
+import { HubClient } from '../provider/lib/hub-client.mjs';
 import { startFeed, Injector } from '../provider/lib/injector.mjs';
 import { resolveVersion } from './version.mjs';
 import { createUpdater } from './updater.mjs';
@@ -27,6 +28,7 @@ if (!app.requestSingleInstanceLock()) {
   let win = null;
   let tray = null;
   let engine = null;
+  let hub = null;
   let updater = null;
   let ticks = 0;
 
@@ -126,23 +128,39 @@ if (!app.requestSingleInstanceLock()) {
     tray.setContextMenu(menu);
   }
 
+  /**
+   * 这一帧要画的 payload。配了自建服务器就以它算的那份为准（它手里有全部机器的账本，
+   * 本机算不全），本机那份只贡献机器级字段——速度、模型清单、同步状态（见 hub-client 的
+   * LOCAL_FIELDS）。服务器不可用或数据过期时原样退回本机那份，行为与没配 hub 时一致。
+   */
+  function currentPayload() {
+    const local = engine.payload();
+    return hub?.enabled ? hub.merge(local) : local;
+  }
+
+  function pushFrame(p = currentPayload()) {
+    if (win && !win.isDestroyed()) win.webContents.send('quota', p);
+    if (tray) tray.setToolTip(trayTooltip(p));
+  }
+
   async function tick() {
     // 每跳都刷账本与推算（payload 里的倒计时、锚点推算随时间走）；限频问接口。
     if (ticks % FETCH_EVERY === 0) await engine.poll().catch(() => {});
     else { engine.ledger.refresh(); if (engine.speed) try { engine.speed.refresh(); } catch { /* 忽略 */ } }
     ticks++;
-    const p = engine.payload();
-    if (win && !win.isDestroyed()) win.webContents.send('quota', p);
-    if (tray) tray.setToolTip(trayTooltip(p));
+    pushFrame();
   }
 
   app.whenReady().then(async () => {
     engine = new Engine({ forceOffline: process.argv.includes('--offline') });
     await engine.loadSpeed();
+    // 服务器一有新数据就重画，不等 5 秒心跳——这是「随时同步」里的「随时」
+    hub = new HubClient({ onPayload: () => { try { pushFrame(); } catch { /* 窗口还没建好 */ } } });
+    hub.start();
     applyTheme(readUI().theme);   // 建窗前定主题，避免首帧闪一下另一套配色
     createWindow();
     createTray();
-    ipcMain.handle('quota:get', () => engine.payload());
+    ipcMain.handle('quota:get', () => currentPayload());
     // 与 dist 同一口径（见 app/version.mjs）；安装包无 .git 时回退 package.json（builder 已注入）
     ipcMain.handle('app:version', () => APP_VERSION);
     // 档位倍率：落盘成功才算改成功，改完立刻重画一帧，用户不用等下一次心跳。
@@ -155,6 +173,16 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.handle('sync:login', async (_e, opts) => {
       const r = await engine.loginSync(opts ?? {});
       if (r?.ok) await tick().catch(() => {});
+      return r;
+    });
+    // 接自建服务器：写完配置要让 HubClient 重读并连上，否则要等下次重启才生效
+    ipcMain.handle('sync:hub', async (_e, opts) => {
+      const r = await engine.sync.connectHub(opts ?? {});
+      if (r?.ok) {
+        engine.pointsAttrib.relaxSettle(engine.sync.intervalSec);
+        hub?.reload();
+        await tick().catch(() => {});
+      }
       return r;
     });
     ipcMain.handle('theme:get', () => applyTheme(readUI().theme));
