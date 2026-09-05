@@ -173,8 +173,11 @@ Environment=NODE_ENV=production
 WantedBy=multi-user.target
 UNIT
 $S systemctl daemon-reload
-$S systemctl enable --now ${SERVICE}
-sleep 2
+$S systemctl enable ${SERVICE}
+# 必须是 restart 不是 enable --now：服务已经在跑时 --now 什么都不做，
+# 于是「重复跑脚本更新代码」变成了「传了新代码但仍跑着旧的」（实咬一次）
+$S systemctl restart ${SERVICE}
+sleep 3
 $S systemctl is-active ${SERVICE}`);
 say(`服务 ${SERVICE} 已启动（127.0.0.1:${PORT}）`);
 
