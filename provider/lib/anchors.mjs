@@ -11,10 +11,10 @@
  */
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { windowDuration } from './windows.mjs';
 
-const STATE_DIR = join(homedir(), '.miraquota');
+const STATE_DIR = join(homedir(), '.miraquota');   // 默认落点；hub 注入自己的数据目录
 const STATE_FILE = join(STATE_DIR, 'anchor.json');
 export const ANCHOR_MAX_AGE = 30 * 86400;   // 锚点过老时滚动误差累积，不再采信
 
@@ -38,11 +38,13 @@ export function anchorsFrom(windows, capturedSec) {
 }
 
 export class AnchorStore {
-  constructor() {
+  /** @param stateFile 落盘路径（服务端 hub 注入自己的数据目录，默认 ~/.miraquota/anchor.json） */
+  constructor(stateFile = STATE_FILE) {
+    this.stateFile = stateFile;
     this.anchors = [];      // [{ label, resetAt, duration, capturedAt, usedPercent, budget, used, modelScoped }]
     this.capturedAt = 0;
     try {
-      const p = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+      const p = JSON.parse(readFileSync(stateFile, 'utf8'));
       this.anchors = p.anchors ?? [];
       this.capturedAt = p.capturedAt ?? 0;
     } catch { /* 首次运行 */ }
@@ -59,8 +61,8 @@ export class AnchorStore {
     if (changed || capturedSec - (this.#lastWrite ?? 0) > 600) {
       this.#lastWrite = capturedSec;
       try {
-        mkdirSync(STATE_DIR, { recursive: true });
-        writeFileSync(STATE_FILE, JSON.stringify({ anchors: this.anchors, capturedAt: capturedSec }));
+        mkdirSync(dirname(this.stateFile), { recursive: true });
+        writeFileSync(this.stateFile, JSON.stringify({ anchors: this.anchors, capturedAt: capturedSec }));
       } catch { /* ignore */ }
     }
   }

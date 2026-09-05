@@ -185,6 +185,14 @@ export class LedgerSync {
       // 快节奏不该反过来比常规轮还慢，min() 兜住配错的情况
       const quotaIntervalSec = Number.isFinite(quota) && quota > 0
         ? Math.min(quota, intervalSec) : Math.min(DEFAULT_QUOTA_INTERVAL, intervalSec);
+      // hub 通道优先：自建服务器是「唯一真相」，配了它就不该再走 git / 收件口那两条
+      // 「没有服务器时的替代品」（用户 2026-09-05 拍板）。
+      if (typeof c?.hub === 'string' && c.hub.trim()) {
+        return {
+          mode: 'hub', hub: c.hub.trim().replace(/\/+$/, ''), token: c.token ?? null,
+          intervalSec, quotaIntervalSec,
+        };
+      }
       if (typeof c?.inbox === 'string' && c.inbox.trim() && ACCOUNT_RE.test(c.account ?? '')
         && typeof c.passphrase === 'string' && c.passphrase.length >= 4) {
         return { mode: 'inbox', inbox: c.inbox.trim().replace(/\/+$/, ''), account: c.account, passphrase: c.passphrase, intervalSec, quotaIntervalSec };
@@ -344,6 +352,42 @@ export class LedgerSync {
     return [...byKey.values()];
   }
 
+  /** hub：一次 PUT，服务端按 installId 整份覆盖。鉴权是共享 token，不按人登录。 */
+  async #publishHub(shard) {
+    await http(`${this.config.hub}/shard`, {
+      method: 'PUT', body: JSON.stringify(shard), headers: this.#hubAuth(),
+    });
+  }
+
+  /** hub：一次 GET 拿全部分片，剔掉自己，顺手落缓存供冷启动。 */
+  async #fetchHub() {
+    const all = await http(`${this.config.hub}/shards`, { headers: this.#hubAuth() });
+    const shards = (Array.isArray(all) ? all : []).filter((s) => this.#isForeign(s));
+    try { writeFileSync(this.cacheFile, JSON.stringify(shards)); } catch { /* 缓存写不进去不影响本轮 */ }
+    return shards;
+  }
+
+  #hubAuth() { return this.config?.token ? { authorization: `Bearer ${this.config.token}` } : {}; }
+
+  /**
+   * 把本机读到的账号额度推给 hub。只有跑着 Mirasim 的机器调得动这条——
+   * 额度点是账号级的，服务器自己没有 Mirasim，这份数据只能由这样的机器送上去。
+   *
+   * 与分片分开发：分片是这台机器的账本（它自己的事），额度是全账号的事，
+   * 一台机器账本推失败不该连带把额度也丢了，反之亦然。失败静默（调用方只当这轮没推成）。
+   * @returns true 表示服务端采纳了（比在架的更新）
+   */
+  async pushLimits(limits) {
+    if (this.config?.mode !== 'hub' || !limits?.windows?.length) return false;
+    try {
+      const r = await http(`${this.config.hub}/limits`, {
+        method: 'PUT', headers: this.#hubAuth(),
+        body: JSON.stringify({ ...limits, machineId: this.machineId, installId: this.installId }),
+      });
+      return !!r?.accepted;
+    } catch { return false; }
+  }
+
   /** 收件口：发布就是一次 PUT；分片里带 account/installId，Worker 据此定分支名。 */
   async #publishInbox(shard) {
     const { inbox, account, passphrase } = this.config;
@@ -386,8 +430,8 @@ export class LedgerSync {
         try { return JSON.parse(readFileSync(this.cacheFile, 'utf8')).filter((s) => this.#isForeign(s)); } catch { return []; }
       };
       let shards;
-      if (this.mode === 'inbox') {
-        shards = cached();
+      if (this.mode !== 'git') {
+        shards = cached();          // HTTP 两条通道没有本地仓，冷启动只有缓存这一份
       } else {
         shards = this.#mergeShards(existsSync(join(this.repoDir, '.git')) ? await this.#readForeignRefs() : [], cached());
       }
@@ -424,21 +468,20 @@ export class LedgerSync {
   async run(ledger, nowSec = Date.now() / 1000, extras = null) {
     if (!this.enabled) return null;
     const firstLine = (e) => String(e.message || e).split('\n')[0].slice(0, 200);
-    const inbox = this.mode === 'inbox';
     let err = null;
     try {
-      if (!inbox) await this.#ensureRepo();
+      if (this.#needsRepo) await this.#ensureRepo();
       // extras 只供「看那台机器」的视角切换用，不参与合并：分片格式没变（schemaVersion 仍是 1），
       // 老版本读到多出来的字段直接忽略，两代客户端可以混跑。
       const shard = { ...ledger.exportShard(this.machineId, nowSec, this.identity), ...(extras ?? {}) };
-      await retryOnce(() => (inbox ? this.#publishInbox(shard) : this.#publish(shard)), this.retryDelayMs);
+      await retryOnce(() => this.#publishTo(shard), this.retryDelayMs);
       this.lastPublishSec = nowSec;   // 发布已成功，即使随后读取失败也算数
       this.pushOk = true;
     } catch (e) { this.pushOk = false; err = firstLine(e); }
     // 发布都推不上去时同一端点的读取几无成功可能，省一次网络往返直接跳过。
     if (this.pushOk) {
       try {
-        this.shards = await retryOnce(() => (inbox ? this.#fetchInbox() : this.#fetchForeign()), this.retryDelayMs);
+        this.shards = await retryOnce(() => this.#fetchAll(), this.retryDelayMs);
         this.lastSyncSec = nowSec;
       } catch (e) { err = firstLine(e); }
     }
@@ -461,12 +504,30 @@ export class LedgerSync {
   async refreshOnly(nowSec = Date.now() / 1000) {
     if (!this.enabled) return null;
     try {
-      const inbox = this.mode === 'inbox';
-      if (!inbox) await this.#ensureRepo();
-      this.shards = await (inbox ? this.#fetchInbox() : this.#fetchForeign());
+      if (this.#needsRepo) await this.#ensureRepo();
+      this.shards = await this.#fetchAll();
       this.lastSyncSec = nowSec;
       return this.shards;
     } catch { return null; }
+  }
+
+  /** 只有 git 通道要维护本地同步仓；HTTP 那两条一个文件都不建。 */
+  get #needsRepo() { return this.mode === 'git'; }
+
+  /**
+   * 发布 / 读取按通道分派。写成表而不是布尔判断：加第四条通道时改这两处，
+   * 不用满文件找 `inbox ? … : …`（这个坑在加 hub 时就已经踩到了）。
+   */
+  #publishTo(shard) {
+    if (this.mode === 'hub') return this.#publishHub(shard);
+    if (this.mode === 'inbox') return this.#publishInbox(shard);
+    return this.#publish(shard);
+  }
+
+  #fetchAll() {
+    if (this.mode === 'hub') return this.#fetchHub();
+    if (this.mode === 'inbox') return this.#fetchInbox();
+    return this.#fetchForeign();
   }
 
   /**
@@ -494,6 +555,7 @@ export class LedgerSync {
       pushOk: this.pushOk,
       intervalSec: this.intervalSec,   // 显示面据此判「分片超过 2×interval 未更新 ⇒ 已过期」
       ...(this.mode === 'inbox' ? { inbox: this.config.inbox, account: this.config.account } : {}),
+      ...(this.mode === 'hub' ? { hub: this.config.hub } : {}),
       machines: [
         { id: this.machineId, key: this.installId, account: this.config?.account ?? null, lastShardSec: this.lastPublishSec, self: true },
         ...this.shards.map((s) => ({

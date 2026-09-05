@@ -143,14 +143,18 @@ export class Engine {
    * @param opts.routerToken 指定会话令牌（否则 Windows 走 PEB 自动发现）
    * @param opts.forceOffline 强制离线（验证降级路径用）
    * @param opts.syncOpts    多机账本同步的路径注入（测试用，默认走 ~/.miraquota）
+   * @param opts.ledgerFile  账本落盘路径（默认 ~/.miraquota/ledger.json）
+   * @param opts.anchorFile  锚点落盘路径（默认 ~/.miraquota/anchor.json）
+   * @param opts.noLocal     不扫本机 transcript 与网关账本。服务端 hub 用：那台机器上
+   *   没有任何人的会话记录，账本全部来自各机推上来的分片，扫本地只是白跑一趟。
    */
   constructor(opts = {}) {
     this.opts = opts;
     this.pricing = new Pricing();
-    this.ledger = new CostLedger(this.pricing);
+    this.ledger = new CostLedger(this.pricing, opts.ledgerFile);
     this.pointsAttrib = new PointsAttributor();
     this.calibrator = new Calibrator();
-    this.anchors = new AnchorStore();
+    this.anchors = new AnchorStore(opts.anchorFile);
     this.settings = new Settings(opts.settingsFile);
     this.sync = new LedgerSync(opts.syncOpts);
     // 同步启用时放宽归因静置：外机支出要等它下一轮发布分片才可见（见 points-attrib.mjs）。
@@ -247,6 +251,9 @@ export class Engine {
     this.#syncKickedAt = now;
     this.#syncBusy = true;
     const speed = this.#shardSpeed();
+    // hub 通道另发一份账号额度：服务器上没有 Mirasim，这份数据只有跑着它的机器送得上去。
+    // 与分片分开发——一台机器账本推失败不该连带把全账号的额度也丢了。
+    if (limits) this.sync.pushLimits(limits).catch(() => { /* pushLimits 自吞错误 */ });
     this.sync.run(this.ledger, now, (speed || limits) ? { ...(speed ? { speed } : {}), ...(limits ? { limits } : {}) } : null)
       .then((r) => { if (r) this.#adoptShards(r.shards); })
       .catch(() => { /* run 自吞错误，这里兜底防未处理拒绝 */ })
@@ -474,6 +481,24 @@ export class Engine {
     return Object.keys(out).length ? out : null;
   }
 
+  /**
+   * 收下一份 /v1/limits 实测：本机自己读到的（poll）与服务端收到别的机器推来的（hub）
+   * 走同一条路，口径不会长出第二份。
+   * @param atSec 读到那一刻（不是收到这一刻）——标定/归因/锚点全按这个时刻对齐账本
+   */
+  ingestLimits(limits, atSec) {
+    if (!limits?.windows?.length) return false;
+    this.#recordTrail(limits, atSec);
+    this.calibrator.record(limits.windows, atSec);
+    this.pointsAttrib.record(limits.windows, atSec);
+    this.anchors.update(limits.windows, atSec);
+    this.ledger.adoptScopedGroups(
+      limits.windows.filter((w) => w.modelScoped).map((w) => modelGroup(w.label)).filter(Boolean));
+    this.last = { at: atSec, limits };
+    this.everConnected = true;
+    return true;
+  }
+
   /** 一轮采集。返回是否拿到实测。 */
   async poll() {
     if (!this.opts.forceOffline) {
@@ -481,19 +506,9 @@ export class Engine {
       const channelPort = await this.#discoverChannelPort(processes);
       const router = await this.#discoverRouter(processes, channelPort);
       const limits = router ? await this.#fetchLimits(router) : null;
-      if (limits) {
-        const nowSec = Date.now() / 1000;
-        this.#recordTrail(limits, nowSec);
-        this.calibrator.record(limits.windows, nowSec);
-        this.pointsAttrib.record(limits.windows, nowSec);
-        this.anchors.update(limits.windows, nowSec);
-        this.ledger.adoptScopedGroups(
-          limits.windows.filter((w) => w.modelScoped).map((w) => modelGroup(w.label)).filter(Boolean));
-        this.last = { at: nowSec, limits };
-        this.everConnected = true;
-      }
+      if (limits) this.ingestLimits(limits, Date.now() / 1000);
     }
-    this.ledger.refresh();
+    if (!this.opts.noLocal) this.ledger.refresh();
     this.#speedRefresh();   // 必须在 #maybeSync 之前：分片要带这一轮的速度，否则首轮发出去的是空速度
     await this.#warmShards();
     this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
