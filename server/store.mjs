@@ -10,6 +10,11 @@ import { join } from 'node:path';
 
 /** 分片保留期：盖住 7d 窗口并留余量，与 CostLedger 的 RETENTION 同口径。 */
 export const SHARD_TTL = 8 * 86400;
+/**
+ * 额度快照到达时最多能有多老。放得比推送间隔（quotaIntervalSec，默认 120 秒）宽得多，
+ * 是为了容下时钟偏差与网络慢包；卡得住的是「离线很久的机器上线后回放一份陈年快照」。
+ */
+export const MAX_PUSH_AGE = 600;
 /** 文件名安全的机器键：分片自报的 installId/machineId 不可信，落盘前必须洗。 */
 export const safeKey = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9-]+/g, '-')
   .replace(/^-+|-+$/g, '').slice(0, 64);
@@ -65,12 +70,20 @@ export class HubStore {
 
   /**
    * 账号额度快照。只留最新的一份——它是账号级的，谁读到的都是同一份，
-   * 存多份只会带来「该信谁」这个本来不存在的问题。旧的比新的还旧就不收。
+   * 存多份只会带来「该信谁」这个本来不存在的问题。
+   *
+   * **新旧按服务器自己的时钟判，不按发送方的 capturedAt。** 各机时钟不齐是常态
+   * （实测本机 Windows 比两台服务器慢 48 秒）；按发送方时钟排序，慢钟那台的新读数会被
+   * 快钟那台的旧读数长期挡住，「随时同步」就成了「随那台钟快的机器」。收到即最新——
+   * 额度是读到就立刻推的，到达顺序≈读取顺序，而且这一路只用一个时钟量。
+   *
+   * capturedAt 仍然收下并原样存：它是**显示龄期**用的，也是唯一能识破「离线很久的机器
+   * 把一份陈年快照推上来」的依据——超过 MAX_PUSH_AGE 一律不收。
    * @returns true 表示这份被采纳了
    */
   putLimits(limits, { machineId = null, at = Date.now() / 1000 } = {}) {
-    const cur = this.limits();
-    if (cur && (cur.capturedAt ?? 0) > (limits.capturedAt ?? 0)) return false;
+    const age = at - (limits.capturedAt ?? 0);
+    if (age > MAX_PUSH_AGE) return false;      // 陈年快照回放：那台机器离线太久，别拿它覆盖
     writeAtomic(this.limitsFile, { ...limits, machineId, receivedAt: at });
     return true;
   }

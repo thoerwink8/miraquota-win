@@ -94,14 +94,41 @@ test('identity is the installId, never the IP', async () => {
   assert.ok(Math.abs(p.windows.find((x) => x.label === '7d')?.spentUSD - 7) < 1e-9, '整份覆盖，不是累加');
 });
 
-test('a stale quota snapshot never overwrites a fresher one', async () => {
+test('a replayed ancient snapshot is refused, but ordinary clock skew is not', async () => {
   const hub = freshHub();
   await call(hub, 'PUT', '/limits', { body: LIMITS });
-  const old = { ...LIMITS, capturedAt: LIMITS.capturedAt - 600, windows: [{ ...LIMITS.windows[0], used: 1 }] };
-  const r = await call(hub, 'PUT', '/limits', { body: old });
-  assert.equal(r.body.accepted, false, '慢包后到 / 机器时钟不齐，旧数不能盖新数');
+  // 离线很久的机器上线后回放一份陈年快照：拦掉
+  const ancient = { ...LIMITS, capturedAt: NOW - 3600, windows: [{ ...LIMITS.windows[0], used: 1 }] };
+  assert.equal((await call(hub, 'PUT', '/limits', { body: ancient })).body.accepted, false);
+  assert.equal((await call(hub, 'GET', '/payload')).body.windows.find((x) => x.label === '7d').points.used, 100_000);
+
+  // 时钟慢几十秒的机器推的**新**读数必须收：实测本机比服务器慢 48 秒，按发送方时钟
+  // 排序会让它的新数长期被别人的旧数挡住，「随时同步」就成了「随那台钟快的机器」
+  const slowClock = { ...LIMITS, machineId: 'slow-box', capturedAt: NOW - 50, windows: [{ ...LIMITS.windows[0], used: 222_222 }] };
+  assert.equal((await call(hub, 'PUT', '/limits', { body: slowClock })).body.accepted, true);
   const { body: p } = await call(hub, 'GET', '/payload');
-  assert.equal(p.windows.find((x) => x.label === '7d').points.used, 100_000);
+  assert.equal(p.windows.find((x) => x.label === '7d').points.used, 222_222);
+  assert.equal(p.hub.limitsFrom, 'slow-box');
+});
+
+test('a server with no Mirasim never tells the user to go start Mirasim', async () => {
+  // 这句会经 hub-client 合并后印在用户面板上；服务器上本来就没有 Mirasim
+  const empty = freshHub();
+  assert.match((await call(empty, 'GET', '/payload')).body.detail, /还没有任何机器推过账号额度/);
+  // 刚过 STALE_AFTER（90 秒）：还在实测态，只是有点旧
+  const stale = freshHub();
+  await call(stale, 'PUT', '/limits', { body: { ...LIMITS, capturedAt: NOW - 300 } });
+  const d1 = (await call(stale, 'GET', '/payload')).body.detail;
+  assert.match(d1, /账号额度已 \d+ 分钟没人推新的/);
+  assert.doesNotMatch(d1, /接口/, '服务器这边没有「接口未回传」这回事');
+
+  // 超过 RECKON_AFTER（600 秒）：转推算态
+  const old = freshHub();
+  await call(old, 'PUT', '/limits', { body: { ...LIMITS, capturedAt: NOW - 590 } });
+  old.engine.last.at = NOW - 590 - 60;   // 把它推过 RECKON_AFTER，走推算分支
+  const d2 = (await call(old, 'GET', '/payload')).body.detail;
+  assert.match(d2, /没有机器推新的账号额度/);
+  assert.doesNotMatch(d2, /Mirasim 未运行/, '服务器不该叫用户去开一个它这里没有的东西');
 });
 
 test('writes need the token, health does not', async () => {

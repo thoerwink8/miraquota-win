@@ -625,7 +625,11 @@ export class Engine {
     if (pc) out.pointCost = pc;
     if (notice) out.accountNotice = notice;
     if (calibDropped > 0) out.calibDropped = calibDropped;
-    if (stale) out.detail = `接口已 ${Math.round(age / 60)} 分钟未回传，显示最后一次实测值`;
+    if (stale) {
+      out.detail = this.opts.noLocal
+        ? `账号额度已 ${Math.round(age / 60)} 分钟没人推新的，显示最后收到的那份`
+        : `接口已 ${Math.round(age / 60)} 分钟未回传，显示最后一次实测值`;
+    }
     return out;
   }
 
@@ -694,6 +698,10 @@ export class Engine {
         : remote.from.unmetered ? '账号不计量，额度上限不适用'
         : remote.from.degraded ? '上游降级运行中' : null;
       if (n) out.accountNotice = n;
+    } else if (this.opts.noLocal) {
+      // 服务端：那台机器上本来就没有 Mirasim，说「Mirasim 未运行」是在答非所问——
+      // 它等的是别的机器把额度推上来（这句会经 hub-client 合并后印在用户的面板上）。
+      out.detail = `没有机器推新的账号额度，按 ${ageText}前的快照推算`;
     } else {
       out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见`;
     }
@@ -719,9 +727,12 @@ export class Engine {
     const pcL = this.#pointCost(this.anchors.anchors, null);
     if (pcL) out.pointCost = pcL;
     out.measured = false;
-    out.detail = this.everConnected
-      ? '接口不可达且无窗口锚点，仅按本机滚动窗口统计支出'
-      : '未取到 Mirasim 的额度接口：确认 Mirasim 正在运行（首次连接需要它在线一次）。';
+    out.detail = this.opts.noLocal
+      // 服务端：它读不了 /v1/limits，也不该叫用户去开 Mirasim——要开的是别的机器
+      ? '还没有任何机器推过账号额度，只按已收到的账本统计支出'
+      : this.everConnected
+        ? '接口不可达且无窗口锚点，仅按本机滚动窗口统计支出'
+        : '未取到 Mirasim 的额度接口：确认 Mirasim 正在运行（首次连接需要它在线一次）。';
     return out;
   }
 
