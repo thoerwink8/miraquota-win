@@ -210,7 +210,8 @@ export class Engine {
     if (now - this.#syncKickedAt < this.sync.intervalSec) return;
     this.#syncKickedAt = now;
     this.#syncBusy = true;
-    this.sync.run(this.ledger, now)
+    const speed = this.#shardSpeed();
+    this.sync.run(this.ledger, now, speed ? { speed } : null)
       .then((r) => { if (r) this.ledger.adoptForeignShards(r.shards); })
       .catch(() => { /* run 自吞错误，这里兜底防未处理拒绝 */ })
       .finally(() => { this.#syncBusy = false; });
@@ -248,6 +249,17 @@ export class Engine {
 
   #speedRefresh() { if (this.speed) try { this.speed.refresh(); } catch { /* 忽略 */ } }
   #speedReport() { if (!this.speed) return null; try { return this.speed.report(); } catch { return null; } }
+
+  /**
+   * 随分片发出去的速度快照：别人要看「这台机器跑得多快」，只有这台机器答得了
+   * （账本分片是分钟桶，里面没有时长与 token 速率）。
+   * 只带 rows 与样本数——在途条目（inflightSince）到对面早就结束了，带过去只会显示假在途。
+   */
+  #shardSpeed() {
+    const r = this.#speedReport();
+    if (!r?.rows?.length) return null;
+    return { rows: r.rows, sampleTotal: r.sampleTotal ?? 0 };
+  }
 
   async #discoverChannelPort(processes) {
     const verify = async (p) => {
@@ -403,10 +415,10 @@ export class Engine {
       }
     }
     this.ledger.refresh();
+    this.#speedRefresh();   // 必须在 #maybeSync 之前：分片要带这一轮的速度，否则首轮发出去的是空速度
     await this.#warmShards();
     this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
     this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
-    this.#speedRefresh();
     return !!this.last;
   }
 

@@ -16,6 +16,8 @@ import { startFeed, Injector, FEED_LO, FEED_HI } from './lib/injector.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const POLL_MS = 15_000;
+// 无界面机器慢一档：它的产出是每 intervalSec 一次的分片，15 秒轮询只是白读账本。
+const SYNC_ONLY_POLL_MS = 60_000;
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes('--' + name);
@@ -28,6 +30,8 @@ if (flag('help') || flag('h')) {
   console.log(`用法 node miraquota-provider.mjs [选项]
 
   --once                取一次并打印，不起服务、不注入
+  --sync-only           无界面机器（Linux 服务器）用：只读本机账本并同步分片，
+                        不起 feed、不注入、不需要 Mirasim 调试端口
   --no-inject           只提供 feed，不做 CDP 注入
   --offline             强制离线（验证锚点推算路径）
   --cdp-port <N>        Mirasim 的调试端口（默认试 MIRAQUOTA_CDP_PORT、9333、9222）
@@ -109,6 +113,38 @@ if (flag('once')) {
   process.exit(engine.last || engine.anchors.usable ? 0 : 1);
 }
 
+/**
+ * 无界面机器（Linux 服务器）：这台机器上没有 Mirasim 界面可注入，也没人看 feed，
+ * 它存在的唯一理由是把本机账本与速度作为分片发出去，让有界面的那台看得见。
+ * 每轮只打一行现状——systemd journal 里能看出它活着、同步成没成。
+ */
+if (flag('sync-only')) {
+  const line = () => {
+    const p = engine.payload();
+    const sy = p.sync;
+    const spend = p.windows?.find((w) => w.label === '7d');
+    const parts = [`账本 ${p.buckets ?? 0} 分钟桶`];
+    // 支出是合并口径（本机 + 已读到的他机），不是这台机器自己花的——写「本机」会看错人
+    if (spend) parts.push(`7 天合计 $${(spend.spentUSD ?? 0).toFixed(2)}`);
+    parts.push(p.speed?.rows?.length ? `速度 ${p.speed.rows.length} 种模型` : '速度无样本');
+    parts.push(sy ? `同步 ${sy.state}${sy.error ? ' · ' + sy.error : ''} · 在场 ${sy.machines?.length ?? 0} 台`
+      : '同步未配置（写 ~/.miraquota/sync.json）');
+    return parts.join(' · ');
+  };
+  // 这台机器没人盯屏，日志只在现状变了时才写一行——journal 里留下的是事件，不是心跳噪音。
+  let last = '';
+  const tick = () => {
+    const s = line();
+    if (s !== last) { last = s; log(s); }
+  };
+  await engine.poll();
+  tick();
+  const timer = setInterval(() => engine.poll().then(tick).catch(() => {}), SYNC_ONLY_POLL_MS);
+  const bye = () => { clearInterval(timer); process.exit(0); };
+  process.on('SIGINT', bye);
+  process.on('SIGTERM', bye);
+} else {
+
 const { server, port: feedPort } = await startFeed({
   payload: () => engine.payload(),
   onQuit: () => shutdown(0),
@@ -136,3 +172,5 @@ function shutdown(code) {
 }
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
+
+}

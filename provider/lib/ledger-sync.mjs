@@ -405,15 +405,18 @@ export class LedgerSync {
    * 一轮同步：发布本机分片 + 读回全部外机分片，两条链分开记（发布成功只读取失败是中间态）。
    * 任何失败都不抛，只记入 lastError；上一轮读到的分片保留（远端临时不可达时合并口径不回退）。
    * 返回 status() 的全部字段外加 shards，功能关闭时返回 null。
+   * @param extras 附加到本机分片上的非账本块（当前只有 speed）；合并口径一个字节都不读它
    */
-  async run(ledger, nowSec = Date.now() / 1000) {
+  async run(ledger, nowSec = Date.now() / 1000, extras = null) {
     if (!this.enabled) return null;
     const firstLine = (e) => String(e.message || e).split('\n')[0].slice(0, 200);
     const inbox = this.mode === 'inbox';
     let err = null;
     try {
       if (!inbox) await this.#ensureRepo();
-      const shard = ledger.exportShard(this.machineId, nowSec, this.identity);
+      // extras 只供「看那台机器」的视角切换用，不参与合并：分片格式没变（schemaVersion 仍是 1），
+      // 老版本读到多出来的字段直接忽略，两代客户端可以混跑。
+      const shard = { ...ledger.exportShard(this.machineId, nowSec, this.identity), ...(extras ?? {}) };
       await retryOnce(() => (inbox ? this.#publishInbox(shard) : this.#publish(shard)), this.retryDelayMs);
       this.lastPublishSec = nowSec;   // 发布已成功，即使随后读取失败也算数
       this.pushOk = true;
@@ -460,6 +463,9 @@ export class LedgerSync {
         ...this.shards.map((s) => ({
           id: s.machineId, key: s.installId ?? s.machineId, account: s.account ?? null,
           lastShardSec: s.generatedAt, self: false,
+          // 那台机器自己的速度快照（v0.9.27 起随分片带上，最多落后一轮）。轻客户端与老版本
+          // 没有这块，字段就省略——界面据此决定给不给它「看这台」的入口。
+          ...(s.speed?.rows?.length ? { speed: s.speed } : {}),
         })),
       ],
       ...(this.autoJoined ? { autoJoined: true } : {}),

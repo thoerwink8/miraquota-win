@@ -146,6 +146,14 @@
   .model-main.open td.t::after { transform: rotate(90deg); }
   .task-row td { color: var(--ink3); font-size: 10.5px; padding: 2px 0; border: 0; }
   .task-row td:first-child { padding-left: 10px; }
+  /* 速度卡的机器切换条：胶囊同页签配色，但更小一号——它是卡内的次级控件，不该抢页签的分量 */
+  .speed-src { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .speed-src button {
+    border: 0; border-radius: 99px; padding: 2px 9px; cursor: pointer;
+    background: var(--track); color: var(--ink2); font: inherit; font-size: 10.5px; font-weight: 600;
+  }
+  .speed-src button:hover { color: var(--ink); }
+  .speed-src button.on { background: var(--accentbg); color: var(--accent); }
   .drift-up { color: var(--ok); }
   .drift-down { color: var(--bad); }
   .inflight { font-size: 11px; color: var(--accent); margin-top: 6px; }
@@ -166,6 +174,8 @@
   .sync-machine { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink2); margin-top: 4px; }
   .sync-machine .id { font-weight: 600; color: var(--ink); }
   .sync-machine .when { color: var(--ink3); }
+  .sync-machine .go { cursor: pointer; color: var(--ink2); font-weight: 600; }
+  .sync-machine .go:hover { color: var(--accent); }
   /* 用量紧跟机器名，和右侧的推送时间分属两栏——一眼看「谁花的」而不用横扫 */
   .sync-machine .use { margin-left: 8px; font-weight: 700; color: var(--accent); }
   /* 按人分组：组名一行，下面缩进列机器 */
@@ -248,6 +258,8 @@
       <div id="cards"><div class="empty">正在读取额度……</div></div>
       <div class="card" id="speedCard" style="display:none">
         <div class="head"><span class="label">速度</span><span class="sp" style="flex:1"></span><span class="label" id="speedNote"></span></div>
+        <!-- 机器切换条：只有别的机器也上报了速度时才出现（多机未启用的人看不到任何新东西） -->
+        <div class="speed-src" id="speedSrc" style="display:none"></div>
         <table id="speedRows"></table>
         <div class="inflight" id="inflight" style="display:none"></div>
       </div>
@@ -400,6 +412,14 @@
   $('foot').onclick = (e) => {
     if (e.target.closest('#footSync')) { tabRestored = true; switchTab('sync'); }
   };
+  // 多机页那行的「速度 →」：切到那台机器的视角并回总览。同样挂委托——机器行每轮重绘。
+  $('syncMachines').onclick = (e) => {
+    const go = e.target.closest('[data-speed]');
+    if (!go) return;
+    setSpeedView(go.dataset.speed);
+    tabRestored = true;
+    switchTab('main');
+  };
   restoreTab();
 
   // ---- 统计口径：pts（默认）| usd ----
@@ -419,6 +439,16 @@
 
   // 速度模型行展开态：按模型 id 记住，避免每秒 render 整表重建后立刻合上
   const openSpeedModels = new Set();
+
+  // 速度卡在看哪台机器：''＝本机，否则是那台机器的 key（installId）。
+  // 只活在这一次会话里，不落盘——重启后停在一张陈旧的他机快照上，比回本机更让人困惑。
+  let speedView = '';
+  function setSpeedView(key) {
+    if (key === speedView) return;
+    speedView = key;
+    openSpeedModels.clear();   // 换了机器，模型多半也换了，展开态跟着清
+    if (latest) render(latest);
+  }
 
   function fmtReset(t) {
     if (t == null) return '';
@@ -675,12 +705,33 @@
       ? `活跃口径：近 3 天 ${anyRate.exhaust.rate.activeHours3d.toFixed(1)} 小时，今天 ${anyRate.exhaust.rate.activeHoursToday.toFixed(1)} 小时。强度 = 账号消耗点数 ÷ 本机活跃小时（多机同用会抬高）。`
       : '';
 
-    const sp = p.speed;
+    // 速度视角：本机 + 每台随分片上报了速度的外机（v0.9.27）。
+    // 只有这张卡跟着切——额度点是账号级的，那三张卡在哪台机器看都是同一个数；
+    // 机器级的问题只有一个：那台机器在跑什么模型、多快。
+    const speedSources = [
+      { key: '', label: '本机', speed: p.speed, at: null },
+      ...(p.sync?.machines ?? [])
+        .filter((m) => !m.self && m.speed?.rows?.length)
+        .map((m) => ({ key: m.key ?? m.id, label: m.id, speed: m.speed, at: m.lastShardSec })),
+    ];
+    // 那台机器离场了就回本机，不留一张永远不再更新的空卡
+    if (!speedSources.some((s) => s.key === speedView)) speedView = '';
+    const src = speedSources.find((s) => s.key === speedView) ?? speedSources[0];
+    const sp = src.speed;
     const hasRows = sp && sp.rows && sp.rows.length;
     const hasInflight = sp && sp.inflightSince && sp.inflightSince.length;
-    $('speedCard').style.display = hasRows || hasInflight ? '' : 'none';
+    $('speedCard').style.display = hasRows || hasInflight || speedSources.length > 1 ? '' : 'none';
+    // 只有一台机器时不出现切换条：功能没启用的人界面零变化
+    $('speedSrc').style.display = speedSources.length > 1 ? '' : 'none';
+    if (speedSources.length > 1) {
+      $('speedSrc').innerHTML = speedSources.map((s) => `<button class="${s.key === speedView ? 'on' : ''}" data-k="${esc(s.key)}">${esc(s.label)}</button>`).join('');
+      $('speedSrc').querySelectorAll('button').forEach((b) => b.onclick = () => setSpeedView(b.dataset.k));
+    }
     if (hasRows) {
-      $('speedNote').textContent = `最近 ${sp.rows.length} 种`;
+      // 他机的数字是分片里的快照，最多落后一轮——不写清楚会被当成实时值
+      $('speedNote').textContent = src.key
+        ? `最近 ${sp.rows.length} 种 · ${src.at ? ago(src.at) + '的快照' : '快照'}`
+        : `最近 ${sp.rows.length} 种`;
       const alive = new Set(sp.rows.map((r) => r.model));
       for (const id of [...openSpeedModels]) if (!alive.has(id)) openSpeedModels.delete(id);
       $('speedRows').innerHTML = sp.rows.map((r, rowIndex) => {
@@ -705,7 +756,11 @@
         if (open) openSpeedModels.add(model); else openSpeedModels.delete(model);
         $('speedRows').querySelectorAll('.task-for-' + row.dataset.row).forEach((task) => { task.style.display = open ? '' : 'none'; });
       });
-    } else { $('speedRows').innerHTML = ''; openSpeedModels.clear(); }
+    } else {
+      $('speedRows').innerHTML = '';
+      openSpeedModels.clear();
+      $('speedNote').textContent = src.key ? '这台机器还没有速度样本' : '';
+    }
     $('inflight').style.display = hasInflight ? '' : 'none';
     if (hasInflight) {
       const oldest = Math.min(...sp.inflightSince);
@@ -756,9 +811,12 @@
         const expired = m.lastShardSec != null && m.lastShardSec < expiredBefore;
         const when = m.lastShardSec == null ? '尚未推送' : `${ago(m.lastShardSec)}推送`;
         const u = useOf(m.key ?? m.id);
+        // 上报了速度的机器给一个入口：点一下回总览看它的模型与 tok/s（v0.9.27）
+        const go = m.speed?.rows?.length && !m.self
+          ? `<span class="go" data-speed="${esc(m.key ?? m.id)}">速度 →</span>` : '';
         return `<div class="sync-machine${expired ? ' expired' : ''}${grouped ? ' grouped' : ''}">
           <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}${u ? `<span class="use">${amount(u.points, u.usd)}</span>` : ''}</span>
-          <span class="when">${when}${expired ? ' · 已过期' : ''}</span></div>`;
+          <span class="when">${go}${go ? ' · ' : ''}${when}${expired ? ' · 已过期' : ''}</span></div>`;
       };
       // 按人分组（收件口登录的机器带 account）；没登录的机器（git 通道）归「额度主人」
       const groups = new Map();

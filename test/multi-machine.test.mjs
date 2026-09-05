@@ -430,3 +430,32 @@ test('the enabled-model roster is checked against the price list', () => {
   assert.deepEqual(r.unpriced, ['kimi-k3']);
   assert.equal(readEnabledModels(new Pricing(join(tmp, 'no-cache.json')), join(tmp, 'missing.json')), null);
 });
+
+test('a machine ships its own speed snapshot so the other end can look at it', async () => {
+  const remote = join(tmp, 'speed-remote.git');
+  await git('init', '--bare', '--quiet', remote);
+  const T = 2_000_000;
+  const ledgerA = ledgerWith('spd-a', { buckets: {} });
+  const ledgerB = ledgerWith('spd-b', { buckets: {} });
+  const syncA = new LedgerSync({ configFile: syncConfig('spd-a', remote), repoDir: join(tmp, 'spd-a-repo'), machineId: 'spd-a' });
+  const syncB = new LedgerSync({ configFile: syncConfig('spd-b', remote), repoDir: join(tmp, 'spd-b-repo'), machineId: 'spd-b' });
+
+  const speed = { rows: [{ model: 'Opus 5', modelId: 'claude-opus-5', rate: 36, ttft: 2.4, endToEnd: 20, samples: 5, latestAt: T - 60, tasks: [] }], sampleTotal: 5 };
+  await syncB.run(ledgerB, T, { speed });
+  const ra = await syncA.run(ledgerA, T + 1);
+
+  // 分片带着速度过来，机器行上直接可读——界面据此给「看这台」的入口
+  const row = ra.machines.find((m) => m.id === 'spd-b');
+  assert.equal(row.speed.rows[0].model, 'Opus 5');
+  assert.equal(row.speed.rows[0].rate, 36);
+  // 本机那行不带 speed：本机速度走 payload.speed，重复一份只会撑大 payload
+  assert.equal(ra.machines.find((m) => m.self).speed, undefined);
+  // 合并口径不受影响：speed 不是账本，一个字节都不该进 spent
+  ledgerA.adoptForeignShards(ra.shards);
+  assert.equal(ledgerA.spent(T - 600, T + 600), 0);
+
+  // 没上报速度的机器（轻客户端、老版本）不出现该字段，界面就不给入口
+  await syncB.run(ledgerB, T + 700);
+  const ra2 = await syncA.run(ledgerA, T + 701);
+  assert.equal(ra2.machines.find((m) => m.id === 'spd-b').speed, undefined);
+});
