@@ -726,12 +726,16 @@
     // 速度视角：本机 + 每台随分片上报了速度的外机（v0.9.27）。
     // 只有这张卡跟着切——额度点是账号级的，那三张卡在哪台机器看都是同一个数；
     // 机器级的问题只有一个：那台机器在跑什么模型、多快。
-    const speedSources = [
-      { key: '', label: '本机', speed: p.speed, at: null },
-      ...(p.sync?.machines ?? [])
-        .filter((m) => !m.self && m.speed?.rows?.length)
-        .map((m) => ({ key: m.key ?? m.id, label: m.id, speed: m.speed, at: m.lastShardSec })),
-    ];
+    // 他机那份优先取**服务器**的（p.hub，随 SSE 实时推过来）；没有服务器时才退回本机
+    // 缓存的分片（p.sync，每 intervalSec 才拉一次，两层滞后叠起来能到二十分钟）。
+    // 服务器不认得「哪台是我」——它只收分片，自己那台靠本机 sync 里的 installId 认出来。
+    const selfKey = (p.sync?.machines ?? []).find((m) => m.self)?.key ?? null;
+    const foreign = p.hub?.machines?.length
+      ? p.hub.machines.filter((m) => m.key !== selfKey && m.speed?.rows?.length)
+        .map((m) => ({ key: m.key, label: m.id, speed: m.speed, at: m.generatedAt }))
+      : (p.sync?.machines ?? []).filter((m) => !m.self && m.speed?.rows?.length)
+        .map((m) => ({ key: m.key ?? m.id, label: m.id, speed: m.speed, at: m.lastShardSec }));
+    const speedSources = [{ key: '', label: '本机', speed: p.speed, at: null }, ...foreign];
     // 那台机器离场了就回本机，不留一张永远不再更新的空卡
     if (!speedSources.some((s) => s.key === speedView)) speedView = '';
     const src = speedSources.find((s) => s.key === speedView) ?? speedSources[0];

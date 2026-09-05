@@ -371,11 +371,15 @@ test('a cold start uses the shards fetched by the previous round, before any net
   // 而他机分片就躺在本地 sync-repo 里（--once 更是活不到第一轮同步完成）。
   const remote = join(tmp, 'cold.git');
   await git('init', '--bare', '--quiet', remote);
+  // cacheFile 必须注入：不注入就读到本机真实的 ~/.miraquota/inbox-shards.json，
+  // 那里面是这台机器此刻真在同步的分片，测试结果会随开发机的状态飘（实咬一次）。
   const a = new LedgerSync({
     configFile: syncConfig('cold-a', remote), repoDir: join(tmp, 'cold-a-repo'), machineId: 'a',
+    cacheFile: join(tmp, 'cold-a-cache.json'), inboxUrl: null,
   });
   const b = new LedgerSync({
     configFile: syncConfig('cold-b', remote), repoDir: join(tmp, 'cold-b-repo'), machineId: 'b',
+    cacheFile: join(tmp, 'cold-b-cache.json'), inboxUrl: null,
   });
   await a.run(ledgerWith('cold-a', { minutes: { 29000000: { usd: 3 } } }), 29000000 * 60);
   await b.run(ledgerWith('cold-b', { minutes: {} }), 29000000 * 60);
@@ -384,6 +388,7 @@ test('a cold start uses the shards fetched by the previous round, before any net
   // 新进程：不跑 run()，只装缓存——拿到的仍是 a 的分片
   const bRestarted = new LedgerSync({
     configFile: syncConfig('cold-b2', remote), repoDir: join(tmp, 'cold-b-repo'), machineId: 'b',
+    cacheFile: join(tmp, 'cold-b-cache.json'), inboxUrl: null,
   });
   assert.deepEqual(bRestarted.shards, [], '构造时不该自带分片');
   const cached = await bRestarted.loadCachedShards();

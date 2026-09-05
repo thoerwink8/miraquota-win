@@ -246,7 +246,10 @@ export class Engine {
     if (this.#syncBusy) return;
     const now = Date.now() / 1000;
     const limits = this.#shardLimits();
-    const every = limits ? this.sync.quotaIntervalSec : this.sync.intervalSec;
+    // hub 通道一律走快节奏：它是自己的服务器，一次小 JSON 的 PUT——600 秒那个默认值
+    // 是给 git force-push 定的价。压着它，别的机器看到的速度/账本就一直是十几分钟前的。
+    const every = (limits || this.sync.mode === 'hub')
+      ? this.sync.quotaIntervalSec : this.sync.intervalSec;
     if (now - this.#syncKickedAt < every) return;
     this.#syncKickedAt = now;
     this.#syncBusy = true;

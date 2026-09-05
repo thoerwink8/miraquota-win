@@ -4,7 +4,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -101,6 +101,17 @@ test('the client streams live updates and reconnects on its own', async () => {
 
   client.stop();
   await hub.close();
+});
+
+test('other machines speed comes from the server, this machine from itself', () => {
+  // 他机速度走服务器那份（SSE 实时）；本机那份永远是本机自己测的
+  const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
+  assert.ok(renderer.includes('p.hub?.machines?.length'), '有服务器就用服务器那份');
+  assert.ok(renderer.includes("(p.sync?.machines ?? []).find((m) => m.self)?.key"),
+    '服务器不认得哪台是我，自己那台靠本机 installId 剔除');
+  assert.match(renderer, /m\.key !== selfKey/);
+  // 没有服务器时退回本机缓存的分片，行为与从前一致
+  assert.ok(renderer.includes('m.lastShardSec'));
 });
 
 test('a wrong token leaves the panel on local data instead of blanking it', async () => {
