@@ -56,6 +56,15 @@ const CHANNEL_DEFAULT = 4970;
 const STALE_AFTER = 90;      // 秒；超过转 stale
 const RECKON_AFTER = 600;    // 秒；stale 超过此龄期转锚点推算
 const AUTOJOIN_EVERY = 3600; // 秒；未配置多机同步时，隔多久静默探一次默认仓能不能读
+/**
+ * 秒；hub 通道下「这台机器刚有新动静」时的最短发布间隔。
+ *
+ * 按固定节奏发有个说不通的地方：别人正盯着这台机器的速度看，而它这一秒刚跑完一个请求，
+ * 压着两分钟不发，对面读到的就是两分钟前的数——用户 2026-09-06 问的正是这个。
+ * 所以有新样本就早发，只留一个下限防抖（一串连续请求不至于变成一串 PUT）。
+ * 只对 hub 生效：git 通道每 15 秒来一次 force-push 是另一回事。
+ */
+const FAST_PUSH_FLOOR = 15;
 export const LEVELS = {
   exact: '精确', stale: '已过期', reckoned: '推算', local: '无数据', connecting: '连接中',
 };
@@ -175,6 +184,17 @@ export class Engine {
   #autoJoinAt = 0;
   #quotaPullBusy = false;
   #quotaPullAt = 0;
+  #lastStamp = null;
+
+  /**
+   * 「这台机器有没有新动静」的指纹：最新一次调用的时刻 + 账本分钟桶数。
+   * 只用来决定要不要早发一轮，不参与任何口径——指纹没变就说明这一轮发出去的东西
+   * 与上一轮逐字相同，那就没必要发。
+   */
+  #activityStamp(speed) {
+    const newest = (speed?.rows ?? []).reduce((a, r) => Math.max(a, r.latestAt ?? 0), 0);
+    return `${Math.round(newest)}|${this.ledger.bucketCount}`;
+  }
 
   /**
    * 没配置多机同步时，隔一阵静默探一次默认仓能不能读，能读就自己接上（见 ledger-sync）。
@@ -246,14 +266,19 @@ export class Engine {
     if (this.#syncBusy) return;
     const now = Date.now() / 1000;
     const limits = this.#shardLimits();
+    const speed = this.#shardSpeed();
     // hub 通道一律走快节奏：它是自己的服务器，一次小 JSON 的 PUT——600 秒那个默认值
     // 是给 git force-push 定的价。压着它，别的机器看到的速度/账本就一直是十几分钟前的。
     const every = (limits || this.sync.mode === 'hub')
       ? this.sync.quotaIntervalSec : this.sync.intervalSec;
-    if (now - this.#syncKickedAt < every) return;
+    const since = now - this.#syncKickedAt;
+    // 刚跑完一个请求就早发一轮（见 FAST_PUSH_FLOOR），别让盯着这台机器看的人读两分钟前的数
+    const stamp = this.#activityStamp(speed);
+    const nudged = this.sync.mode === 'hub' && stamp !== this.#lastStamp && since >= FAST_PUSH_FLOOR;
+    if (since < every && !nudged) return;
+    this.#lastStamp = stamp;
     this.#syncKickedAt = now;
     this.#syncBusy = true;
-    const speed = this.#shardSpeed();
     // hub 通道另发一份账号额度：服务器上没有 Mirasim，这份数据只有跑着它的机器送得上去。
     // 与分片分开发——一台机器账本推失败不该连带把全账号的额度也丢了。
     if (limits) this.sync.pushLimits(limits).catch(() => { /* pushLimits 自吞错误 */ });

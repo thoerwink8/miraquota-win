@@ -139,7 +139,11 @@ if (flag('sync-only')) {
   };
   await engine.poll();
   tick();
-  const timer = setInterval(() => engine.poll().then(tick).catch(() => {}), SYNC_ONLY_POLL_MS);
+  // hub 通道跟桌面同频（15 秒）：分片要「有新动静就早发」，而早发的机会只在 poll 里，
+  // 60 秒一轮就意味着别人最多晚一分钟才看得到这台机器刚跑完的请求。账本是增量扫的，
+  // 15 秒一次在服务器上不值一提。git / 收件口仍走 60 秒——那两条的发布本身就贵。
+  const pollMs = engine.sync?.mode === 'hub' ? POLL_MS : SYNC_ONLY_POLL_MS;
+  const timer = setInterval(() => engine.poll().then(tick).catch(() => {}), pollMs);
   const bye = () => { clearInterval(timer); process.exit(0); };
   process.on('SIGINT', bye);
   process.on('SIGTERM', bye);

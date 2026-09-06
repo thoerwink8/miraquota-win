@@ -114,6 +114,46 @@ test('other machines speed comes from the server, this machine from itself', () 
   assert.ok(renderer.includes('m.lastShardSec'));
 });
 
+test('a busy machine publishes early instead of sitting on fresh numbers', async () => {
+  const { Engine } = await import('../provider/lib/engine.mjs');
+  const hub = new Hub({ dataDir: join(tmp, 'nudge'), token: 'sekrit' });
+  const srv = await hub.listen(0);
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const cfg = join(tmp, 'nudge-sync.json');
+  writeFileSync(cfg, JSON.stringify({ hub: base, token: 'sekrit', intervalSec: 600 }));
+  const led = join(tmp, 'nudge-led.json');
+  writeFileSync(led, JSON.stringify({ schemaVersion: 2 }));
+
+  const e = new Engine({
+    forceOffline: true, noLocal: true, ledgerFile: led,
+    anchorFile: join(tmp, 'nudge-anchor.json'), settingsFile: join(tmp, 'nudge-set.json'),
+    syncOpts: { configFile: cfg, machineId: 'busy', installId: 'ffffffffffffffff', cacheFile: join(tmp, 'nudge-cache.json'), inboxUrl: null },
+  });
+  assert.equal(e.sync.mode, 'hub');
+  // 假速度模块：latestAt 一变就代表「刚跑完一个请求」
+  let latestAt = 1000;
+  e.speed = { refresh() {}, report: () => ({ rows: [{ model: 'Opus 5', latestAt, samples: 1 }], sampleTotal: 1 }) };
+
+  await e.poll();
+  const waitShard = async (want) => {
+    for (let i = 0; i < 100; i++) {
+      const s = hub.store.shards().find((r) => r.shard.machineId === 'busy');
+      if (s?.shard?.speed?.rows?.[0]?.latestAt === want) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return false;
+  };
+  assert.ok(await waitShard(1000), '首轮就该发一次');
+
+  // 节流窗（600 秒）远没到，但这台机器刚跑完一个请求 ⇒ 早发，别让对面读两分钟前的数
+  latestAt = 2000;
+  await new Promise((r) => setTimeout(r, 16_000));   // 越过 FAST_PUSH_FLOOR（15 秒）
+  await e.poll();
+  assert.ok(await waitShard(2000), '有新动静就该早发，不等 intervalSec');
+
+  await hub.close();
+});
+
 test('a wrong token leaves the panel on local data instead of blanking it', async () => {
   const hub = new Hub({ dataDir: join(tmp, 'auth'), token: 'w', readToken: 'r' });
   const srv = await hub.listen(0);
