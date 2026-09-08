@@ -1,5 +1,5 @@
 /**
- * Windows 会话令牌自动发现。
+ * 会话令牌自动发现（Windows 读 PEB，Linux 读 /proc）。
  *
  * 现行 Mirasim 的 `/v1/limits` 要求带会话令牌，令牌只存在于 Mirasim 拉起的会话进程
  * 环境变量里。两代约定并存：
@@ -8,8 +8,7 @@
  *  - 新版（0.0.257 起）：令牌并进 URL 路径 `http://127.0.0.1:<port>/<token>`，
  *    `ANTHROPIC_AUTH_TOKEN` 换成了上游凭据、对 /v1/limits 无效（实测 invalid x-api-key）。
  * 这里两种都带回去，由 engine 按「有路径用路径、没路径用头」组装请求。
- * macOS / Linux 用 `ps eww` 读得到；Windows 的 `Get-CimInstance` 不暴露
- * 进程环境，参考实现因此要求手工传令牌。
+ * Windows 的 `Get-CimInstance` 不暴露进程环境，参考实现因此要求手工传令牌。
  *
  * 这里改用 PEB 内存读取还原自动发现：`NtQueryInformationProcess` 取 PEB 基址，
  * 沿 `ProcessParameters → Environment` 读出目标进程的环境块。同用户、同完整性级别的
@@ -17,8 +16,16 @@
  *
  * 偏移量为 Win10/11 x64 标准布局：PEB+0x20 = ProcessParameters，
  * ProcessParameters+0x80 = Environment，+0x3F0 = EnvironmentSize。
+ *
+ * Linux（服务器那台）直接读 `/proc/<pid>/environ`：同用户的进程读得到，别人的读不到就
+ * 跳过，不用起 ps、不会截断。**这条不是可选优化**——服务器上也跑着 Mirasim，它读不到
+ * 令牌就读不到 `/v1/limits`，于是两处一起坏（实咬 2026-09-08）：账号额度只能等有界面
+ * 那台开着才刷新（那天 Windows 的 Mirasim 关了 25.5 小时，面板一直按旧快照推算），而
+ * `adoptScopedGroups` 只在收下 limits 时才开档位分桶，服务器烧掉的 fable 全落进
+ * `buckets` / `family:claude`、`scoped` 一个键都没有，于是 fable 卡主行恒为 $0。
  */
 import { execFile } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
 
 const PS_SCRIPT = String.raw`
 $ErrorActionPreference = 'SilentlyContinue'
@@ -70,11 +77,49 @@ foreach($procId in $targets){
 `;
 
 /**
+ * 一个进程的环境块 → { port, path, token }；不是 Mirasim 会话进程就是 null。
+ * 环境块是 NUL 分隔的（/proc/environ 原样，PEB 亦然），所以值的边界按空白与 NUL 断。
+ * @param block 整块环境文本
+ */
+export function parseSessionEnv(block) {
+  const url = String(block || '').match(/ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:(\d+)(\/[^\s\0]*)?/);
+  if (!url) return null;
+  const port = Number(url[1]);
+  if (!port) return null;
+  const path = url[2] ? url[2].replace(/\/+$/, '') : null;
+  const tok = String(block).match(/ANTHROPIC_AUTH_TOKEN=([^\s\0]+)/);
+  const token = tok ? tok[1] : null;
+  return (path || token) ? { port, path, token } : null;
+}
+
+/** Linux：扫 /proc 的环境块。读不到的（别人的进程、刚退出的 pid）静默跳过。 */
+function discoverViaProc() {
+  const out = [];
+  const seen = new Set();
+  let entries;
+  try { entries = readdirSync('/proc'); } catch { return out; }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue;
+    let block;
+    try { block = readFileSync(`/proc/${name}/environ`, 'utf8'); } catch { continue; }
+    if (!block.includes('ANTHROPIC_BASE_URL=')) continue;
+    const pair = parseSessionEnv(block);
+    if (!pair) continue;
+    const key = `${pair.port}${pair.path ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(pair);
+  }
+  return out;
+}
+
+/**
  * 返回 [{ port, path, token }]，来自本机 Mirasim 会话进程的环境。
  * `path` 是并在 URL 里的令牌路径（新版），`token` 是 header 令牌（旧版）；缺失为 null。
- * 非 Windows 或读取失败时返回空数组，由调用方退回 relay 帧口径。
+ * 平台不支持或读取失败时返回空数组，由调用方退回 relay 帧口径。
  */
 export function discoverSessionTokens() {
+  if (process.platform === 'linux') return Promise.resolve(discoverViaProc());
   if (process.platform !== 'win32') return Promise.resolve([]);
   return new Promise((resolve) => {
     execFile('powershell.exe',
