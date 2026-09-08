@@ -62,6 +62,11 @@ export class CostLedger {
     // 记下来的意义是让它在面板上有名有姓，而不是消失进「未同步机器」那条残差里。
     this.unpriced = {};
     this.unpricedBooked = {};  // 账目键 → 已计 token（回填变大补差额）
+    // 要单独分桶的档位组（fable）。**跟着状态文件落盘**：它本来只由 ingestLimits() 灌进来，
+    // 于是「这一轮读不到 /v1/limits」就等于「这一轮扫进来的钱不进档位桶」，而那些分钟桶
+    // 之后不会再扫第二遍——档位卡的主行永久缺这一段。读不到 limits 是常态而非异常：令牌
+    // 挂在**正在跑的会话进程**环境里，服务器上没人开会话的那几分钟就拿不到（2026-09-08
+    // 实咬的加长版：那台机器整整一天一个 fable 桶都没有）。学会一次就记住，别再靠运气。
     this.scopedGroups = [];
     this.gatewayScanned = {}; // 网关文件 → 上次 mtimeMs
     this.fullGatewayScanDone = false;
@@ -94,6 +99,7 @@ export class CostLedger {
       this.seen = p.seen ?? {};
       this.booked = p.booked ?? {};
       this.scopedSince = p.scopedSince ?? {};
+      this.scopedGroups = Array.isArray(p.scopedGroups) ? p.scopedGroups : [];
       this.unpriced = p.unpriced ?? {};
       this.unpricedBooked = p.unpricedBooked ?? {};
       if ((p.schemaVersion ?? 1) < STATE_SCHEMA) {
@@ -110,21 +116,29 @@ export class CostLedger {
         schemaVersion: STATE_SCHEMA,
         cursors: this.cursors, buckets: this.buckets, scoped: this.scoped, family: this.family,
         familyBooked: this.familyBooked, familyLatest: this.familyLatest,
-        seen: this.seen, booked: this.booked, scopedSince: this.scopedSince,
+        seen: this.seen, booked: this.booked,
+        scopedSince: this.scopedSince, scopedGroups: this.scopedGroups,
         unpriced: this.unpriced, unpricedBooked: this.unpricedBooked,
       }));
     } catch { /* 落盘失败不阻断 */ }
   }
 
-  /** 声明需要单独分桶的模型档位组（`7d_fable` → `fable`）。 */
+  /**
+   * 声明需要单独分桶的模型档位组（`7d_fable` → `fable`）。
+   *
+   * 空集不覆盖：调用方给不出组，可能是账号真没档位窗，也可能只是这一轮读不到
+   * `/v1/limits`——两者在这里分不开，而猜错的代价不对称。当成「没有档位」的后果是
+   * 这一轮扫进来的分钟桶永久缺档位归属（桶不会重扫）；当成「不知道」只是多留几个
+   * 没人查的桶。所以宁可留着上次学到的那份。
+   */
   adoptScopedGroups(groups) {
-    const norm = [...new Set(groups.map((g) => g.toLowerCase()).filter(Boolean))].sort();
+    const norm = [...new Set((Array.isArray(groups) ? groups : []).map((g) => g.toLowerCase()).filter(Boolean))].sort();
+    if (!norm.length) return;
     if (norm.join(',') === this.scopedGroups.join(',')) return;
     this.scopedGroups = norm;
     const nowMin = Math.floor(Date.now() / 60000);
-    let dirty = false;
-    for (const g of norm) if (this.scopedSince[g] == null) { this.scopedSince[g] = nowMin; dirty = true; }
-    if (dirty) this.#save();
+    for (const g of norm) if (this.scopedSince[g] == null) this.scopedSince[g] = nowMin;
+    this.#save();   // 组本身也要落盘：读不到 limits 的那几轮全靠它才不漏桶
   }
 
   /** 该组分桶是否已覆盖到给定时刻。未覆盖时其支出偏低，展示需据此让位。 */
