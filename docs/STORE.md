@@ -154,8 +154,15 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
 8. **测试盯住上面每一条**：`test/store.test.mjs`（11 条库的契约）+ `test/store-cli.test.mjs`
    （2 条整条迁移路径的契约：导入→对账→任务→保留→打包，幂等与总额守恒都在里面）。
 
-## 还没做的（Phase 2/3）
+## 迁移进度
 
-- Phase 2：`Engine` 改用 `UsageStore`（payload 形状不变，界面零改动）；hub 加 `PUT /journal`；
-  `calibration`/`points-attrib`/`anchors` 收进库。
-- Phase 3：删 git 通道与 `gh` 依赖；收件口按流水块收发；任务/工作区报表进界面。
+- ✅ **Phase 1**：`store.mjs` / `sources.mjs` / 迁移工具 / 本机与 VPS 全流程导入 / 契约测试。
+- ✅ **Phase 2a**：`Engine` 已改用 `JournalLedger`（= SQLite 流水账 + 旧账本那套接口）。
+  payload 形状没变、界面零改动，145 条既有测试全绿。`ledger.json` 从此只是历史文件
+  （不再读写，留着回滚与人工比对用）。
+- ⏳ **Phase 2b**：标定（`points`/`marks`）与点数归因、锚点收进库。现在仍写各自的 JSON。
+- ⏳ **Phase 2c**：hub 加 `PUT /journal` 收流水增量（此后 hub 手里是全账号流水，
+  任务级报表与逐点对账都在它上面出）。现在仍走旧的分片协议——但分片已由**流水**导出，
+  所以推出去的是去重后的数。
+- ⏳ **Phase 3**：删 git 通道与 `gh` 依赖（实测 333 KB/10 分钟 = 47 MB/天/机的提交量）；
+  收件口按流水块收发；任务/工作区报表进界面。

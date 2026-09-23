@@ -10,12 +10,12 @@
  */
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 
 import { Pricing } from './pricing.mjs';
-import { CostLedger } from './ledger.mjs';
-import { LedgerSync, DEFAULT_INBOX, DEFAULT_HUB } from './ledger-sync.mjs';
+import { JournalLedger } from './journal-ledger.mjs';
+import { LedgerSync, DEFAULT_INBOX, DEFAULT_HUB, cleanMachineId } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
@@ -167,6 +167,8 @@ export class Engine {
    * @param opts.calibratorFile 标定采样路径（默认 ~/.miraquota/calibration.json）
    * @param opts.noLocal     不扫本机 transcript 与网关账本。服务端 hub 用：那台机器上
    *   没有任何人的会话记录，账本全部来自各机推上来的分片，扫本地只是白跑一趟。
+   * @param opts.storeFile  流水库落点（默认 ~/.miraquota/store.db；给了 ledgerFile 就跟着它
+   *   换个扩展名，测试注入的老参数照旧管用）
    *
    * **路径注入要覆盖每一个会落盘的模块。** 少一个，测试就会去改真机的状态：2026-09-23
    * 实咬过一次——quota-share 那条测试用默认路径跑 poll()，而账本正好在这一版升级 schema，
@@ -175,7 +177,14 @@ export class Engine {
   constructor(opts = {}) {
     this.opts = opts;
     this.pricing = new Pricing();
-    this.ledger = new CostLedger(this.pricing, opts.ledgerFile);
+    // 账本换成 SQLite 流水账（JournalLedger 实现的是旧账本那套接口，所以别处一行都不用改）。
+    // ledger.json 从此只是历史文件：不再读写，留着是给回滚和人工比对用。
+    this.ledger = new JournalLedger({
+      file: opts.storeFile ?? (opts.ledgerFile ? String(opts.ledgerFile).replace(/\.json$/, '') + '.db' : undefined),
+      machine: opts.syncOpts?.machineId ?? cleanMachineId(hostname()),
+      pricing: this.pricing,
+      home: opts.home,
+    });
     this.pointsAttrib = new PointsAttributor(opts.attribFile);
     this.calibrator = new Calibrator(opts.calibratorFile);
     this.anchors = new AnchorStore(opts.anchorFile);

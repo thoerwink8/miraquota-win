@@ -41,7 +41,7 @@ import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { BUILTIN, FAMILY } from './pricing.mjs';
+import { BUILTIN, FAMILY, Pricing } from './pricing.mjs';
 import { familyLabel, modelFamily } from './model-families.mjs';
 
 /**
@@ -313,7 +313,9 @@ export class UsageStore {
         ins.run(
           kh, r.src, r.side ?? (r.src === 't' ? 't' : 'g'), ts, Math.floor(ts / 3600), dayInt(ts),
           r.sid ? this.dimId('session', r.sid) : 0,
-          r.model ? this.dimId('model', r.model) : 0,
+          // 模型名归一化（剥掉 `[1m]` 这类上下文后缀）：`claude-opus-5[1m]` 与 `claude-opus-5`
+          // 是同一个模型同一份价，进同一个维度，否则报表里会分裂成两行（旧账本同样归一化）。
+          r.model ? this.dimId('model', Pricing.normalize(r.model)) : 0,
           this.dimId('machine', r.machine ?? this.machine),
           r.effort ? this.dimId('effort', r.effort) : 0,
           r.ws ? this.dimId('ws', r.ws) : 0,
@@ -513,6 +515,10 @@ export class UsageStore {
     const norm = (d) => (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) ? Number(d.replace(/-/g, '')) : d);
     const day = norm(beforeDay) ?? (keepDetailDays != null ? dayInt(Date.now() / 1000 - keepDetailDays * 86400) : null);
     if (!day) throw new Error('prune 需要 beforeDay（YYYY-MM-DD 或 YYYYMMDD）或 keepDetailDays');
+    // 早退：refresh() 每 15 秒调一次 prune，而绝大多数时候没有过期的明细可汇。
+    // 用 day 索引取最早一天比"先分组数一遍"便宜几个数量级。
+    const oldest = this.db.prepare('SELECT MIN(day) d FROM calls').get().d;
+    if (oldest == null || oldest >= day) return { rolled: 0, deleted: 0 };
     const rolled = this.db.prepare(`SELECT COUNT(*) n FROM (
       SELECT 1 FROM calls WHERE day < ? GROUP BY hour, machine, model, sess, ws, src, side, priced, billable)`).get(day).n;
     this.db.exec('BEGIN');

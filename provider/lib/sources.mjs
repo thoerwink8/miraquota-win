@@ -100,14 +100,17 @@ export function* transcriptRows({ root, cutoff, pricing, machine = null, cursors
     if (size <= from) continue;
     const text = readRange(path, from, size);
     if (!text) continue;
-    let start = 0, nl;
+    let start = 0, nl, consumed = 0;
     while ((nl = text.indexOf('\n', start)) >= 0) {
       const line = text.slice(start, nl);
-      start = nl + 1;
+      start = nl + 1; consumed = start;
       if (!line.includes('"usage"')) continue;
       const row = transcriptLine(line, { cutoff, pricing, machine });
       if (row) yield row;
     }
+    // 游标只影响性能（主键会把重读挡掉），所以这里就地更新、由调用方决定要不要落盘。
+    // 只记到最后一个完整行：半行留在下次读。
+    if (cursors) cursors[path] = { size, offset: from + Buffer.byteLength(text.slice(0, consumed), 'utf8') };
   }
 }
 

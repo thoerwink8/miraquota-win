@@ -170,7 +170,7 @@ test('a fully injected engine writes nothing into the default state dir', () => 
     env: { ...process.env, HOME: home, USERPROFILE: home }, timeout: 60_000, windowsHide: true,
   });
 
-  assert.ok(existsSync(join(work, 'ledger.json')), '注入的那份账本要真写出来，否则这条测试是空转');
+  assert.ok(existsSync(join(work, 'ledger.db')), '注入的那份流水库要真写出来，否则这条测试是空转');
   assert.ok(existsSync(join(work, 'calibration.json')), '标定采样同理');
   assert.equal(existsSync(join(home, '.miraquota')), false,
     '默认状态目录被碰了——有模块没走路径注入，测试正在改真机状态');
