@@ -253,15 +253,31 @@ export class JournalLedger {
       fold(r.model, r.minute, r.usd);
     }
     // 外机分片折进同一套索引（合并口径）。分片的键是「模型|分钟」/「组|分钟」这种。
+    //
+    // **明细覆盖到的 (机器, 分钟) 上不再折分片**：两者记的是同一批美元。一台机器先只推分片、
+    // 后来又推流水之后，不这么做它的钱会在账号合计里出现两遍——2026-09-23 实咬：hub 上
+    // VPS 的 $1.81 同时来自它的流水和它的分片，7 天合计因此从 $120.07 变 $121.88。
+    // 只按机器整台跳过是不对的（那样「推了流水但只推了一小段」的机器会丢掉分片里其余的部分），
+    // 所以按 (机器, 分钟) 逐格让位。
+    const covered = new Set();
+    for (const r of this.store.db.prepare(`SELECT m.name machine, c.ts / 60 minute
+      FROM calls c JOIN dims m ON m.id = c.machine GROUP BY m.name, minute`).all()) {
+      covered.add(`${r.machine}\u0000${r.minute}`);
+    }
     for (const s of this.foreignShards) {
+      const hit = (minute) => covered.has(`${s.machineId}\u0000${minute}`);
       const walk = (obj, kind) => {
         for (const [k, v] of Object.entries(obj ?? {})) {
           const usd = Number(v) || 0;
           if (!usd) continue;
-          if (kind === 'buckets') { const m = Number(k); if (Number.isFinite(m)) total.set(m, (total.get(m) ?? 0) + usd); continue; }
+          if (kind === 'buckets') {
+            const m = Number(k);
+            if (Number.isFinite(m) && !hit(m)) total.set(m, (total.get(m) ?? 0) + usd);
+            continue;
+          }
           const cut = k.lastIndexOf('|');
           const minute = Number(k.slice(cut + 1));
-          if (!Number.isFinite(minute)) continue;
+          if (!Number.isFinite(minute) || hit(minute)) continue;
           const name = k.slice(0, cut);
           if (kind === 'models') bump(models, name, minute, usd);
           else if (kind === 'family') bump(families, name, minute, usd);

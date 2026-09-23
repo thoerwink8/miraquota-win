@@ -258,3 +258,37 @@ test('the hub ingests journal rows: merged across machines, idempotent on re-pus
   assert.equal(noToken.status, 401, '写接口一律要 token');
   await hub.close();
 });
+
+/**
+ * 分片与流水覆盖同一批美元：一台机器两样都推时，只能算一次。
+ * 2026-09-23 实咬：VPS 推上流水之后，hub 的 7 天合计从 $120.07 变成 $121.88——多出来的
+ * $1.81 正是它自己那条流水的钱，分片里已经有过一遍。
+ */
+test('a machine that pushes both a shard and its journal is counted once', async () => {
+  const hub = freshHub();
+  const min = Math.floor(NOW / 60);
+  const usd = 4;
+
+  // ① 只有分片的机器照旧算（这是今天唯一推得动的那类机器，不能被这条修法顺手丢掉）
+  await call(hub, 'PUT', '/shard', {
+    body: { ...shardV1('shard-only', 'cccccccccccccccc', usd), buckets: { [min]: usd } },
+  });
+  // ② 分片 + 流水都推的机器：流水那一笔盖住同一分钟
+  await call(hub, 'PUT', '/shard', {
+    body: { ...shardV1('both', 'dddddddddddddddd', usd), buckets: { [min]: usd } },
+  });
+  await call(hub, 'PUT', '/journal', {
+    body: {
+      machineId: 'both',
+      rows: [{
+        kh: '999', ts: min * 60 + 5, src: 'g', side: 'g', model: 'claude-opus-5',
+        i: 1000, o: 0, cr: 0, cw: 0, usd, priced: 1, billable: 1,
+      }],
+    },
+  });
+
+  const { body: p } = await call(hub, 'GET', '/payload');
+  assert.equal(p.windows.find((x) => x.label === '7d').spentUSD, usd * 2,
+    'shard-only $4 + both $4（流水盖住分片的同一分钟，只算一次）——不是 $12');
+  await hub.close();
+});
