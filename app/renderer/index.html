@@ -540,30 +540,33 @@
       if (elapsedDays >= 0.5) subBits.push(`日均 ${fmtK(w.points.used / elapsedDays)} 点`);
       if (w.scaledSpentUSD != null) subBits.push(`账号折算 ≈${money(w.scaledSpentUSD)}`);
     } else {
-      // 美元口径：主行放**精确值**——本机账本 token × 官方价直接求和（全家族合计），
-      // 与 Mirasim「流量监控 → 估算成本」列同源可逐笔核对，零推断。
-      // 「满额/余」由汇率反推，属推断值，一律带 ≈ 并降到副行（用户 2026-08-28 指出主次颠倒）。
-      mainText = money(w.spentUSD ?? 0);
-      mainTitle = '本机账本实际花费：token × API 价直接求和（全家族合计）';
-      // 主行「/ 之后」直接摆两个满额口径——那个位置原先重复了右侧的百分比徽章
-      // （用户 2026-08-28 指出重叠且该位置应给满额）。
-      // 满额只给一个数（2026-09-02）：原来并排「官≈/预≈」两个口径，改成总额比值后
-      // 两者只差 fable 折算，摆两个数只会让人问哪个对。中位数退到 tooltip 当保守参考。
+      // 美元口径：**主行必须与进度条同源**——进度条、百分比、满额、余全是官方点数算的，
+      // 而主行原来是「本机账本」，两个来源并排摆，用户只会得出「这软件算错了」
+      // （2026-09-23 用户：「$256，但进度条和实际这么多」）。所以主行改成
+      // 官方点数 × 汇率（= scaledSpentUSD），四个数从此是同一件事的四个面；
+      // 账本那个数不丢，退到副行并**标明口径不同**（它是本机真实花费，不含账号级用量）。
+      const officialUsed = w.scaledSpentUSD;
+      mainText = money(officialUsed ?? w.spentUSD ?? 0);
+      mainTitle = officialUsed != null
+        ? '账号级已用：官方额度点 × 汇率（÷100），与进度条、百分比、满额、余同一个来源'
+        : '本机账本实际花费：token × API 价直接求和（这一帧没有官方点数，只能给这个）';
       fullText = w.fullUSD != null ? ` / <span class="tag">满额</span><b>${money(w.fullUSD, 0)}</b>` : ' / 满额标定中';
       const infer = [];
       if (w.remainingUSD != null) infer.push(`余 <b>${money(w.remainingUSD, 0)}</b>`);
-      if (w.scaledSpentUSD != null) infer.push(`账号级已用 <b>${money(w.scaledSpentUSD)}</b>`);
       remainText = infer.length ? `推算 ${infer.join(' · ')}` : '';
       fullTitle = '满额 = 官方预算点 ÷ 100' + (w.modelGroup ? ' ÷ 档位倍率（该档位真能花掉的 API 用量）' : '')
         + (w.conservativeUSD != null ? ` · 保守估计（分段单价中位数）${money(w.conservativeUSD, 0)}` : '')
         + ' · 非云端账单';
       subBits = w.points ? [`${Math.round(w.points.used).toLocaleString()}/${fmtK(w.points.budget)} 点`] : [];
-      // 折算后支出与满额同口径（点数口径）；主行的账本原值是真实花费，两者差的就是 fable 的额外扣点。
-      // 不摆这个数，用户会拿 $426 去比 $5580 得出「才用了 7.6%」，而官方计数器是 11.6%。
-      if (w.weightedSpentUSD != null) {
+      // 账本数只作对照，且必须说清它**不是**上面那几个数的来源：它是本机的真实花费，
+      // 账号级已用里还含这些机器之外的用量（浏览器/别的客户端），两者天然不等。
+      if (officialUsed != null) {
+        subBits.push(`<span title="本机账本：token × API 价直接求和（可逐笔核对）。它与「账号级已用」不是同一个量——后者是账号点数换算，含这些机器之外的用量">本机账本 <b>${money(w.spentUSD ?? 0)}</b></span>`);
+      }
+      if (w.weightedSpentUSD != null && officialUsed == null) {
         subBits.push(`<span title="账本 ${money(w.spentUSD ?? 0)} 按档位倍率折算后的点数口径花费，与满额同口径">折算 <b>${money(w.weightedSpentUSD)}</b></span>`);
       }
-      if (elapsedDays >= 0.5) subBits.push(`日均 ${money((w.spentUSD ?? 0) / elapsedDays)}`);
+      if (elapsedDays >= 0.5) subBits.push(`日均 ${money((officialUsed ?? w.spentUSD ?? 0) / elapsedDays)}`);
     }
 
     return `<div class="card">

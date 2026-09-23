@@ -107,6 +107,19 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /lastShardSec/);
 });
 
+test('美元主行必须与进度条同源，账本数退到副行并标注', () => {
+  // 2026-09-23 用户：「$256，但进度条和实际这么多」。根子是两个来源并排摆：
+  // 进度条/百分比/满额/余都是**官方点数**算的，而主行是**本机账本**——用户只会读成「算错了」。
+  // 钉住：主行 = 官方点数 × 汇率（scaledSpentUSD），账本数降到副行且写明口径不同。
+  // 两个显示面（桌面面板 + 内嵌 widget）必须一致，不许一个讲一套。
+  assert.match(renderer, /const officialUsed = w\.scaledSpentUSD;/);
+  assert.match(renderer, /mainText = money\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+  assert.match(renderer, /本机账本 <b>/);
+  assert.match(widget, /const officialUsed = w\.scaledSpentUSD;/);
+  assert.match(widget, /usd\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+  assert.match(widget, /'本机账本 ' \+ usd/);
+});
+
 test('每个模型的实测倍率都要报，且每个模型用它自己那个池当计数器', () => {
   // 「哪个模型对不上」是整窗比值答不了的。2026-09-23 实查两轮：
   //  ① 只报配置过的组（fable）时，本机最大那笔 claude-opus-5 完全看不见；

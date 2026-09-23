@@ -919,11 +919,12 @@
       // 三张卡的序号都取不到，错峰就退化成同时出现。
       setVar(c.el, '--i', String(i));
       setText(c.wl, winTitle(w.label));
-      // 主行放精确值（本机账本 token × 官方价直接求和，可与 Mirasim 流量监控逐笔核对）；
-      // 满额给出两个口径对照：官方点数反推与本机账本预测。与桌面面板保持同一套信息层级，
-      // 两个显示面不各讲一套（用户 2026-08-28 要求内嵌与桌面端一致）。
-      const headPoints = w.spentUSD == null && w.points;
-      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(w.spentUSD ?? 0));
+      // 主行必须与进度条同源（2026-09-23 与桌面面板同步改）：进度条、百分比、满额、余全是
+      // 官方点数算的，主行原来是本机账本——两个来源并排摆，用户只会得出「这软件算错了」。
+      // 所以主行给「官方点数 × 汇率」（= scaledSpentUSD），账本数退到副行并标明口径不同。
+      const officialUsed = w.scaledSpentUSD;
+      const headPoints = officialUsed == null && w.spentUSD == null && w.points;
+      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(officialUsed ?? w.spentUSD ?? 0));
       // 满额只给一个数（2026-09-02，与桌面面板同步）：原来的「官≈/预≈」两口径在
       // 改用总额比值后只差 fable 折算，摆两个数只会让人问哪个对。
       setText(c.full, w.fullUSD != null ? '/ 满额 ' + usd(w.fullUSD) : '/ 满额标定中');
@@ -955,8 +956,9 @@
       setTick(c.right, w.resetAt ? countdown(w.resetAt - now) : '无固定重置');
 
       const bits = [];
-      if (w.scaledSpentUSD != null) bits.push('账号级 ≈' + usd(w.scaledSpentUSD));
       if (w.points) bits.push(`${kilo(w.points.used)}/${kilo(w.points.budget)} 点`);
+      // 账本数只作对照，并说清它**不是**上面那几个数的来源（它是本机真实花费）。
+      if (officialUsed != null) bits.push('本机账本 ' + usd(w.spentUSD ?? 0));
       setText(c.sub, bits.join(' · '));
       setHidden(c.sub, !bits.length);
 
