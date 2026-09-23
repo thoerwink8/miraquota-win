@@ -106,3 +106,18 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /已过期/);
   assert.doesNotMatch(widget, /lastShardSec/);
 });
+
+test('the three dollar-trust alarms name the culprit and say what to do about it', () => {
+  // 2026-09-22：这三条都是「静默成功」型的偏差——价目兜底猜、transcript 漏账、外机分片旧
+  // 口径。每一条的表现都只是一个偏了的美元数，用户无从解释，所以必须点名 + 给动作；
+  // 只写「可能有偏差」等于没写。引擎侧也要真的产出这三个字段，否则界面这几段永不触发。
+  assert.match(renderer, /p\.guessedPrices\?\.length/);
+  assert.match(renderer, /补进内置表/);
+  assert.match(renderer, /p\.sourceGaps\?\.length/);
+  assert.match(renderer, /~\/\.claude\/projects/);
+  assert.match(renderer, /p\.staleShards\?\.length/);
+  assert.match(renderer, /升到本版并让它重建账本/);
+  assert.match(engine, /guessedPrices: guessed/);
+  assert.match(engine, /sourceGaps: gaps\.slice/);
+  assert.match(engine, /staleShards: stale/);
+});

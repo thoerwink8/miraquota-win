@@ -929,6 +929,22 @@
         ? `<b>价目</b> 已启用模型中<b>无价</b>：${p.roster.unpriced.map(esc).join('、')}——用到它们账本只记 token，不记美元`
         : `<b>价目</b> Mirasim 已启用的 ${p.roster.models.length} 个模型都有价`);
     }
+    // 猜来的价会静默把美元算偏（缓存读这一列各代差好几倍），所以要点名而不是只记日志
+    if (p.guessedPrices?.length) {
+      st2.push(`<b>价目猜的</b> ${p.guessedPrices.map((g) => `${esc(g.model)}→按 ${esc(g.via)} 记`).join('、')}`
+        + '——官方价目核对后补进内置表，否则这些模型的美元是估的');
+    }
+    // 美元只认 transcript；网关看到得更多就说明 transcript 漏了（换过 HOME、SDK 起的会话不写会话文件）
+    if (p.sourceGaps?.length) {
+      st2.push(`<b>来源对账</b> 近 24h 网关看到的花费多于 transcript：`
+        + p.sourceGaps.map((g) => `${esc(g.model)} 网关 ${money(g.gatewayUSD)} vs 账本 ${money(g.transcriptUSD)}`).join('、')
+        + '——账本这部分偏低，查这些会话的 transcript 在不在 ~/.claude/projects');
+    }
+    // 旧版分片里的美元是双计过的（拆不开），合并口径会把这份虚高算进账号总数
+    if (p.staleShards?.length) {
+      st2.push(`<b>分片口径旧</b> ${p.staleShards.map(esc).join('、')} 推上来的账本还是旧版（Claude 美元虚高）`
+        + '——把那台升到本版并让它重建账本，否则账号合计一直偏');
+    }
     $('specState').innerHTML = st2.join('<br>');
     renderPointCost(p.pointCost);
   }
@@ -982,11 +998,22 @@
     if (!cfgReady) { $('fableRatio').value = fable.ratio; cfgReady = true; }   // 别打断正在输入的用户
     // 实测给不出有两种原因，说法必须分开：没连上（等 Mirasim 起来就有）和样本薄（等用量）。
     // 早先一律说「样本还不够」，而真实原因往往是 Mirasim 没在跑——用户据此以为是「最近没用 fable」。
-    $('fableMeasured').textContent = fable.measured
-      ? `（本机实测 ${fable.measured.toFixed(2)}×：非 fable 单价 ÷ fable 单价，两个数各出自一个官方计数器）`
-      : latest?.measured === false
+    // 实测值按模型逐行给：fable-5 与 fable-5-1 的倍率是两个数，一个组值代表不了它们
+    // （用户 2026-09-22：「fable5.1 和 fable5 的倍率一直算不准」——一半的锅在这个粒度上）。
+    if (!fable.measured) {
+      $('fableMeasured').textContent = latest?.measured === false
         ? '（Mirasim 未运行，实测倍率暂不可给；下面这个设置照常生效）'
-        : '（样本还不够，实测倍率暂不可给）';
+        : '（样本还不够，实测倍率暂不可给：要有「这一段只有一个模型在花钱」的采样段）';
+      return;
+    }
+    const conf = { high: '高置信', medium: '收敛中', low: '标定中' };
+    const rows = (fable.models ?? []).map((m) =>
+      `${m.model} <b>${m.measured.toFixed(2)}×</b>（${m.segments} 段 · ${money(m.usd)} · ${conf[m.confidence] ?? m.confidence}）`);
+    const head = `（本机实测 <b>${fable.measured.toFixed(2)}×</b>：官方点数增量 ÷ 同一瞬间的账本美元 ÷ 100，取各段中位）`;
+    const split = fable.agree === false
+      ? '<br>⚠ 组内两款量出的倍率不一样——这一个设置值对它们来说是个混合值，按主要在用的那款填。'
+      : '';
+    $('fableMeasured').innerHTML = head + (rows.length ? '<br>' + rows.join('<br>') : '') + split;
   }
   $('btnRatio').onclick = async () => {
     const ok = await window.miraquota.setPointCost?.('fable', Number($('fableRatio').value));

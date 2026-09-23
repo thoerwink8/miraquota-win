@@ -164,7 +164,7 @@ test('the store forgets machines that stopped reporting', () => {
 });
 
 test('a real client pushes over HTTP and reads the others back', async () => {
-  const { CostLedger } = await import('../provider/lib/ledger.mjs');
+  const { CostLedger, STATE_SCHEMA } = await import('../provider/lib/ledger.mjs');
   const { LedgerSync } = await import('../provider/lib/ledger-sync.mjs');
   const { writeFileSync } = await import('node:fs');
 
@@ -176,7 +176,7 @@ test('a real client pushes over HTTP and reads the others back', async () => {
     const cfg = join(tmp, `${name}-sync.json`);
     writeFileSync(cfg, JSON.stringify({ hub: base, token: 'sekrit', intervalSec: 600 }));
     const led = join(tmp, `${name}-led.json`);
-    writeFileSync(led, JSON.stringify({ schemaVersion: 2, buckets: { [MIN]: usd } }));
+    writeFileSync(led, JSON.stringify({ schemaVersion: STATE_SCHEMA, buckets: { [MIN]: usd } }));
     return {
       sync: new LedgerSync({ configFile: cfg, repoDir: join(tmp, `${name}-repo`), machineId: name, installId, cacheFile: join(tmp, `${name}-cache.json`) }),
       ledger: new CostLedger({}, led),

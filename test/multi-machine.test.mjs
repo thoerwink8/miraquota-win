@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { CostLedger } from '../provider/lib/ledger.mjs';
+import { CostLedger, STATE_SCHEMA } from '../provider/lib/ledger.mjs';
 import { LedgerSync, cleanMachineId, retryOnce, explainSyncError } from '../provider/lib/ledger-sync.mjs';
 import { Calibrator } from '../provider/lib/calibrator.mjs';
 import { PointsAttributor } from '../provider/lib/points-attrib.mjs';
@@ -31,16 +31,17 @@ function syncConfig(name, remote, intervalSec = 600) {
 /** 带真价目表（内置官方价、无缓存）的空账本——测网关行解析要用到 pricing.cost */
 function pricedLedger(name) {
   const file = join(tmp, `${name}-ledger.json`);
-  writeFileSync(file, JSON.stringify({ schemaVersion: 2 }));
+  writeFileSync(file, JSON.stringify({ schemaVersion: STATE_SCHEMA }));
   return new CostLedger(new Pricing(join(tmp, 'no-cache.json')), file);
 }
 
 /** 机器行去掉收件口身份字段（key/account），老测试只比 id/时间/本机标记 */
 const bare = (rows) => rows.map(({ id, lastShardSec, self }) => ({ id, lastShardSec, self }));
 
+/** 预置当前格式的聚合态账本；旧 schema 会被当成「双计过的旧账」清空重建，别拿它当预置。 */
 function ledgerWith(name, data) {
   const file = join(tmp, `${name}-ledger.json`);
-  writeFileSync(file, JSON.stringify({ schemaVersion: 2, ...data }));
+  writeFileSync(file, JSON.stringify({ schemaVersion: STATE_SCHEMA, ...data }));
   return new CostLedger({}, file);
 }
 

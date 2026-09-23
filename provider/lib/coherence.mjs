@@ -65,34 +65,9 @@ export function evaluateCoherence(windows, ledger, nowSec, groupCost = {}) {
   };
 }
 
-/**
- * 实测倍率：非该组单价 ÷ 该组单价，两个数各来自一个**独立的官方计数器**
- * （总窗的点数、该档位窗的点数），不是本机分摊，所以可以拿来对表官方口径。
- * 样本不足或分母为零时返回 null——宁可不给，也不给一个由噪声算出的倍率。
- * @returns { group, measured, groupPerPoint, otherPerPoint } | null
- */
-export function measureGroupRatio(windows, ledger, nowSec, group) {
-  const scoped = windows.find((w) => w.modelScoped && w.label.endsWith(`_${group}`));
-  if (!scoped) return null;
-  // 必须拿同长度的总窗（7d_fable 配 7d）：档位点数是从同一个池子里扣的，配 5h 池会算出
-  // 「非该档位点数」为负。同长度的没有就放弃——宁可不给倍率，也不给一个跨窗口拼出来的数。
-  const scopedDur = windowDuration(scoped.label);
-  const pool = windows.find((w) => !w.modelScoped && windowDuration(w.label) === scopedDur);
-  if (!pool || !scopedDur) return null;
-  const poolDur = windowDuration(pool.label);
-  const poolStart = pool.resetAt - poolDur;
-  const poolUSD = ledger.spent(poolStart, nowSec, { includeOpenMinute: true });
-  const groupUSD = ledger.spent(poolStart, nowSec, { includeOpenMinute: true, group });
-  const otherUSD = poolUSD - groupUSD;
-  const otherPoints = pool.used - scoped.used;
-  if (!(groupUSD > 0) || !(otherUSD > 0) || !(scoped.used > MIN_POINTS) || !(otherPoints > MIN_POINTS)) {
-    return null;
-  }
-  const groupPerPoint = groupUSD / scoped.used;
-  const otherPerPoint = otherUSD / otherPoints;
-  if (!(groupPerPoint > 0)) return null;
-  return { group, measured: otherPerPoint / groupPerPoint, groupPerPoint, otherPerPoint };
-}
+// 实测倍率曾经在这里：`measureGroupRatio` 拿「非该组单价 ÷ 该组单价」两个整窗比值相除。
+// 2026-09-22 删除，改用 rate-measure.mjs 的逐段中位法——那两个整窗比值各自都带着他机用量、
+// 时间错位和跨源双计，相除只会把误差乘起来（长期落在 2.39，真值 2.00）。留着它就是留第二份账。
 
 /** 兜底停用的原因，供显示面共用一套说法。自洽时为 null。 */
 export function coherenceNotice(result) {

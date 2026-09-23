@@ -10,7 +10,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { CostLedger } from '../provider/lib/ledger.mjs';
+import { CostLedger, STATE_SCHEMA } from '../provider/lib/ledger.mjs';
 import { LedgerSync } from '../provider/lib/ledger-sync.mjs';
 import { Engine } from '../provider/lib/engine.mjs';
 import { anchorsFrom } from '../provider/lib/anchors.mjs';
@@ -30,7 +30,7 @@ function syncConfig(name, remote, extra = {}) {
 
 function emptyLedger(name) {
   const file = join(tmp, `${name}-ledger.json`);
-  writeFileSync(file, JSON.stringify({ schemaVersion: 2 }));
+  writeFileSync(file, JSON.stringify({ schemaVersion: STATE_SCHEMA }));
   return new CostLedger({}, file);
 }
 

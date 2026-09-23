@@ -40,23 +40,45 @@ export class Calibrator {
   constructor(stateFile = STATE_FILE) {
     this.stateFile = stateFile;
     this.points = {};   // label → [{ at, used, budget, resetAt }]
+    // 与点数读数同一瞬间的「各模型美元增量」：[{ at, d: { 模型: 美元 } }]，`gap` 为真表示
+    // 累计基准断了（重启、修剪过老桶），跨它的区间不能用。倍率测算只认这个配对——
+    // 分子分母同一个时间窗才谈得上准（见 rate-measure.mjs）。
+    this.marks = [];
+    this.lastTotals = null;   // 上一 tick 的累计（只在内存，重启即断，落一个 gap）
     this.#load();
   }
 
   #load() {
-    try { this.points = JSON.parse(readFileSync(this.stateFile, 'utf8')).points ?? {}; }
-    catch { /* 首次运行 */ }
+    try {
+      const p = JSON.parse(readFileSync(this.stateFile, 'utf8'));
+      this.points = p.points ?? {};
+      this.marks = Array.isArray(p.marks) ? p.marks : [];
+    } catch { /* 首次运行 */ }
   }
 
   #save() {
     try {
       mkdirSync(dirname(this.stateFile), { recursive: true });
-      writeFileSync(this.stateFile, JSON.stringify({ points: this.points }));
+      writeFileSync(this.stateFile, JSON.stringify({ points: this.points, marks: this.marks }));
     } catch { /* ignore */ }
   }
 
-  /** 记录一次原始点数观测。未到间隔或值未变时不追加。 */
-  record(windows, capturedSec) {
+  /**
+   * 记录一次原始点数观测。未到间隔或值未变时不追加。
+   *
+   * **点数样本只记在有 mark 的那些 tick 上**（`#mark` 返回假就整轮不记）。倍率测算要拿
+   * 「同一个 tick 上的点数」配「同一个 tick 上的美元」，而 mark 的间隔门与点数的间隔门
+   * 原先各自独立：某款模型值没变的那一轮会记下 mark 却不记点数，于是下一个点数样本落在
+   * 「上一个 mark 之后」而不是「某个 mark 上」，一段的美元就凑不齐（少算或把上一段算进来）。
+   * 让 mark 当节拍器后，每个点数样本都踩在 mark 上，段内把 mark 增量累加即恰好等于
+   * (a.at, b.at] 的花费（见 rate-measure.mjs）。代价只是点数样本对齐到 mark 节拍，
+   * 间隔仍是 30 秒，粒度不变。
+   *
+   * @param byModel 这一刻各模型的累计美元（`ledger.cumulativeByModel()`）。给了就同时记一条
+   *   增量 mark；不给则记一个 gap——没有配对的美元，这一段就不该被倍率测算用上。
+   */
+  record(windows, capturedSec, byModel = null) {
+    if (!this.#mark(capturedSec, byModel)) return;
     let dirty = false;
     for (const w of windows) {
       if (!(w.budget > 0)) continue;
@@ -69,7 +91,29 @@ export class Calibrator {
       list.push({ at: capturedSec, used: w.used, budget: w.budget, resetAt: w.resetAt });
       dirty = true;
     }
-    if (dirty) { this.#prune(); this.#save(); }
+    if (dirty || this.marks.length) { this.#prune(); this.#save(); }
+  }
+
+  /**
+   * 记一条与点数读数同瞬的美元增量，返回这一刻是否落了 mark（点数样本跟着它走）。
+   * 累计值回落（修剪）或基准缺失时落 gap。
+   */
+  #mark(capturedSec, byModel) {
+    const last = this.marks[this.marks.length - 1];
+    if (last && capturedSec - last.at < POINT_MIN_INTERVAL) return false;
+    if (!byModel) { this.lastTotals = null; this.marks.push({ at: capturedSec, gap: true }); return true; }
+    const prior = this.lastTotals;
+    this.lastTotals = { ...byModel };
+    if (!prior) { this.marks.push({ at: capturedSec, gap: true }); return true; }
+    const d = {};
+    for (const [model, total] of Object.entries(byModel)) {
+      const delta = total - (prior[model] ?? 0);
+      if (delta !== 0) d[model] = delta;
+    }
+    // 少了模型 = 那个模型的桶被修剪掉了，基准不可比，整条标记为 gap
+    const shrank = Object.keys(prior).some((m) => byModel[m] == null);
+    this.marks.push(shrank ? { at: capturedSec, gap: true } : { at: capturedSec, d });
+    return true;
   }
 
   #prune() {
@@ -79,6 +123,7 @@ export class Calibrator {
       if (kept.length > MAX_POINT_SAMPLES) kept = kept.slice(kept.length - MAX_POINT_SAMPLES);
       this.points[k] = kept;
     }
+    this.marks = this.marks.filter((m) => m.at >= cutoff).slice(-MAX_POINT_SAMPLES);
   }
 
   /**

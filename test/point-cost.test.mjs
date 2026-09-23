@@ -10,7 +10,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Settings, DEFAULT_GROUP_POINT_COST } from '../provider/lib/settings.mjs';
-import { evaluateCoherence, weightedSpend, measureGroupRatio } from '../provider/lib/coherence.mjs';
+import { evaluateCoherence, weightedSpend } from '../provider/lib/coherence.mjs';
+import { measureModelRates, groupRate } from '../provider/lib/rate-measure.mjs';
+import { Calibrator } from '../provider/lib/calibrator.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mq-cost-'));
 const settingsAt = (name) => new Settings(join(tmp, `${name}.json`));
@@ -69,16 +71,115 @@ test('ratio 1 leaves every number exactly as before', () => {
   assert.deepEqual(weightedSpend(ledger, 0, now, {}), { usd: 100, raw: 100, adjustments: [] });
 });
 
-test('the measured ratio comes from two independent official counters', () => {
-  const ledger = fakeLedger({ total: 190.87, byGroup: { fable: 86.50 } });
-  const m = measureGroupRatio(windows7d, ledger, now, 'fable');
-  // fable 单价 = 86.50/28520；非 fable 单价 = 104.37/14408；比值 ≈ 2.39（本机实测值）
-  assert.ok(Math.abs(m.measured - 2.39) < 0.02, `实测倍率应 ≈2.39，得到 ${m.measured}`);
-  // 样本不足时宁可不给，也不给噪声算出来的倍率
-  assert.equal(measureGroupRatio([
-    { label: '7d', used: 300, budget: 560000, resetAt: now + 1, modelScoped: false },
-    { label: '7d_fable', used: 250, budget: 296800, resetAt: now + 1, modelScoped: true },
-  ], ledger, now, 'fable'), null);
+/**
+ * 造一串点数样本与同瞬的美元增量。segs 每项 { spend: {模型: 美元}, points, gap }，
+ * 一项就是相邻两次采样之间发生的事。
+ */
+const series = (segs, startAt = now) => {
+  const samples = [{ at: startAt, used: 1000, budget: 296800, resetAt: startAt + 86400 }];
+  const marks = [{ at: startAt, d: {} }];
+  let at = startAt, used = 1000;
+  for (const s of segs) {
+    at += 30; used += s.points ?? 0;
+    samples.push({ at, used, budget: 296800, resetAt: startAt + 86400 });
+    marks.push(s.gap ? { at, gap: true } : { at, d: s.spend ?? {} });
+  }
+  return { samples, marks };
+};
+
+test('the measured ratio is the median of single-model segments, not a window division', () => {
+  // 10 段干净的 fable：$1 花掉 200 点（官方基准 100 点/$ 的 2 倍）；再塞两段时间错位的
+  // 脏数据——本机实测里确实会出现 40 点/$ 与 443 点/$ 这种段（账本与官方计数器差一个采样格）。
+  const segs = Array.from({ length: 10 }, () => ({ spend: { 'claude-fable-5-1': 1 }, points: 200 }));
+  segs.push({ spend: { 'claude-fable-5-1': 1 }, points: 40 });
+  segs.push({ spend: { 'claude-fable-5-1': 1 }, points: 443 });
+  const { samples, marks } = series(segs);
+  const [fable] = measureModelRates(samples, marks);
+  assert.equal(fable.model, 'claude-fable-5-1');
+  assert.equal(fable.multiplier, 2, '中位数必须正好落在 2.00，错位段不许把它拖走');
+  assert.equal(fable.segments, 12);
+  // 同一批数据按「整窗总量相除」得 (10*200+40+443)/12/100 = 2.07，脏段一多就越偏
+  const wholeWindow = segs.reduce((s, x) => s + x.points, 0) / segs.length / 100;
+  assert.ok(Math.abs(wholeWindow - 2.0) > 0.02, '整窗相除本来就会偏，这条测的就是中位法更稳');
+});
+
+test('a segment with two models in it, or a gap in the dollar basis, is not measured', () => {
+  const mixed = series([
+    { spend: { 'claude-fable-5-1': 1, 'claude-opus-5': 1 }, points: 300 },   // 两个模型，分不清
+    { spend: { 'claude-fable-5-1': 1 }, points: 999, gap: true },            // 美元基准断了
+  ]);
+  assert.deepEqual(measureModelRates(mixed.samples, mixed.marks), []);
+  // 样本太少（少于 3 段、或累计支出不到 $2）时宁可不给，也不给一个噪声算出来的倍率
+  const thin = series([{ spend: { 'claude-fable-5-1': 1 }, points: 200 }]);
+  assert.deepEqual(measureModelRates(thin.samples, thin.marks), []);
+});
+
+test('fable-5 and fable-5-1 are measured apart, and a disagreement is visible', () => {
+  const seg = (model, points) => ({ spend: { [model]: 1 }, points });
+  const same = series([
+    ...Array.from({ length: 4 }, () => seg('claude-fable-5-1', 200)),
+    ...Array.from({ length: 4 }, () => seg('claude-fable-5', 200)),
+  ]);
+  const rates = measureModelRates(same.samples, same.marks);
+  assert.deepEqual(rates.map((r) => r.model).sort(), ['claude-fable-5', 'claude-fable-5-1']);
+  const g = groupRate(rates, 'fable');
+  assert.equal(g.multiplier, 2);
+  assert.equal(g.agree, true, '两个版本量出同一个倍率时，组值才代表得了它们');
+
+  const split = series([
+    ...Array.from({ length: 4 }, () => seg('claude-fable-5-1', 200)),
+    ...Array.from({ length: 4 }, () => seg('claude-fable-5', 100)),
+  ]);
+  const g2 = groupRate(measureModelRates(split.samples, split.marks), 'fable');
+  assert.equal(g2.agree, false, '版本之间不一致必须能看出来——那个「一组一倍率」的配置就是个混合值');
+  assert.equal(g2.members.length, 2);
+});
+
+test('a segment sums every mark inside it, not just the one on the closing sample', () => {
+  // mark 是增量，点数样本的间隔门与 mark 的间隔门各自独立：某款模型值没变的那一轮只记
+  // mark 不记点数。于是 (a, b] 里能有好几条 mark，只取 b 那一条会把这一段算成 5×——
+  // 这正是「倍率一直算不准」里最难看见的一处（它只在样本恰好错过 mark 节拍时出现）。
+  const samples = [];
+  const marks = [];
+  let used = 1000;
+  for (let k = 0; k < 4; k++) {
+    const t0 = now + 90 * k;
+    samples.push({ at: t0, used, budget: 296800, resetAt: now + 86400 });
+    marks.push({ at: t0, d: {} });
+    marks.push({ at: t0 + 30, d: { 'claude-fable-5-1': 0.6 } });   // 这一轮点数没变，只有 mark
+    used += 200;
+    samples.push({ at: t0 + 60, used, budget: 296800, resetAt: now + 86400 });
+    marks.push({ at: t0 + 60, d: { 'claude-fable-5-1': 0.4 } });
+  }
+  const [fable] = measureModelRates(samples, marks);
+  assert.equal(fable.segments, 4);
+  assert.equal(fable.multiplier, 2, '200 点 ÷ ($0.6 + $0.4) ÷ 100 = 2.00，不是 200÷0.4÷100');
+  assert.equal(fable.p25, 2);
+  assert.equal(fable.p75, 2);
+
+  // 反过来：样本没踩在 mark 上（改这版之前存下的点数样本）就不该拿它算——求和会从
+  // a.at 之前那一条 mark 起算，把上一段的钱算进这一段。宁可不给。
+  const legacy = measureModelRates([{ ...samples[0], at: now + 5 }, ...samples.slice(1)], marks);
+  assert.equal(legacy[0].segments, 3, '端点不在 mark 节拍上的那一段必须丢掉，而不是算成 5×');
+});
+
+test('point samples only land on mark ticks, so every segment has dollars at both ends', () => {
+  // 这是上面那条求和规则的前提，也是它唯一容易被破坏的地方：只要有一轮记了点数却没记
+  // mark，那个样本就成了「端点不在节拍上」的段，被整段丢掉——数据看着在，倍率却一直
+  // 样本不足。所以钉住：没落 mark 的那一轮，点数也不许落。
+  const cal = new Calibrator(join(tmp, 'cal-marks.json'));
+  const w = (used) => [{ label: '7d_fable', used, budget: 296800, resetAt: now + 86400, modelScoped: true }];
+  cal.record(w(1000), now, {});                                  // 首次：基准缺失，落 gap
+  cal.record(w(1200), now + 5, {});                              // 未到 30 秒：整轮都不记
+  cal.record(w(1200), now + 40, { 'claude-fable-5-1': 0.5 });    // 点数没变，mark 照记
+  cal.record(w(1400), now + 70, { 'claude-fable-5-1': 1.5 });
+  const ats = cal.points['7d_fable'].map((p) => p.at);
+  const markAts = new Set(cal.marks.map((m) => m.at));
+  assert.deepEqual(ats, [now, now + 40, now + 70], '未到间隔的那一轮不许留下点数样本');
+  for (const at of ats) assert.ok(markAts.has(at), `${at} 这个点数样本没有同瞬的 mark`);
+  // 相邻两点数样本之间的 mark 之和就是这一段的美元：(now,now+40] = $0.5、(now+40,now+70] = $1.0
+  const between = cal.marks.filter((m) => m.at > now && m.at <= now + 40);
+  assert.equal(between.reduce((s, m) => s + (m.d?.['claude-fable-5-1'] ?? 0), 0), 0.5);
 });
 
 test('the config lives on the spec tab, not the first screen', () => {
@@ -89,24 +190,14 @@ test('the config lives on the spec tab, not the first screen', () => {
   assert.ok(existsSync(new URL('../provider/lib/settings.mjs', import.meta.url)));
 });
 
-test('the measured ratio pairs the scoped window with the pool window of the same length', () => {
-  // 实测踩过：窗口表里 5h 排在 7d 前面，若取「第一个非档位窗」会拿 5h 池配 7d_fable，
-  // 「非该档位点数」算成负数，倍率直接消失（界面上表现为一直显示样本不够）。
-  const ledger = fakeLedger({ total: 290.79, byGroup: { fable: 141.93 } });
-  // 合并多机账本后的实测量级：7d 43413 点（fable 28520）、账本 $290.79（fable $141.93）
-  const merged7d = [
-    { label: '7d', used: 43413, budget: 560000, resetAt: now + 86400, modelScoped: false },
-    windows7d[1],
-  ];
-  const withFiveHour = [
-    { label: '5h', used: 7500, budget: 156800, resetAt: now + 3600, modelScoped: false },
-    ...merged7d,
-  ];
-  const m = measureGroupRatio(withFiveHour, ledger, now, 'fable');
-  assert.ok(m, '有同长度的 7d 窗就必须算得出倍率');
-  assert.ok(Math.abs(m.measured - 2.01) < 0.02, `合并多机账本后实测 ≈2.01×，得到 ${m?.measured}`);
-  // 只有 5h 池、没有 7d 池时宁可不给
-  assert.equal(measureGroupRatio([withFiveHour[0], merged7d[1]], ledger, now, 'fable'), null);
+test('the measured ratio reads the scoped window, so other models cannot pollute it', () => {
+  // 档位窗（7d_fable）的点数只数 fable 自己的模型，是量它倍率最干净的计数器。
+  // 引擎按 modelGroup(label) 找这个窗，找不到才退到总窗——这条订住那个选择。
+  const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
+  assert.match(src, /w\.modelScoped && modelGroup\(w\.label\) === g/);
+  assert.match(src, /measureModelRates\(this\.calibrator\.points\[label\], this\.calibrator\.marks\)/);
+  // 美元与点数必须在同一个 tick 上取——分子分母不同时刻就是上一版算不准的根
+  assert.match(src, /this\.calibrator\.record\(limits\.windows, atSec, this\.ledger\.cumulativeByModel\(\)\)/);
 });
 
 test('full quota comes from the official points/100 rule on every payload path', () => {
@@ -141,12 +232,11 @@ test('the ratio setting stays visible when Mirasim is not running', () => {
   // 只在实测路径生成，Mirasim 一停就整个字段消失，界面把整张配置卡都藏了。设置是设置，
   // 连不连得上都该看得见、改得动；实测值给不出时要说清是没连上还是样本薄。
   const src = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
-  assert.ok(src.includes('#pointCost(windows, atSec)'), '三条路径共用一个 pointCost 生成器');
-  // src 是「这次用的那份锚点」——本机锚点或他机送来的账号额度快照，两者都自带采集时刻
-  assert.ok(src.includes("this.#pointCost(src.anchors, src.capturedAt)"),
-    '推算路径用锚点采集时刻算实测——拿陈旧点数配当下账本会算出假倍率');
-  assert.ok(src.includes('this.#pointCost(this.anchors.anchors, null)'),
-    '本机路径没有官方点数，只回设置值');
+  assert.ok(src.includes('#pointCost(windows) {'), '三条路径共用一个 pointCost 生成器');
+  // 实测值现在来自存下来的采样段（美元与点数同瞬记录），不再需要「这一刻」的时间戳——
+  // 于是推算态、纯本机态也照样给得出实测倍率，不是只有连着 Mirasim 时才有
+  assert.equal((src.match(/this\.#pointCost\(/g) ?? []).length, 3, '三条 payload 路径各调一次');
+  assert.ok(!src.includes('#pointCost(windows, atSec)'), '别再把实测值绑在某一刻的账本上');
   const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
   assert.ok(renderer.includes("latest?.measured === false"), '要分开「没连上」和「样本不够」');
   assert.match(renderer, /Mirasim 未运行，实测倍率暂不可给/);

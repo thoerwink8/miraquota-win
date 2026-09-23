@@ -19,14 +19,22 @@ import { LedgerSync, DEFAULT_INBOX, DEFAULT_HUB } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
-import { evaluateCoherence, coherenceNotice, measureGroupRatio, weightedSpend } from './coherence.mjs';
+import { evaluateCoherence, coherenceNotice, weightedSpend } from './coherence.mjs';
+import { measureModelRates, groupRate } from './rate-measure.mjs';
 
 /**
- * 官方汇率：额度点 ÷ 100 = 美元（560000→5600、156800→1568、296800→2968 三窗都整除）。
- * 2026-09-02 用户向官方求证确认。此前满额靠「本机账本 ÷ 已用点」反推，有两处硬伤：
- * 账本漏一点满额就同倍缩水（实测偏 -3.5%），而 Mirasim 一停就退到另一套中位数算法
- * （实测报 2837 而非 5600）。改成官方除法后三条 payload 路径同一个数，且不依赖账本。
- * 反推不删——它与这个常量的偏离就是「账本漏了多少」的读数，降级为对账检查。
+ * 官方汇率：额度点 ÷ 100 = 美元（2026-09-02 用户向官方求证确认时，三窗 560000→5600、
+ * 156800→1568、296800→2968 都整除）。
+ *
+ * **预算点不是常量**：官方会整体缩放它。2026-09-23 实测 /v1/limits 三个窗同时缩到
+ * ×0.9154（7d 512,600、5h 143,528、7d_fable 271,678），一周从 $5,600 变 $5,126，且多了
+ * 一个满额与 7d 相同的 7d_claude 窗。所以满额只认「当帧读到的 budget × 这个汇率 ÷ 倍率」，
+ * 上面那几个数只是注释里的算例，别当常量（「÷100 整除」在新值上也不成立）。
+ *
+ * 此前满额靠「本机账本 ÷ 已用点」反推，有两处硬伤：账本漏一点满额就同倍缩水（实测偏
+ * -3.5%），而 Mirasim 一停就退到另一套中位数算法（实测报 2837 而非 5600）。改成官方除法后
+ * 三条 payload 路径同一个数，且不依赖账本。反推不删——它与这个常量的偏离就是「账本漏了
+ * 多少」的读数，降级为对账检查。
  */
 export const OFFICIAL_PER_POINT = 0.01;
 
@@ -517,7 +525,8 @@ export class Engine {
   ingestLimits(limits, atSec) {
     if (!limits?.windows?.length) return false;
     this.#recordTrail(limits, atSec);
-    this.calibrator.record(limits.windows, atSec);
+    // 各模型累计美元与点数读数同一瞬记下，倍率测算才有一段对得上的分子分母
+    this.calibrator.record(limits.windows, atSec, this.ledger.cumulativeByModel());
     this.pointsAttrib.record(limits.windows, atSec);
     this.anchors.update(limits.windows, atSec);
     this.ledger.adoptScopedGroups(
@@ -649,7 +658,7 @@ export class Engine {
       };
       if (coherence.spread != null) out.unitPriceSpread = coherence.spread;
     } else { const n = coherenceNotice(coherence); if (n) out.unitPriceNotice = n; }
-    const pc = this.#pointCost(limits.windows, now);
+    const pc = this.#pointCost(limits.windows);
     if (pc) out.pointCost = pc;
     if (notice) out.accountNotice = notice;
     if (calibDropped > 0) out.calibDropped = calibDropped;
@@ -709,7 +718,7 @@ export class Engine {
     const ageText = ageMin >= 60 ? `${(ageMin / 60).toFixed(1)} 小时` : `${ageMin} 分钟`;
     const out = this.#base('reckoned', src.capturedAt, windows);
     // 锚点自带 used/budget/modelScoped，实测倍率按采集时刻算（那一刻账本与官方计数器同期）
-    const pcR = this.#pointCost(src.anchors, src.capturedAt);
+    const pcR = this.#pointCost(src.anchors);
     if (pcR) out.pointCost = pcR;
     out.measured = false;
     if (remote) {
@@ -752,7 +761,7 @@ export class Engine {
       };
     });
     const out = this.#base('local', now, windows);
-    const pcL = this.#pointCost(this.anchors.anchors, null);
+    const pcL = this.#pointCost(this.anchors.anchors);
     if (pcL) out.pointCost = pcL;
     out.measured = false;
     out.detail = this.opts.noLocal
@@ -800,20 +809,40 @@ export class Engine {
    * 回归标定的观测数仍然照常汇报——它是「这个数有多少实测撑着」的唯一来源。
    */
   /**
-   * 档位倍率：配置值与实测值（各出自一个独立的官方计数器）一起给界面，用户能自己对表。
+   * 档位倍率：配置值与实测值一起给界面，用户能自己对表。
    * 三条 payload 路径都要给——这是个**设置**，Mirasim 没在跑时用户照样该能看见和改。
    * （用户 2026-09-02 指出：没连上时整张配置卡消失，看着像「最近没用 fable 就不显示倍率」。）
-   * 实测值要官方计数器与账本对齐的那一刻：实测态用 now，推算态用锚点采集时刻——
-   * 拿陈旧的点数配到当下的账本会算出一个假倍率，宁可只给设置值。
+   *
+   * 实测值按**模型**给（`models` 一行一个），组值是组内各模型按支出加权的中位。
+   * 原先只有一个组值、且由「整窗总量相除」算出，长期落在 2.39 而真值 2.00
+   * （用户 2026-09-22：「fable5.1 和 fable5 的倍率一直算不准」）；换成逐段中位后
+   * fable-5-1 量到 ×2.00 整，且 fable-5 与 fable-5-1 分得开。算法见 rate-measure.mjs。
    * @param windows 有 used/budget/modelScoped 的窗口数组；给不出就传 null（只回设置值）
    */
-  #pointCost(windows, atSec) {
+  #pointCost(windows) {
     const groups = [...new Set((windows ?? []).filter((w) => w.modelScoped)
       .map((w) => modelGroup(w.label)).filter(Boolean))];
     if (!groups.length) return null;
+    // 档位窗的点数只数该档位的模型，是量这些模型倍率最干净的计数器；没有档位窗时退到总窗
+    const scopedLabel = (g) => (windows ?? []).find((w) => w.modelScoped && modelGroup(w.label) === g)?.label;
     return groups.map((g) => {
-      const m = atSec != null ? measureGroupRatio(windows, this.ledger, atSec, g) : null;
-      return { group: g, ratio: this.settings.ratioOf(g), ...(m ? { measured: m.measured } : {}) };
+      const label = scopedLabel(g);
+      const rates = label ? measureModelRates(this.calibrator.points[label], this.calibrator.marks) : [];
+      const measured = groupRate(rates, g);
+      return {
+        group: g,
+        ratio: this.settings.ratioOf(g),
+        ...(measured ? {
+          measured: measured.multiplier,
+          segments: measured.segments,
+          confidence: measured.confidence,
+          agree: measured.agree,
+          models: measured.members.map((r) => ({
+            model: r.model, measured: r.multiplier, segments: r.segments,
+            usd: r.usd, confidence: r.confidence,
+          })),
+        } : {}),
+      };
     });
   }
 
@@ -900,6 +929,29 @@ export class Engine {
       // 没同步时给登录入口（收件口地址可改）：没有 GitHub 的人从这里进（2026-09-02）
       ...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX, hub: DEFAULT_HUB } } : {}),
       ...(this.#roster() ?? {}),
+      ...this.#priceTrust(),
+    };
+  }
+
+  /**
+   * 三条「美元可不可信」的报警，都是这次（2026-09-22）补上的缺口：
+   *  - guessedPrices：价目表没收录、按前缀兜底猜的模型。兜底是静默成功的，以前没有落点。
+   *  - sourceGaps：网关看到的 Claude 花费比 transcript 多 ⇒ transcript 漏了。美元现在只认
+   *    transcript 一个来源（见 ledger.mjs 的跨源说明），这是唯一的独立证人。
+   *  - staleShards：某台外机推上来的还是旧口径分片（美元虚高、且拆不开）。本机修好了，
+   *    合并口径仍会带着它的虚高——升级那台之前必须说出来。
+   */
+  #priceTrust() {
+    // 报警跟着账本走，不是跟着这一次运行走：账本里出现过的模型 id 每次重新问一遍价目表，
+    // 于是重启后那些被兜底猜出来的美元照样点名（见 Pricing.guessedAmong）。
+    const guessed = this.pricing.guessedAmong(this.ledger.modelIds());
+    const now = Date.now() / 1000;
+    const gaps = this.ledger.crossSourceGaps(now - 86400, now);
+    const stale = this.ledger.staleForeignShards();
+    return {
+      ...(guessed.length ? { guessedPrices: guessed } : {}),
+      ...(gaps.length ? { sourceGaps: gaps.slice(0, 5) } : {}),
+      ...(stale.length ? { staleShards: stale } : {}),
     };
   }
 

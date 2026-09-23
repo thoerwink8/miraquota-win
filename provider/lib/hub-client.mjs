@@ -29,9 +29,14 @@ const CONNECT_TIMEOUT_MS = 20_000;
  *  - roster   对表 ~/.mirasim/setting.json 的已启用模型，是**这台机器**的配置；
  *  - sync     这台机器与服务器的连接状态，本来就是本机的事；
  *  - buckets  本机账本的分钟桶数，排查用的本机读数；
- *  - pricing  价目表来源，本机的。
+ *  - pricing  价目表来源，本机的；
+ *  - guessedPrices 靠前缀兜底猜过价的模型。价目表是本机这份（见上一条），猜没猜过当然也是
+ *             本机的判断——服务器那台跑的可能还是旧版表，它的「没猜过」不能替本机背书；
+ *  - sourceGaps  网关看到的 Claude 花费多于 transcript ⇒ **这台机器**的会话文件漏了
+ *             （换过 HOME、SDK 起的会话不写文件）。服务器那份说的是服务器那台，拿过来
+ *             会指着一台无关的机器说「你漏账了」。
  */
-export const LOCAL_FIELDS = ['speed', 'roster', 'sync', 'buckets', 'pricing'];
+export const LOCAL_FIELDS = ['speed', 'roster', 'sync', 'buckets', 'pricing', 'guessedPrices', 'sourceGaps'];
 
 /**
  * 服务器那份 + 本机那份 → 面板真正画的那份。

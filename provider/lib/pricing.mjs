@@ -11,15 +11,23 @@ import { join } from 'node:path';
 
 const MODELS_CACHE = join(homedir(), '.mirasim', 'models-dev-cache.json');
 
-// 美元 / 百万 token：[input, output, cacheRead(=10% input), cacheWrite(=125% input)]
-// 官方价来源：Anthropic API 价目（2026-08 核对）。注意 $15/$75 是上代 Opus 4/4.1 的旧价，
-// Opus 5/4.8 官方价即 $5/$25，Fable 5 即 $10/$50——勿按旧价"纠正"本表。
+// 美元 / 百万 token：[input, output, cacheRead, cacheWrite]
+// 官方价来源：Anthropic API 价目（2026-08 核对，2026-09-22 补 Fable 5.1 与 Opus 5.5）。
+// 注意 $15/$75 是上代 Opus 4/4.1 的旧价，Opus 5/4.8 官方价即 $5/$25，Fable 5 即 $10/$50
+// ——勿按旧价"纠正"本表。
+//
+// **缓存读不再一律是 input 的 10%**：Fable 5.1 是 $0.25（Fable 5 的 1/4，同代 input 同价）、
+// Opus 5.5 是 $0.20（不是 $4 的 10%）。这一列填错的代价被缓存读的体量放大——本机实测
+// 缓存读占 fable 花费的 56%，按 Fable 5 的 $1.00 记 5.1 会把账本抬高一倍多，倍率随之全错。
+// 新模型进表时逐项查官方价目，别按「10%/125%」推。
 const BUILTIN = {
+  'claude-opus-5-5':   [4, 20, 0.2, 5],
   'claude-opus-5':     [5, 25, 0.5, 6.25],
   'claude-opus-4-8':   [5, 25, 0.5, 6.25],
   'claude-opus-4-7':   [5, 25, 0.5, 6.25],
   'claude-opus-4-6':   [5, 25, 0.5, 6.25],
   'claude-opus-4-5':   [5, 25, 0.5, 6.25],
+  'claude-fable-5-1':  [10, 50, 0.25, 12.5],
   'claude-fable-5':    [10, 50, 1.0, 12.5],
   'claude-sonnet-5':   [2, 10, 0.2, 2.5],
   'claude-sonnet-4-6': [3, 15, 0.3, 3.75],
@@ -27,8 +35,10 @@ const BUILTIN = {
   'claude-haiku-4-5':  [1, 5, 0.1, 1.25],
 };
 
+// 系列兜底：认不出版本号时按这一代的当前款算。指向新款而不是老款——没收录的多半是更新的，
+// 而 fable 两款的缓存读差 4 倍，猜错方向就是账本偏一大截。
 const FAMILY = [
-  ['opus', 'claude-opus-5'], ['fable', 'claude-fable-5'],
+  ['opus', 'claude-opus-5'], ['fable', 'claude-fable-5-1'],
   ['sonnet', 'claude-sonnet-5'], ['haiku', 'claude-haiku-4-5'],
 ];
 
@@ -40,6 +50,7 @@ export class Pricing {
   /** @param cachePath 测试注入用；默认读 Mirasim 的 models.dev 缓存 */
   constructor(cachePath = MODELS_CACHE) {
     const loaded = Pricing.#loadCache(cachePath) ?? {};
+    this.guessed = new Map();   // 兜底命中的模型 → 借用了哪个键的价（见 #guess）
     // 内置官方价权威；缓存只补充未收录模型。冲突仅记录，不覆盖。
     this.table = { ...loaded, ...BUILTIN };
     this.source = Object.keys(loaded).length ? 'builtin(official) + cache补充' : 'builtin(official)';
@@ -80,23 +91,62 @@ export class Pricing {
     return s;
   }
 
-  /** 查价。未收录的标识按日期后缀、再按系列前缀归档，避免整条记录被丢弃造成低估。 */
+  /**
+   * 查价。未收录的标识按日期后缀、再按系列前缀归档，避免整条记录被丢弃造成低估。
+   *
+   * 兜底命中会被记进 `guessed`：它是**静默成功**的——返回一个看着合理的价，账本照常
+   * 出数，只有倍率、满额这些下游量会偏，而偏了没人知道（2026-09-22 实咬：`claude-opus-5-5`
+   * 按前缀落到 Opus 5 的 $5/$25/$0.5，官方是 $4/$20/$0.2，非 fable 侧的美元凭空抬高）。
+   * 「查不到价」进 unpriced 有人看，「猜了个价」以前没有落点，所以这里留一份并上报界面。
+   */
   price(rawModel) {
     let id = Pricing.normalize(rawModel);
     if (this.table[id]) return this.table[id];
     // 「厂商/模型」写法先剥厂商再查
-    if (id.includes('/')) { const tail = id.slice(id.lastIndexOf('/') + 1); if (this.table[tail]) return this.table[tail]; id = tail; }
+    if (id.includes('/')) {
+      const tail = id.slice(id.lastIndexOf('/') + 1);
+      if (this.table[tail]) return this.table[tail];
+      id = tail;
+    }
 
     const parts = id.split('-');
     while (parts.length > 2) {
       parts.pop();
-      const hit = this.table[parts.join('-')];
-      if (hit) return hit;
+      const key = parts.join('-');
+      const hit = this.table[key];
+      if (hit) return this.#guess(id, key, hit);
     }
     for (const [family, key] of FAMILY) {
-      if (id.includes(family)) return this.table[key];
+      if (id.includes(family)) return this.#guess(id, key, this.table[key]);
     }
     return null;
+  }
+
+  /** 记下一次兜底并返回那份价。同一个模型只记一次、只喊一次。 */
+  #guess(id, via, price) {
+    if (!price) return null;
+    if (!this.guessed.has(id)) {
+      this.guessed.set(id, via);
+      console.error(`[pricing] ${id} 不在价目表，按 ${via} 的价记账——查官方价目补进内置表`);
+    }
+    return price;
+  }
+
+  /** 这次运行里被猜过价的模型：[{ model, via }]。空数组 = 每一笔都查到了确切价。 */
+  guessedModels() {
+    return [...this.guessed.entries()].map(([model, via]) => ({ model, via })).sort((a, b) => a.model.localeCompare(b.model));
+  }
+
+  /**
+   * 把一批模型 id 过一遍价目表，返回其中靠兜底猜出价的那些。
+   *
+   * 报警要跟着**账本**走，不是跟着某一次运行走：兜底一旦发生，那些模型的美元就已经记进
+   * 账本了；只在解析记录的那一刻记一次的话，重启后这个报警就没了，而账本里被猜出来的
+   * 美元还在。所以界面每次出 payload 都拿账本里出现过的 id 重新问一遍价目表。
+   */
+  guessedAmong(ids) {
+    for (const id of ids ?? []) this.price(id);
+    return this.guessedModels();
   }
 
   /** 一次调用的等价美元；未收录模型返回 null（区别于零 token 的 0）。 */

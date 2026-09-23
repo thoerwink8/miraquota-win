@@ -10,6 +10,7 @@ import { join } from 'node:path';
 
 import { merge, readHubConfig, HubClient, LOCAL_FIELDS, HUB_STALE_AFTER } from '../provider/lib/hub-client.mjs';
 import { Hub } from '../server/hub.mjs';
+import { STATE_SCHEMA } from '../provider/lib/ledger.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mq-hubc-'));
 const NOW = 1_000_000;
@@ -32,6 +33,8 @@ const local = {
   sync: { state: 'ok', mode: 'hub' },
   buckets: 3614,
   pricing: 'builtin',
+  guessedPrices: [{ model: 'claude-fable-9-9', via: 'claude-fable-5-1' }],
+  sourceGaps: [{ model: 'claude-fable-5-1', transcriptUSD: 0, gatewayUSD: 10 }],
 };
 
 test('account-level numbers come from the server, machine-level ones stay local', () => {
@@ -46,6 +49,10 @@ test('account-level numbers come from the server, machine-level ones stay local'
   assert.deepEqual(m.sync, local.sync);
   assert.equal(m.buckets, 3614);
   assert.equal(m.pricing, 'builtin');
+  // 「本机这份价目表猜过价」「本机的会话文件漏了」都只对这台机器成立——服务器那台跑的可能
+  // 是别的版本、会话文件也在别处，拿它的结论会指着一台无关的机器说「你漏账了」
+  assert.deepEqual(m.guessedPrices, local.guessedPrices);
+  assert.deepEqual(m.sourceGaps, local.sourceGaps);
   assert.equal(m.fromHub.machines, 2);
   assert.ok(m.fromHub.ageSeconds >= 5);
 });
@@ -122,7 +129,7 @@ test('a busy machine publishes early instead of sitting on fresh numbers', async
   const cfg = join(tmp, 'nudge-sync.json');
   writeFileSync(cfg, JSON.stringify({ hub: base, token: 'sekrit', intervalSec: 600 }));
   const led = join(tmp, 'nudge-led.json');
-  writeFileSync(led, JSON.stringify({ schemaVersion: 2 }));
+  writeFileSync(led, JSON.stringify({ schemaVersion: STATE_SCHEMA }));
 
   const e = new Engine({
     forceOffline: true, noLocal: true, ledgerFile: led,

@@ -12,7 +12,7 @@ import { join } from 'node:path';
 
 import { validateShard, branchFor, hashPassphrase, verifyPassphrase, ACCOUNT_RE } from '../inbox/shared.mjs';
 import { LedgerSync, DEFAULT_INBOX, readInstallId } from '../provider/lib/ledger-sync.mjs';
-import { CostLedger } from '../provider/lib/ledger.mjs';
+import { CostLedger, STATE_SCHEMA } from '../provider/lib/ledger.mjs';
 import { Pricing } from '../provider/lib/pricing.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mq-inbox-'));
@@ -85,7 +85,7 @@ function fakeInbox({ invite = 'code' } = {}) {
 
 const pricedLedger = (name, data = {}) => {
   const file = join(tmp, `${name}-ledger.json`);
-  writeFileSync(file, JSON.stringify({ schemaVersion: 2, ...data }));
+  writeFileSync(file, JSON.stringify({ schemaVersion: STATE_SCHEMA, ...data }));
   return new CostLedger(new Pricing(join(tmp, 'no-cache.json')), file);
 };
 
