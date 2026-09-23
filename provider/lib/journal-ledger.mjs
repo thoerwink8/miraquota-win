@@ -104,6 +104,7 @@ export class JournalLedger {
 
     this.#saveCursors();     // sources 在读文件时顺手更新了 this.#cursors（只影响性能）
     this.#prune();
+    if (added > 0) this.invalidate();   // 新行进来了，内存索引作废（下次查询重建）
     return added > 0;
   }
 
@@ -116,6 +117,7 @@ export class JournalLedger {
 
   adoptForeignShards(shards) {
     this.foreignShards = (Array.isArray(shards) ? shards : []).filter((s) => s && s.machineId);
+    this.invalidate();      // 合并口径变了，索引要重建
   }
 
   foreignCoverage(nowSec = Date.now() / 1000) {
@@ -172,59 +174,104 @@ export class JournalLedger {
   }
 
   // MARK: 查询（本地流水 + 外机分片 = 合并口径）
+  //
+  // **为什么要有内存前缀和**：旧账本的 `spent()` 是内存里前缀和相减，微秒级；而标定
+  // `Calibrator.estimate()` 会**每一对相邻样本问一次**（实测 657 次），`#fullOf` 每帧还要
+  // 对四个窗口各问一次。直接把每次 `spent()` 换成一条 SQL（7.5 ms）会让一帧 payload 变成
+  // **20 秒**——应用装上新引擎后卡死就是这么来的（2026-09-23 实咬）。
+  // 所以这里把索引搭回旧账本的形状：一次聚合查询建好，写入了就作废重建，查询是前缀和相减。
+
+  #index = null;
+
+  /** 建索引：一次查询拿 (分钟, 模型) 的美元，再折成总额/按模型/按家族/按档位组四张前缀和。 */
+  #build() {
+    const total = new Map();
+    const models = new Map();
+    const families = new Map();
+    const groups = new Map();
+    const bump = (m, key, minute, usd) => {
+      let t = m.get(key);
+      if (!t) { t = new Map(); m.set(key, t); }
+      t.set(minute, (t.get(minute) ?? 0) + usd);
+    };
+    const fold = (model, minute, usd) => {
+      total.set(minute, (total.get(minute) ?? 0) + usd);
+      bump(models, model, minute, usd);
+      bump(families, modelFamily(model).id, minute, usd);
+      const lower = String(model).toLowerCase();
+      for (const g of this.scopedGroups) if (lower.includes(g)) bump(groups, g, minute, usd);
+    };
+    for (const r of this.store.db.prepare(`SELECT e.ts / 60 minute, d.name model, SUM(e.usd) usd
+      FROM effective e JOIN dims d ON d.id = e.model GROUP BY minute, d.name`).all()) {
+      fold(r.model, r.minute, r.usd);
+    }
+    // 外机分片折进同一套索引（合并口径）。分片的键是「模型|分钟」/「组|分钟」这种。
+    for (const s of this.foreignShards) {
+      const walk = (obj, kind) => {
+        for (const [k, v] of Object.entries(obj ?? {})) {
+          const usd = Number(v) || 0;
+          if (!usd) continue;
+          if (kind === 'buckets') { const m = Number(k); if (Number.isFinite(m)) total.set(m, (total.get(m) ?? 0) + usd); continue; }
+          const cut = k.lastIndexOf('|');
+          const minute = Number(k.slice(cut + 1));
+          if (!Number.isFinite(minute)) continue;
+          const name = k.slice(0, cut);
+          if (kind === 'models') bump(models, name, minute, usd);
+          else if (kind === 'family') bump(families, name, minute, usd);
+          else bump(groups, name, minute, usd);
+        }
+      };
+      walk(s.buckets, 'buckets'); walk(s.models, 'models'); walk(s.family, 'family'); walk(s.scoped, 'scoped');
+    }
+    const table = (map) => {
+      const minutes = [...map.keys()].sort((a, b) => a - b);
+      const prefix = [0];
+      for (const m of minutes) prefix.push(prefix[prefix.length - 1] + map.get(m));
+      return { minutes, prefix };
+    };
+    this.#index = {
+      total: table(total),
+      models: new Map([...models].map(([k, v]) => [k, table(v)])),
+      families: new Map([...families].map(([k, v]) => [k, table(v)])),
+      groups: new Map([...groups].map(([k, v]) => [k, table(v)])),
+    };
+  }
+
+  #tables() { if (!this.#index) this.#build(); return this.#index; }
+
+  /** 内存索引作废（写入了新行、换了分片）。下一次查询重建。 */
+  invalidate() { this.#index = null; }
 
   /** 半开区间内的等价支出。`includeOpenMinute` 只作兼容保留：流水是秒级，`ts < to` 本就精确。 */
-  spent(fromSec, toSec, { group = null, model = null, localOnly = false } = {}) {
-    const local = this.store.spend(fromSec, toSec, { group, model }).usd;
-    if (localOnly || !this.foreignShards.length) return local;
-    // 三者**互斥**：group/model 查的是子集，不是叠加——叠加会把总额又算一遍
-    if (group) return local + this.#shardSum('scoped', fromSec, toSec, String(group).toLowerCase() + '|');
-    if (model) return local + this.#shardSum('models', fromSec, toSec, Pricing.normalize(model).toLowerCase() + '|');
-    return local + this.#shardSum('buckets', fromSec, toSec);
+  spent(fromSec, toSec, { group = null, model = null } = {}) {
+    const idx = this.#tables();
+    const t = group ? idx.groups.get(String(group).toLowerCase())
+      : model ? idx.models.get(String(model))
+        : idx.total;
+    if (!t || !t.minutes.length) return 0;
+    const lo = lowerBound(t.minutes, Math.floor(fromSec / 60));
+    const hi = lowerBound(t.minutes, Math.floor(toSec / 60) + 1);
+    return t.prefix[hi] - t.prefix[lo];
   }
 
-  /** 区间内有支出的分钟数（合并口径去重：同一分钟多台机器只算一次）。 */
-  activeMinutes(fromSec, toSec, { group = null, localOnly = false } = {}) {
-    const minutes = new Set();
-    const lo = Math.floor(fromSec / 60), hi = Math.floor(toSec / 60);
-    const head = group ? String(group).toLowerCase() + '|' : null;
-    const rows = head
-      ? this.store.db.prepare(`SELECT DISTINCT e.ts FROM effective e JOIN dims d ON d.id = e.model
-          WHERE d.name LIKE ? AND e.ts >= ? AND e.ts < ?`).all('%' + head.slice(0, -1) + '%', fromSec, toSec)
-      : this.store.db.prepare('SELECT DISTINCT ts FROM effective WHERE ts >= ? AND ts < ?').all(fromSec, toSec);
-    for (const r of rows) minutes.add(Math.floor(r.ts / 60));
-    if (!localOnly) {
-      for (const s of this.foreignShards) {
-        for (const k of Object.keys(s[head ? 'scoped' : 'buckets'] ?? {})) {
-          const m = Number(head ? k.slice(head.length) : k);
-          if (Number.isFinite(m) && m >= lo && m <= hi) minutes.add(m);
-        }
-      }
-    }
-    return minutes.size;
+  /** 区间内有支出的分钟数（合并口径：同一分钟多台机器只算一次）。 */
+  activeMinutes(fromSec, toSec, { group = null } = {}) {
+    const idx = this.#tables();
+    const t = group ? idx.groups.get(String(group).toLowerCase()) : idx.total;
+    if (!t || !t.minutes.length) return 0;
+    const lo = lowerBound(t.minutes, Math.floor(fromSec / 60));
+    const hi = lowerBound(t.minutes, Math.floor(toSec / 60) + 1);
+    return Math.max(0, hi - lo);
   }
 
-  familyIds() {
-    const ids = new Set();
-    for (const r of this.store.db.prepare("SELECT name FROM dims WHERE kind = 'model'").all()) {
-      ids.add(modelFamily(r.name).id);
-    }
-    for (const s of this.foreignShards) {
-      for (const k of Object.keys(s.family ?? {})) ids.add(k.slice(0, k.indexOf('|')));
-    }
-    ids.delete('');
-    return [...ids];
-  }
+  familyIds() { return [...this.#tables().families.keys()].filter(Boolean); }
 
-  familySpent(fromSec, toSec, familyId, { localOnly = false } = {}) {
-    const want = String(familyId);
-    let total = 0;
-    for (const r of this.store.byModel(fromSec, toSec)) {
-      const id = r.model === 'dispatch' ? 'dispatch' : modelFamily(r.model).id;
-      if (id === want) total += r.usd;
-    }
-    if (!localOnly) total += this.#shardSum('family', fromSec, toSec, want + '|');
-    return total;
+  familySpent(fromSec, toSec, familyId) {
+    const t = this.#tables().families.get(String(familyId));
+    if (!t || !t.minutes.length) return 0;
+    const lo = lowerBound(t.minutes, Math.floor(fromSec / 60));
+    const hi = lowerBound(t.minutes, Math.floor(toSec / 60) + 1);
+    return t.prefix[hi] - t.prefix[lo];
   }
 
   /** 各模型累计美元（倍率标定用：点数与美元必须在同一瞬配对）。 */
@@ -292,6 +339,13 @@ export class JournalLedger {
   }
 
   close() { this.store.close(); }
+}
+
+/** 有序数组里第一个 >= x 的下标（前缀和相减用）。 */
+function lowerBound(arr, x) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] < x) lo = mid + 1; else hi = mid; }
+  return lo;
 }
 
 /** 分片字典（"分钟" 或 "前缀|分钟" → 美元）在区间内求和。 */
