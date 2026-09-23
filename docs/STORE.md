@@ -93,8 +93,8 @@ VPS   $4667.76 = 明细 $23.64   + 汇总 $4644.12
 |---|---|---|
 | 账本 `ledger.json` | 8 天 443 KB–2.2 MB（其中去重键 75–85%） | **进库**（`calls` + 视图） |
 | 标定 `calibration.json` | 141 KB，3 天 | **进库**（`points` + `marks`）；mark 由增量改存累计，`broken` 标基准断点 |
-| 锚点 `anchor.json` | 小 | 进库（`machines`/`limits` 同族），Phase 2 |
-| 点数归因 `points-attrib.json` | 74 KB | 进库（一张 `attrib` 表），Phase 2 |
+| 锚点 `anchor.json` | 小 | **进库**（`anchors` 表 + meta 里的 capturedAt） |
+| 点数归因 `points-attrib.json` | 74 KB | **进库**（`attrib` 表 + meta 里的小状态） |
 | hub 分片目录 `shards/*.json` + `limits.json` | N 个小文件 | 进库（一台机一行），省 inode 与 rename |
 | 价目缓存 `~/.mirasim/models-dev-cache.json` | 只读输入 | 只把**用到的那几列**种进 `prices`（代码里的 `BUILTIN` 是种子）；原始缓存不动 |
 | `settings.json` / `sync.json` / `install.json` / `ui.json` / `inbox-admin.json` / `feed.token` | 配置与密钥 | **留 JSON**：人要能手改、密钥不该进库、坏了要能一眼看懂 |
@@ -160,10 +160,9 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
 - ✅ **Phase 1**：`store.mjs` / `sources.mjs` / 迁移工具 / 本机与 VPS 全流程导入 / 契约测试。
 - ✅ **Phase 2a**：`Engine` 已改用 `JournalLedger`（= SQLite 流水账 + 旧账本那套接口）。
   payload 形状没变、界面零改动。`ledger.json` 从此只是历史文件（不再读写，留着回滚与人工比对）。
-- ✅ **Phase 2b**：标定（`points`/`marks`）进库。`Calibrator` 落盘换成 SQLite 的 `points`/`marks`
-  两张表，`calibration.json` 只在**库里一条都没有**时读一次当迁移源，此后不再写。内存形状不变，
-  所以倍率那条链一个字节没动（库里存累计、估算器要增量，读回来换算一次）。
-  ⏳ 还差**点数归因**（`points-attrib.json` 74 KB → `attrib` 表）与**锚点**（`anchor.json`）。
+- ✅ **Phase 2b**：标定、点数归因、锚点**三份状态全进库**（`points`/`marks`/`attrib`/`anchors`
+  四张表 + `meta` 里的几个小标量）。各自的 JSON 只在**库里一条都没有**时读一次当迁移源，
+  此后不再写。内存形状不变，所以倍率那条链一个字节没动（库里存累计、估算器要增量，读回来换算）。
 - ✅ **Phase 2c**：hub 收流水明细（`PUT /journal`）。客户端按批推、推完才退水位（水位存 `meta`，
   重启不丢）；行的 `kh` 是主键，重推幂等。**分片与明细盖住同一分钟时只算一次**（按
   (机器, 分钟) 逐格让位）——实测 VPS 两样都推之后，账号 7 天合计从 $120.07 虚高到 $121.88。
@@ -172,8 +171,13 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
 - ✅ **Phase 3（git 退役）**：git 通道的**代码与测试都删了**（`ledger-sync.mjs` 里的 git 模式、
   `tryAutoJoin` 自动接入、`deploy-linux.mjs` 的 `--via-git` 与 `gh` 装密钥那一段），多机测试
   整体换成 hub 夹具（本地真 HTTP，不再依赖本地 bare 仓）。`gh` 依赖随之清零。
-- ⏳ **Phase 3（余下）**：收件口（Cloudflare KV）按同一套行格式收流水块——**Phase 2b 余下的
-  点数归因与锚点已完成**，所以这一条是最后一处。
+- ✅ **Phase 3（收件口流水）**：收件口也收流水明细（`PUT /journal` / `GET /journals`）。设计与
+  hub 不同——KV 没有能查询的存储，所以**推的机器放明细块、读的机器写进自己的库**；`GET` 只回
+  本账号的（明细里有会话 id 与工作区路径，不能像聚合分片那样跨账号可读）。
+  部署那条命令要人跑一次：`npx wrangler login` 之后 `node scripts/inbox-deploy.mjs`。
+
+**Phase 1–3 到此全部落地**：四个曾经各写一个 JSON 的状态（账本 / 标定 / 归因 / 锚点）都在
+`store.db` 里；两条 HTTP 通道都带明细；git 通道与 `gh` 依赖清零。
 
 ### 2026-09-23 上线时实咬的三处（都已修 + 都有测试）
 
