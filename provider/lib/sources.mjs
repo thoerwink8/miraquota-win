@@ -24,6 +24,7 @@
  * 占掉状态文件 75–85% 的体积，就为了防重读。
  */
 import { openSync, closeSync, readSync, readdirSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 import { isRelayCharged, modelFamily } from './model-families.mjs';
@@ -32,6 +33,47 @@ const num = (v) => {
   const n = typeof v === 'string' ? Number(v) : v;
   return typeof n === 'number' && Number.isFinite(n) ? n : 0;
 };
+
+/** 游标前这么多字节的指纹；外加每 10 分钟整文件重扫一次的兜底。 */
+const TAIL_BYTES = 256;
+const RESCAN_EVERY_MS = 10 * 60 * 1000;
+
+/** 游标处「前一段字节」的指纹（长度 0 或读不到时返回空串）。 */
+function tailHash(path, at) {
+  if (!(at > 0)) return '';
+  const text = readRange(path, Math.max(0, at - TAIL_BYTES), at);
+  return text ? createHash('sha1').update(text).digest('hex').slice(0, 16) : '';
+}
+
+/**
+ * 这个文件的游标还能不能用；不能用就返回 0（从头重扫）。
+ *
+ * **为什么不能只信偏移**：原始记录会被**改写**——实测网关账本里同一行的 token 从 0 变成真值
+ * （先落一行、拿到 usage 再补全），而我们的偏移游标早就越过它，于是那一行**永远读不到最终
+ * 版本**：库里留下 0 token 的行。2026-09-23 实咬：近 6 小时 1453 条带 token 的网关行里
+ * **1451 条在库里是 0**（3.4 亿 token 没记账），账号残差 $535 就是它。
+ * 改写会改变字节长度，游标前的指纹必然跟着变；指纹对不上就重扫。
+ * 再加一条时间兜底：**每 10 分钟整文件重扫一次**，对付「长度没变但内容变了」的改写。
+ * 重扫是安全的：`insertCalls` 取 MAX，只会把值补大，不会重复计。
+ */
+function cursorOffset(cursors, path, size, nowMs) {
+  const cur = cursors?.[path];
+  if (!cur || !(cur.offset > 0) || size < cur.offset) return 0;
+  if (cur.tail != null && tailHash(path, cur.offset) !== cur.tail) return 0;
+  if (cur.scannedAt && nowMs - cur.scannedAt > RESCAN_EVERY_MS) return 0;
+  return cur.offset;
+}
+
+/** 读完一个文件后落游标。`from === 0` 表示这一轮是整文件重扫，刷新 `scannedAt`。 */
+function saveCursor(cursors, path, { size, offset, from, prev, nowMs }) {
+  if (!cursors) return;
+  cursors[path] = {
+    size,
+    offset,
+    tail: tailHash(path, offset),
+    scannedAt: from === 0 ? nowMs : (prev?.scannedAt ?? nowMs),
+  };
+}
 
 /** 递归收集 .jsonl（子代理会话在更深一层，但都一样读）。 */
 export function walkTranscripts(dir, depth, out) {
@@ -90,13 +132,14 @@ export function callRow({
  */
 export function* transcriptRows({ root, cutoff, pricing, machine = null, cursors = null }) {
   const files = walkTranscripts(root, 0, []);
+  const nowMs = Date.now();
   for (const { path } of files) {
     let st;
     try { st = statSync(path); } catch { continue; }
     if (st.mtimeMs / 1000 < cutoff) continue;      // 整个文件早于窗口
     const size = st.size;
-    let from = cursors?.[path]?.offset ?? 0;
-    if (size < from) from = 0;                     // 被截断，从头读
+    const prev = cursors?.[path];
+    const from = cursorOffset(cursors, path, size, nowMs);   // 校验过才用（见 cursorOffset）
     if (size <= from) continue;
     const text = readRange(path, from, size);
     if (!text) continue;
@@ -110,7 +153,9 @@ export function* transcriptRows({ root, cutoff, pricing, machine = null, cursors
     }
     // 游标只影响性能（主键会把重读挡掉），所以这里就地更新、由调用方决定要不要落盘。
     // 只记到最后一个完整行：半行留在下次读。
-    if (cursors) cursors[path] = { size, offset: from + Buffer.byteLength(text.slice(0, consumed), 'utf8') };
+    saveCursor(cursors, path, {
+      size, from, prev, nowMs, offset: from + Buffer.byteLength(text.slice(0, consumed), 'utf8'),
+    });
   }
 }
 
@@ -149,14 +194,15 @@ export function transcriptLine(line, { cutoff = 0, pricing, machine = null } = {
 export function* gatewayRows({ dir, cutoff, pricing, machine = null, cursors = null }) {
   let files;
   try { files = readdirSync(dir); } catch { return; }
+  const nowMs = Date.now();
   for (const name of files) {
     if (!name.startsWith('usage-') || !name.endsWith('.ndjson')) continue;
     const path = join(dir, name);
     let st;
     try { st = statSync(path); } catch { continue; }
     const size = st.size;
-    let from = cursors?.[path]?.offset ?? 0;
-    if (size < from) from = 0;              // 被截断/轮转，从头读
+    const prev = cursors?.[path];
+    const from = cursorOffset(cursors, path, size, nowMs);   // 校验过才用（见 cursorOffset）
     if (size <= from) continue;
     const text = readRange(path, from, size);
     if (!text) continue;
@@ -168,7 +214,9 @@ export function* gatewayRows({ dir, cutoff, pricing, machine = null, cursors = n
       const row = gatewayLine(line, { cutoff, pricing, machine });
       if (row) yield row;
     }
-    if (cursors) cursors[path] = { size, offset: from + Buffer.byteLength(text.slice(0, consumed), 'utf8') };
+    saveCursor(cursors, path, {
+      size, from, prev, nowMs, offset: from + Buffer.byteLength(text.slice(0, consumed), 'utf8'),
+    });
   }
 }
 

@@ -10,12 +10,12 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { UsageStore, STORE_SCHEMA } from '../provider/lib/store.mjs';
-import { callRow, gatewayLine, transcriptLine, turnLine } from '../provider/lib/sources.mjs';
+import { callRow, gatewayLine, gatewayRows, transcriptLine, turnLine } from '../provider/lib/sources.mjs';
 import { Pricing } from '../provider/lib/pricing.mjs';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -258,6 +258,42 @@ test('journalSince 出来的行必须能直接进 JSON（BigInt 进不去）', a
   assert.equal(JSON.parse(JSON.stringify(rows))[0].model, 'claude-opus-5');
   assert.equal(rows[rows.length - 1].ts, T0, '水位取最后一行，BigInt 会让 Math.floor 抛');
   led.close();
+});
+
+test('原始记录被改写时游标要发现并重扫——不然那一行永远是旧的', () => {
+  // 2026-09-23 实咬：网关账本里同一行的 token 从 0 变成真值（先落一行、拿到 usage 再补全），
+  // 而偏移游标早就越过它 → 那一行**永远读不到最终版本**：近 6 小时 1453 条带 token 的行里
+  // 1451 条在库里是 0（3.4 亿 token 没记账），账号残差 $535 就是它。
+  // 修法不是「别用游标」（性能），而是**校验游标**：改写会改变字节长度，游标前的指纹必然变。
+  const dir = mkdtempSync(join(tmpdir(), 'mq-rewrite-'));
+  const f = join(dir, 'usage-2026-09.ndjson');
+  const line = (tok) => JSON.stringify({
+    v: 1, id: 'call-1', ts: '2026-09-23T12:00:00.000Z', sessionId: 's1', agent: 'claude',
+    model: 'claude-opus-5', viaRelay: true, leg: 'relay', status: 200,
+    input: tok, output: 0, cacheRead: 0, cacheWrite: 0,
+  });
+  const pricing = new Pricing(join(tmp, 'no-cache.json'));
+  writeFileSync(f, line(0) + '\n');
+
+  const cursors = {};
+  const first = [...gatewayRows({ dir, cutoff: 0, pricing, machine: 'm', cursors })];
+  assert.equal(first.length, 1);
+  assert.equal(first[0].i, 0, '第一轮读到的是「还没补全」的那一版');
+
+  // 就地改写同一行：token 变成真值，字节长度也变了
+  writeFileSync(f, line(1_000_000) + '\n');
+  const second = [...gatewayRows({ dir, cutoff: 0, pricing, machine: 'm', cursors })];
+  assert.equal(second.length, 1, '游标失效 → 整文件重扫，那一行必须再出来一次');
+  assert.equal(second[0].i, 1_000_000, '读到的是改写后的值（库里靠 MAX 补上）');
+
+  // 内容没变时不该白扫：游标有效就不重复产出
+  const third = [...gatewayRows({ dir, cutoff: 0, pricing, machine: 'm', cursors })];
+  assert.equal(third.length, 0, '没新内容就不该重复产出（游标仍在起作用）');
+
+  // 时间兜底：超过 10 分钟没整文件重扫过，就重扫一次（对付「长度没变但内容变了」的改写）
+  cursors[f].scannedAt = Date.now() - 11 * 60 * 1000;
+  const fourth = [...gatewayRows({ dir, cutoff: 0, pricing, machine: 'm', cursors })];
+  assert.equal(fourth.length, 1, '时间兜底到点 → 重扫一次');
 });
 
 test('reprice 按当前价目重算，且不动已被修剪的汇总行', async () => {
