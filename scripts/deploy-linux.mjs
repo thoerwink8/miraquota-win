@@ -104,10 +104,12 @@ if (lines.includes('NO_INSIGHTS')) {
 const hasSync = lines.includes('HAS_SYNC');
 say(`${HOST} · ${hostShort} · node ${nodeVer} · 同步配置 ${hasSync ? '已有（不动）' : '待写入'}`);
 
-/* ---------------- 2. 送代码：只有 provider，纯 Node、零依赖 ---------------- */
+/* ---------------- 2. 送代码：provider + 迁移工具，纯 Node、零依赖 ---------------- */
 await remote(`mkdir -p ${DIR}`);
 await new Promise((resolve, reject) => {
-  const tar = spawn('tar', ['-cf', '-', 'provider'], { cwd: ROOT, windowsHide: true });
+  // store-migrate.mjs 一起送：那台机器要能自己重建账本（换盘、换机器、迁 VPS 都走它），
+  // 它读原始记录用的是同一套 provider/lib/sources.mjs。
+  const tar = spawn('tar', ['-cf', '-', 'provider', 'scripts/store-migrate.mjs'], { cwd: ROOT, windowsHide: true });
   const ssh = spawn('ssh', [...SSH, HOST, `tar -xf - -C ${DIR}`], { windowsHide: true });
   let err = '';
   tar.stderr.on('data', (d) => { err += d; });

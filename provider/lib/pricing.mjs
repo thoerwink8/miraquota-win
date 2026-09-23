@@ -20,7 +20,10 @@ const MODELS_CACHE = join(homedir(), '.mirasim', 'models-dev-cache.json');
 // Opus 5.5 是 $0.20（不是 $4 的 10%）。这一列填错的代价被缓存读的体量放大——本机实测
 // 缓存读占 fable 花费的 56%，按 Fable 5 的 $1.00 记 5.1 会把账本抬高一倍多，倍率随之全错。
 // 新模型进表时逐项查官方价目，别按「10%/125%」推。
-const BUILTIN = {
+//
+// 导出给 store.mjs 种进 SQLite 的 prices 表：**代码仍是唯一来源**，库里那份只是给 SQL join
+// 用的副本，每次开库覆盖——免得"库里改了但代码没改"变成第二份价目表。
+export const BUILTIN = {
   'claude-opus-5-5':   [4, 20, 0.2, 5],
   'claude-opus-5':     [5, 25, 0.5, 6.25],
   'claude-opus-4-8':   [5, 25, 0.5, 6.25],
@@ -37,7 +40,7 @@ const BUILTIN = {
 
 // 系列兜底：认不出版本号时按这一代的当前款算。指向新款而不是老款——没收录的多半是更新的，
 // 而 fable 两款的缓存读差 4 倍，猜错方向就是账本偏一大截。
-const FAMILY = [
+export const FAMILY = [
   ['opus', 'claude-opus-5'], ['fable', 'claude-fable-5-1'],
   ['sonnet', 'claude-sonnet-5'], ['haiku', 'claude-haiku-4-5'],
 ];
@@ -46,8 +49,14 @@ const FAMILY = [
 // 剥掉它不算猜价——否则每个带日期的 id 都会在界面上被点名（2026-09-23 服务器日志实咬：
 // 一条 `claude-haiku-4-5-20251001 不在价目表，按 claude-haiku-4-5 的价记账`）。反过来，
 // 剥掉的是版本号（`claude-opus-5-5` → `claude-opus-5`）就是**另一个模型**，必须留痕报警——
-// 当初那个静默偏高的价正是这么来的。区分二者只看剥掉的那一段是不是纯数字日期。
-const SNAPSHOT_SUFFIX = /^\d{6,}$/;
+// 当初那个静默偏高的价正是这么来的。
+//
+// 思考档位后缀同理：`kimi-k3-high`、`gpt-5.6-luna-low`、`deepseek-v4-flash-max` 是同一款模型
+// 换个档位，**每 token 单价不变**（档位改的是它花多少 token）。2026-09-23 在 VPS 上实咬：
+// 不认这三个后缀，导入时刷了一屏"不在价目表"的假警报。
+//
+// 两类都算"同款模型的另一种写法"，只有剥掉版本号才算猜价。
+const SAME_MODEL_SUFFIX = /^(?:\d{6,}|low|medium|high|max|minimal|none|xhigh|ultra)$/i;
 
 // 缓存里几百个 provider 对同一模型标价不一。官方源优先，其余按名字序兜底——兜底价只用来
 // 让 kimi/gemini/qwen/glm 这类模型「有个数」而不是整行消失（用户 2026-09-02）。
@@ -121,7 +130,7 @@ export class Pricing {
       const popped = parts.pop();
       const key = parts.join('-');
       const hit = this.table[key];
-      if (hit) return SNAPSHOT_SUFFIX.test(popped) ? hit : this.#guess(id, key, hit);
+      if (hit) return SAME_MODEL_SUFFIX.test(popped) ? hit : this.#guess(id, key, hit);
     }
     for (const [family, key] of FAMILY) {
       if (id.includes(family)) return this.#guess(id, key, this.table[key]);

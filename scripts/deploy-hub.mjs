@@ -121,7 +121,7 @@ say(`${HOST} · ${hostShort} · node ${nodeVer} · nginx ${hasNginx ? '有' : '�
 /* ---------------- 2. 送代码：server/ + provider/，纯 Node 零依赖 ---------------- */
 await remote(`mkdir -p ${DIR} ${DATA}`);
 await new Promise((resolve, reject) => {
-  const tar = spawn('tar', ['-cf', '-', 'server', 'provider'], { cwd: ROOT, windowsHide: true });
+  const tar = spawn('tar', ['-cf', '-', 'server', 'provider', 'scripts/store-migrate.mjs'], { cwd: ROOT, windowsHide: true });
   const ssh = spawn('ssh', [...SSH, HOST, `tar -xf - -C ${DIR}`], { windowsHide: true });
   let err = '';
   tar.stderr.on('data', (d) => { err += d; });
