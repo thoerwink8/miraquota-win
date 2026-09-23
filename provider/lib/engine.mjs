@@ -64,6 +64,11 @@ const CHANNEL_DEFAULT = 4970;
 const STALE_AFTER = 90;      // 秒；超过转 stale
 const RECKON_AFTER = 600;    // 秒；stale 超过此龄期转锚点推算
 const AUTOJOIN_EVERY = 3600; // 秒；未配置多机同步时，隔多久静默探一次默认仓能不能读
+// 流水增量推给 hub 的节奏与批量：明细比聚合大得多（一批 2000 行 ≈ 300 KB），所以比同步轮
+// （10 分钟）密一档、但一轮最多推几批——推不完下轮接着推，水位保证不重不漏。
+const JOURNAL_EVERY = 300;      // 秒；两次推流水之间的最小间隔
+const JOURNAL_BATCH = 2000;     // 每批行数（与 journalSince 的 limit 一致）
+const JOURNAL_MAX_BATCHES = 8;  // 一轮最多推几批，别把一轮 poll 拖长
 /**
  * 秒；hub 通道下「这台机器刚有新动静」时的最短发布间隔。
  *
@@ -578,11 +583,45 @@ export class Engine {
       this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
       this.#maybeQuotaPull(Date.now() / 1000);   // 本机没实测时，额度从还在跑的那台机器补
       this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
+      await this.#pushJournalDelta();
       return !!this.last;
     } finally { this.#pollBusy = false; }
   }
 
   #pollBusy = false;
+  #journalBusy = false;
+  #journalAt = 0;
+
+  /**
+   * 把本机流水增量推给 hub（明细，供账号级对账与任务报表）。
+   *
+   * 三件事定成败：
+   *  1. **只有 hub 通道收**——git/收件口那条路是聚合分片，流水块还没做；
+   *  2. **按批推、推完再退水位**：水位存库里（重启不丢），失败就停在那批之前，下一轮重试。
+   *     行的 `kh` 是主键，重推幂等，所以「宁可重推一段」是安全的；
+   *  3. **不挡主流程**：失败只记一行日志，不抛——它不该让采集/展示跟着挂。
+   */
+  async #pushJournalDelta() {
+    if (this.sync?.mode !== 'hub' || this.opts.noLocal) return;
+    const now = Date.now() / 1000;
+    if (this.#journalBusy || now - this.#journalAt < JOURNAL_EVERY) return;
+    this.#journalAt = now;
+    this.#journalBusy = true;
+    try {
+      let since = this.ledger.journalWatermark();
+      if (since == null) since = Math.floor(now) - 8 * 86400;   // 新库：从保留窗起点补一次
+      for (let i = 0; i < JOURNAL_MAX_BATCHES; i++) {
+        const rows = this.ledger.journalSince(since);
+        if (!rows.length) break;
+        await this.sync.pushJournal(rows);
+        since = rows[rows.length - 1].ts;                        // 按 ts 升序取的，最后一行就是水位
+        this.ledger.setJournalWatermark(since);
+        if (rows.length < JOURNAL_BATCH) break;
+      }
+    } catch (e) {
+      console.error(`[journal] 推流水失败（下一轮重试，水位没退）：${String(e?.message || e).slice(0, 160)}`);
+    } finally { this.#journalBusy = false; }
+  }
 
   /** 契约 A 的 quota.json。只填有据可查的字段，控件对缺字段是容忍的。 */
   payload() {

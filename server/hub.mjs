@@ -176,6 +176,30 @@ export class Hub {
       return json(res, 200, { ok: true, accepted: took });
     }
 
+    /**
+     * 收各机的**流水明细**（一次一批，调用方按批循环）。
+     *
+     * 与 /shard 的分工：分片是聚合（三张卡与「谁花的」够用），流水是逐笔——有了它，hub 才能出
+     * 全账号的任务级报表与逐点对账（「后端管理对账」要的就是这个）。落进同一张 `calls` 表，
+     * `machine` 维度区分机器，所以合并口径不需要第二套逻辑。
+     *
+     * 幂等：行的 `kh` 就是主键，重复推同一批不会重复计——客户端因此可以放心重推（水位退一格
+     * 或多推一段都安全）。
+     */
+    if (req.method === 'PUT' && path === '/journal') {
+      if (!write()) return json(res, 401, { error: 'token 不对' });
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch (e) { return json(res, 400, { error: e.message }); }
+      const machine = String(body?.machineId || '').trim();
+      if (!machine) return json(res, 400, { error: '缺 machineId' });
+      const rows = (Array.isArray(body?.rows) ? body.rows : [])
+        .filter((r) => r && Number.isFinite(r.ts) && typeof r.model === 'string' && r.kh != null);
+      if (!rows.length) return json(res, 400, { error: '缺 rows（或没有一行是完整的）' });
+      const accepted = this.engine.ledger.store.insertCalls(rows.map((r) => ({ ...r, machine })));
+      if (accepted) { this.engine.ledger.invalidate(); this.#bump(); }
+      return json(res, 200, { ok: true, accepted, got: rows.length });
+    }
+
     if (req.method === 'GET' && path === '/payload') {
       if (!read()) return json(res, 401, { error: 'token 不对' });
       return json(res, 200, this.payload());

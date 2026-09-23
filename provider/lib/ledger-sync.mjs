@@ -417,6 +417,24 @@ export class LedgerSync {
   #hubAuth() { return this.config?.token ? { authorization: `Bearer ${this.config.token}` } : {}; }
 
   /**
+   * hub：把本机**流水增量**推给服务器。
+   *
+   * 与分片分开：分片是聚合（三张卡够用），流水是明细——hub 手里有了明细，才谈得上「后端管理
+   * 对账」（全账号逐点对账）与「每个任务花了多少」。两者都是幂等 PUT，谁失败都不连带另一个。
+   *
+   * 只走 hub 通道：收件口（Cloudflare KV）那条路按同一套行格式收流水块是后面的事。
+   * @returns {number} 服务端采纳（新插入）的行数；没配/失败一律 0，调用方据此决定要不要退水位
+   */
+  async pushJournal(rows, { machineId = null } = {}) {
+    if (this.config?.mode !== 'hub' || !Array.isArray(rows) || !rows.length) return 0;
+    const r = await http(`${this.config.hub}/journal`, {
+      method: 'PUT', headers: this.#hubAuth(),
+      body: JSON.stringify({ machineId: machineId ?? this.machineId, installId: this.installId, rows }),
+    });
+    return Number(r?.accepted) || 0;
+  }
+
+  /**
    * 把本机读到的账号额度推给 hub。只有跑着 Mirasim 的机器调得动这条——
    * 额度点是账号级的，服务器自己没有 Mirasim，这份数据只能由这样的机器送上去。
    *

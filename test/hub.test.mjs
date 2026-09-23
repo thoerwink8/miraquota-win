@@ -217,3 +217,44 @@ test('a restarted hub answers from disk before anyone pushes again', async () =>
   assert.equal(p.windows.find((x) => x.label === '7d').points.used, 100_000);
   assert.equal(p.hub.machines.length, 1);
 });
+
+/**
+ * 流水明细（`PUT /journal`）：hub 手里有逐笔，才谈得上账号级对账与任务报表。
+ * 三条要钉住：跨机合并、幂等重推、机器维度不串。
+ */
+test('the hub ingests journal rows: merged across machines, idempotent on re-push', async () => {
+  const hub = freshHub();
+  const row = (machine, ts, usd, kh, model = 'claude-opus-5') => ({
+    kh: String(kh), ts, src: 'g', side: 'g', model, sid: `${machine}-s1`, ws: 'D:\\proj',
+    i: 1_000_000, o: 0, cr: 0, cw: 0, usd, priced: 1, billable: 1,
+  });
+  const aRows = [row('win-box', NOW - 120, 5, 111n), row('win-box', NOW - 60, 3, 222n)];
+  const bRows = [row('mac-box', NOW - 90, 7, 333n)];
+
+  const first = await call(hub, 'PUT', '/journal', { body: { machineId: 'win-box', rows: aRows } });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.accepted, 2, '两行都是新的');
+  await call(hub, 'PUT', '/journal', { body: { machineId: 'mac-box', rows: bRows } });
+
+  // 幂等：同一批再推一次，一行都不采纳（kh 是主键）
+  const again = await call(hub, 'PUT', '/journal', { body: { machineId: 'win-box', rows: aRows } });
+  assert.equal(again.body.accepted, 0, '重推同一批不该重复计');
+
+  const { body: p } = await call(hub, 'GET', '/payload');
+  assert.ok(Math.abs(p.windows.find((x) => x.label === '7d').spentUSD - 15) < 1e-9, '5+3+7 三笔合并');
+
+  // 机器维度分得开：同一份库里按 machine 拆得出来（payload 暂时还没有这个面，直接查库钉住）。
+  // 注意 hub.machines 是**分片**那张表，流水行不进那里——两者不是一回事，别混着断言。
+  const perMachine = hub.engine.ledger.store.db.prepare(`SELECT m.name machine, SUM(c.usd) usd
+    FROM calls c JOIN dims m ON m.id = c.machine GROUP BY m.name ORDER BY usd DESC`).all()
+    .map((r) => ({ machine: r.machine, usd: r.usd }));   // node:sqlite 回的是 null 原型对象，deepEqual 认原型
+  assert.deepEqual(perMachine, [{ machine: 'win-box', usd: 8 }, { machine: 'mac-box', usd: 7 }],
+    '两台机器的流水各归各的，合并口径才谈得上「谁花的」');
+  const one = await call(hub, 'PUT', '/journal', { body: { machineId: '', rows: aRows } });
+  assert.equal(one.status, 400, '缺 machineId 要拒——不然那批行不知道该算谁的');
+  const bad = await call(hub, 'PUT', '/journal', { body: { machineId: 'x', rows: [{ ts: 'NaN' }] } });
+  assert.equal(bad.status, 400, '一行都不完整也拒，不写半截');
+  const noToken = await call(hub, 'PUT', '/journal', { body: { machineId: 'x', rows: aRows }, token: null });
+  assert.equal(noToken.status, 401, '写接口一律要 token');
+  await hub.close();
+});

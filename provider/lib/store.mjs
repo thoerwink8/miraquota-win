@@ -308,7 +308,9 @@ export class UsageStore {
     try {
       for (const r of rows) {
         const ts = Math.floor(r.ts);
-        const kh = keyHash(r.key);
+        // 带 `kh` 的行来自别的机器（hub 收流水增量）：那边算好哈希了，直接用字符串传过来
+        // （63 位整数超过 Number.MAX_SAFE_INTEGER，读回会抛 ERR_OUT_OF_RANGE，所以一律走 BigInt）。
+        const kh = r.kh != null ? BigInt(r.kh) : keyHash(r.key);
         const fresh = has.get(kh) == null;
         ins.run(
           kh, r.src, r.side ?? (r.src === 't' ? 't' : 'g'), ts, Math.floor(ts / 3600), dayInt(ts),
