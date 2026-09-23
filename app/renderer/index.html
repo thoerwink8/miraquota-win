@@ -758,9 +758,11 @@
       $('speedNote').textContent = (src.key
         ? `最近 ${sp.rows.length} 种 · ${src.at ? ago(src.at) + '的快照' : '快照'}`
         : `最近 ${sp.rows.length} 种`)
-        // 本轮（5h 窗）这些模型一共花了多少——速度表原来只有 tok/s，没有钱
-        // （用户 2026-09-23：「速度那一栏，能不能顺便填写一下这一行本次消耗的费用，这样更直观」）。
-        + (sp.usdTotal > 0 ? ` · 本轮 ${money(sp.usdTotal)}` : '');
+        // **当前 5h 窗口**内这些模型在本机账本上花了多少——速度表原来只有 tok/s，没有钱
+        // （用户 2026-09-23：「速度那一栏，能不能顺便填写一下这一行本次消耗的费用」）。
+        // 标签把「哪个窗口」和「哪个口径」都写死：它与 5h 卡同窗，但口径是**本机账本**
+        // （官方点数没有按模型的拆分）。读不到官方窗口时这里什么都不加，不换定义。
+        + (sp.usdTotal > 0 ? ` · 5h 窗 · 本机账本 ${money(sp.usdTotal)}` : '');
       const alive = new Set(sp.rows.map((r) => r.model));
       for (const id of [...openSpeedModels]) if (!alive.has(id)) openSpeedModels.delete(id);
       $('speedRows').innerHTML = sp.rows.map((r, rowIndex) => {
@@ -771,9 +773,9 @@
         const metric = r.rate != null
           ? `${r.ttft != null ? '首字 ≈' + r.ttft.toFixed(1) + 's · ' : ''}${r.rate.toFixed(0)} tok/s`
           : `端到端 ${Number(r.endToEnd ?? 0).toFixed(0)} tok/s`;
-        // 这一行**本轮**花了多少（同一台机器、同一个 5h 窗，与账本同源）
+        // 这一行在**当前 5h 窗口**花了多少（本机账本口径，与表头同一个窗口同一个来源）
         const cost = r.usd > 0
-          ? `<span class="usd" title="本轮（${sp.usdWindow ?? '5h'} 窗）这个模型在本机账本上的花费">${money(r.usd)}</span> `
+          ? `<span class="usd" title="当前 5h 窗口（与 5h 卡同窗）内，这个模型在**本机账本**上的花费（token × API 价）">${money(r.usd)}</span> `
           : '';
         const tasks = (r.tasks ?? []).map((task, taskIndex) => `<tr class="task-row task-for-${rowIndex}" style="display:${open ? '' : 'none'}">
           <td>任务 ${taskIndex + 1}</td><td>${task.rate != null ? task.rate.toFixed(0) + ' tok/s' : '—'} · ${task.durationMs != null ? (task.durationMs / 1000).toFixed(1) + 's' : '—'}</td><td class="t">${ago(task.at)}</td></tr>`).join('');

@@ -1029,8 +1029,10 @@
     } else {
       if (c.pulse) { c.tag.textContent = ''; c.tag.__v = undefined; c.pulse = null; }
       c.tag.style.color = 'var(--ink3)';
-      // 本轮（5h 窗）这些模型一共花了多少——速度卡原来只有 tok/s，没有钱
-      setText(c.tag, `最近 ${(sp.rows || []).length} 种` + (sp.usdTotal > 0 ? ` · 本轮 ${usd(sp.usdTotal)}` : ''));
+      // **当前 5h 窗口**内这些模型在本机账本上花了多少（与桌面面板同一个窗口同一个口径）。
+      // 标签写死窗口与口径；读不到官方窗口时引擎不给这个数，这里也就什么都不加。
+      setText(c.tag, `最近 ${(sp.rows || []).length} 种`
+        + (sp.usdTotal > 0 ? ` · 5h 窗 · 本机账本 ${usd(sp.usdTotal)}` : ''));
     }
 
     const rows = sp.rows || [];
@@ -1051,10 +1053,10 @@
       const drift = row.driftNotable;
       setText(r.dr, drift == null ? '' : `${drift > 0 ? '快' : '慢'}${Math.abs(drift).toFixed(0)}%`);
       setTone(r.dr, 'dr', drift == null ? '' : drift > 0 ? 'fast' : 'slow');
-      // 这一行**本轮**花了多少（与桌面面板同一条信息，两个显示面不各讲一套）。
+      // 这一行在**当前 5h 窗口**花了多少（本机账本口径，与表头同一个窗口同一个来源）。
       // 用 setTick（记忆化）而不是 setText：这一格每帧都在重画，没必要每次都写 DOM。
       setTick(r.n, (row.usd > 0 ? usd(row.usd) + ' · ' : '') + ago(row.latestAt));
-      if (row.usd > 0) r.n.title = `本轮（${sp.usdWindow ?? '5h'} 窗）这个模型在本机账本上的花费`;
+      if (row.usd > 0) r.n.title = '当前 5h 窗口内这个模型在本机账本上的花费（token × API 价）';
       const rowTasks = row.tasks || [];
       r.tasks.innerHTML = rowTasks.map((task, taskIndex) => {
         const speed = task.rate == null ? '—' : `${task.rate.toFixed(0)} tok/s`;

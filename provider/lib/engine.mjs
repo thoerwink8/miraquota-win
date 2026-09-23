@@ -378,18 +378,22 @@ export class Engine {
   #speedReport() { if (!this.speed) return null; try { return this.speed.report(); } catch { return null; } }
 
   /**
-   * 速度卡每一行补上「这个模型**本轮**花了多少」。
+   * 速度卡每一行补上「这个模型在**当前 5h 窗口**花了多少」。
    *
    * 速度表原来只有 tok/s 与时间——用户 2026-09-23：「速度那一栏，能不能顺便填写一下这一行
-   * 本次消耗的费用，这样更直观」。花费的权威来源是账本（不是速度模块自己的事件），所以在这里
-   * 合流：`byModel` 按模型给窗口内的美元，挂到对应的行上；窗口取**5h 池**——它是最短的官方窗口，
-   * 「本轮」指的就是它。行上的模型名是短名，所以按 modelId 匹配。
+   * 本次消耗的费用，这样更直观」。花费的权威来源是账本（速度模块自己的事件里只有 token 与
+   * 时长，没有美元），所以在这里合流。
+   *
+   * **口径只有一种**：当前官方 5h 窗口（`resetAt − duration`），与同一屏的 5h 卡**严格同窗**；
+   * 读不到窗口就**不给这个数**。第一版在窗口缺席时退成「最近 5 小时」，同一个标签下藏了两种
+   * 含义（用户 2026-09-23 追问「本轮到底是什么意思」）——宁可空着，也不要一个会变的定义。
+   * 给的也是**本机账本**（token × 价），不是主卡那种官方点数换算：官方点数没有按模型的拆分。
    */
   #speedWithCost(report, nowSec, windows) {
     if (!report?.rows?.length) return report;
-    // 窗口取**5h 池**（最短的官方窗口，「本轮」指的就是它）；读不到就用「最近 5 小时」兜底。
     const w = (windows ?? []).find((x) => x.label === '5h' && !x.modelScoped);
-    const from = w?.resetAt != null && w?.durationSeconds ? w.resetAt - w.durationSeconds : nowSec - 5 * 3600;
+    if (w?.resetAt == null || !w?.durationSeconds) return report;   // 没有官方窗口 ⇒ 不显示，别换定义
+    const from = w.resetAt - w.durationSeconds;
     let byModel = [];
     try { byModel = this.ledger.store.byModel(from, nowSec); } catch { byModel = []; }
     const usd = new Map(byModel.map((r) => [r.model, r.usd]));
@@ -399,7 +403,7 @@ export class Engine {
       total += u;
       return u > 0 ? { ...r, usd: u } : r;
     });
-    return { ...report, rows, usdWindow: '5h', usdTotal: total, usdFrom: from };
+    return { ...report, rows, usdWindow: '5h', usdTotal: total, usdFrom: from, usdBasis: 'ledger' };
   }
 
   /**

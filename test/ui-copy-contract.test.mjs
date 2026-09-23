@@ -107,16 +107,18 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /lastShardSec/);
 });
 
-test('速度卡每一行要带本轮花费（tok/s 旁边得有钱）', () => {
-  // 用户 2026-09-23：「速度那一栏，能不能顺便填写一下这一行本次消耗的费用，这样更直观」。
-  // 花费的权威来源是账本，所以在引擎里合流（速度模块自己的事件里没有美元），
-  // 两个显示面都要显示，且行上的模型名是短名 ⇒ 必须按 modelId 匹配。
+test('速度卡每一行要带 5h 窗花费，且窗口口径只能有一个含义', () => {
+  // 用户 2026-09-23：「速度那一栏，能不能顺便填写一下这一行本次消耗的费用，这样更直观」，
+  // 随后追问「本轮到底是什么意思」——因为第一版把「当前 5h 窗口」和「最近 5 小时」两种含义
+  // 塞进了同一个标签。钉住：只有当前官方 5h 窗口一种定义，读不到就**不给这个数**（不许换定义），
+  // 标签写死窗口与口径（本机账本，不是官方点数换算——官方点数没有按模型的拆分）。
   assert.match(engine, /#speedWithCost\(this\.#speedReport\(\)/);
   assert.match(engine, /this\.ledger\.store\.byModel\(from, nowSec\)/);
   assert.match(engine, /usd\.get\(r\.modelId\)/);
-  assert.match(renderer, /本轮 \$\{money\(sp\.usdTotal\)\}/);
-  assert.match(renderer, /本轮（\$\{sp\.usdWindow/);
-  assert.match(widget, /本轮 \$\{usd\(sp\.usdTotal\)\}/);
+  assert.match(engine, /if \(w\?\.resetAt == null \|\| !w\?\.durationSeconds\) return report;/);
+  assert.doesNotMatch(engine, /nowSec - 5 \* 3600/, '不许再有「最近 5 小时」的兜底：那会让同一个标签变含义');
+  assert.match(renderer, /5h 窗 · 本机账本 \$\{money\(sp\.usdTotal\)\}/);
+  assert.match(widget, /5h 窗 · 本机账本 \$\{usd\(sp\.usdTotal\)\}/);
   assert.match(widget, /row\.usd > 0 \? usd\(row\.usd\)/);
 });
 
