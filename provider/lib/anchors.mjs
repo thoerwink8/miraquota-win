@@ -38,11 +38,31 @@ export function anchorsFrom(windows, capturedSec) {
 }
 
 export class AnchorStore {
-  /** @param stateFile 落盘路径（服务端 hub 注入自己的数据目录，默认 ~/.miraquota/anchor.json） */
-  constructor(stateFile = STATE_FILE) {
+  /**
+   * @param stateFile 落盘路径（服务端 hub 注入自己的数据目录，默认 ~/.miraquota/anchor.json）
+   * @param opts.store UsageStore；给了就以**库**为准（锚点进 `anchors` 表），
+   *   JSON 只在库里没有锚点时读一次当迁移源。
+   */
+  constructor(stateFile = STATE_FILE, { store = null } = {}) {
     this.stateFile = stateFile;
+    this.store = store;
     this.anchors = [];      // [{ label, resetAt, duration, capturedAt, usedPercent, budget, used, modelScoped }]
     this.capturedAt = 0;
+    if (this.store) {
+      const rows = this.store.readAnchors();
+      if (rows.length) {
+        this.anchors = rows;
+        this.capturedAt = Number(this.store.metaGet('anchors_captured_at')) || 0;
+        return;
+      }
+      try {
+        const p = JSON.parse(readFileSync(stateFile, 'utf8'));
+        this.anchors = p.anchors ?? [];
+        this.capturedAt = p.capturedAt ?? 0;
+        if (this.anchors.length) this.#write();
+      } catch { /* 首次运行 */ }
+      return;
+    }
     try {
       const p = JSON.parse(readFileSync(stateFile, 'utf8'));
       this.anchors = p.anchors ?? [];
@@ -60,14 +80,22 @@ export class AnchorStore {
     this.capturedAt = capturedSec;
     if (changed || capturedSec - (this.#lastWrite ?? 0) > 600) {
       this.#lastWrite = capturedSec;
-      try {
-        mkdirSync(dirname(this.stateFile), { recursive: true });
-        writeFileSync(this.stateFile, JSON.stringify({ anchors: this.anchors, capturedAt: capturedSec }));
-      } catch { /* ignore */ }
+      this.#write();
     }
   }
 
   #lastWrite;
+
+  #write() {
+    if (this.store) {
+      try { this.store.putAnchors(this.anchors, this.capturedAt); } catch { /* ignore */ }
+      return;
+    }
+    try {
+      mkdirSync(dirname(this.stateFile), { recursive: true });
+      writeFileSync(this.stateFile, JSON.stringify({ anchors: this.anchors, capturedAt: this.capturedAt }));
+    } catch { /* ignore */ }
+  }
 
   get usable() {
     return this.anchors.length > 0 && Date.now() / 1000 - this.capturedAt < ANCHOR_MAX_AGE;

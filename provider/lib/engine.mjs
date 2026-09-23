@@ -195,10 +195,11 @@ export class Engine {
       pricing: this.pricing,
       home: opts.home,
     });
-    this.pointsAttrib = new PointsAttributor(opts.attribFile);
-    // 标定的点数采样与 marks 跟着流水进同一个库（`calibration.json` 从此只当迁移源读一次）。
+    // 三份「跟着账本走」的小状态都进同一个库（Phase 2b）：标定的点数采样与 marks、
+    // 点数归因的桶、窗口锚点。各自的 JSON 从此只当迁移源读一次。
+    this.pointsAttrib = new PointsAttributor(opts.attribFile, { store: this.ledger.store });
     this.calibrator = new Calibrator(opts.calibratorFile, { store: this.ledger.store });
-    this.anchors = new AnchorStore(opts.anchorFile);
+    this.anchors = new AnchorStore(opts.anchorFile, { store: this.ledger.store });
     this.settings = new Settings(opts.settingsFile);
     this.sync = new LedgerSync(opts.syncOpts);
     // 同步启用时放宽归因静置：外机支出要等它下一轮发布分片才可见（见 points-attrib.mjs）。

@@ -20,14 +20,21 @@ const SETTLE_SEC = 300;           // 等 relay 回填的静置时长
 const UNATTR = '?';               // 无主家族键
 
 export class PointsAttributor {
-  constructor(stateFile = STATE_FILE) {
+  /**
+   * @param stateFile 落盘路径（没有库时用；测试注入）
+   * @param opts.store UsageStore；给了就以**库**为准（桶进 `attrib` 表，小状态进 `meta`），
+   *   JSON 只在库里一条都没有时读一次当迁移源。内存形状不变——查询照旧走内存前缀和。
+   */
+  constructor(stateFile = STATE_FILE, { store = null } = {}) {
     this.stateFile = stateFile;
+    this.store = store;
     this.buckets = {};   // "家族|分钟" → 点数（家族为 ? 时是无主）
     this.last = null;    // { label, resetAt, used, at } 基准窗上次采样
     this.pending = [];   // [{ from, to, points }] 待静置的增量
     this.sinceSec = null; // 归因起始时刻（覆盖率判断用）
     this.settleSec = SETTLE_SEC;
     this.#index = {};
+    this.#dirty = new Map();   // 待写库的桶（key → points）
     this.#load();
   }
 
@@ -40,18 +47,61 @@ export class PointsAttributor {
   }
 
   #index;
+  #dirty;
+
+  #loadJson() {
+    try { return JSON.parse(readFileSync(this.stateFile, 'utf8')); } catch { return null; }
+  }
 
   #load() {
-    try {
-      const p = JSON.parse(readFileSync(this.stateFile, 'utf8'));
+    if (this.store) {
+      const rows = this.store.db.prepare('SELECT family, minute, points FROM attrib').all();
+      const last = this.store.metaGet('attrib_last');
+      const since = this.store.metaGet('attrib_since');
+      const pending = this.store.metaGet('attrib_pending');
+      if (rows.length || last || pending) {
+        for (const r of rows) this.buckets[r.family + '|' + r.minute] = r.points;
+        this.last = last ? JSON.parse(last) : null;
+        this.sinceSec = since ? Number(since) : null;
+        this.pending = pending ? JSON.parse(pending) : [];
+        return;
+      }
+      // 库里空着而 JSON 还在 = 第一次上库：导进去，此后 JSON 不再写。
+      const legacy = this.#loadJson();
+      if (legacy) {
+        this.buckets = legacy.buckets ?? {};
+        this.last = legacy.last ?? null;
+        this.pending = Array.isArray(legacy.pending) ? legacy.pending : [];
+        this.sinceSec = legacy.sinceSec ?? null;
+        this.#save();
+      }
+      return;
+    }
+    const p = this.#loadJson();
+    if (p) {
       this.buckets = p.buckets ?? {};
       this.last = p.last ?? null;
       this.pending = Array.isArray(p.pending) ? p.pending : [];
       this.sinceSec = p.sinceSec ?? null;
-    } catch { /* 首次运行 */ }
+    }
   }
 
   #save() {
+    if (this.store) {
+      // 桶是**批量**（settle 一次分摊一整批）；小状态进 meta——`pending` 是待静置的短队列，
+      // 从不参与查询，给它单开一张表只是把 JSON 换个地方放。
+      if (this.#dirty.size) {
+        this.store.insertAttrib([...this.#dirty].map(([k, points]) => {
+          const cut = k.indexOf('|');
+          return { family: k.slice(0, cut), minute: Number(k.slice(cut + 1)), points };
+        }));
+        this.#dirty.clear();
+      }
+      this.store.metaSet('attrib_last', JSON.stringify(this.last ?? null));
+      this.store.metaSet('attrib_pending', JSON.stringify(this.pending));
+      if (this.sinceSec != null) this.store.metaSet('attrib_since', String(Math.floor(this.sinceSec)));
+      return;
+    }
     try {
       mkdirSync(dirname(this.stateFile), { recursive: true });
       writeFileSync(this.stateFile, JSON.stringify({
@@ -108,6 +158,7 @@ export class PointsAttributor {
   #add(id, minute, points) {
     const key = id + '|' + minute;
     this.buckets[key] = (this.buckets[key] ?? 0) + points;
+    this.#dirty.set(key, this.buckets[key]);
     this.#index[id] = null;
   }
 
@@ -116,6 +167,7 @@ export class PointsAttributor {
     for (const k of Object.keys(this.buckets)) {
       if (Number(k.slice(k.indexOf('|') + 1)) < cut) { delete this.buckets[k]; this.#index = {}; }
     }
+    if (this.store) this.store.pruneAttrib(cut);
   }
 
   /** [fromSec, toSec) 内归到该家族的点数。id 传 '?' 查无主。 */

@@ -56,6 +56,9 @@ import { familyLabel, modelFamily } from './model-families.mjs';
  * v1/v2 都没发布过，所以旧库直接**重建派生表**（见 `#migrate`）：流水能从原始记录重扫回来。
  * 从 v3 起，任何破坏性改形状都必须先写就地迁移，否则宁可拒绝打开——原始记录不是永远都在
  * （transcript 会被 Claude Code 清掉，那天已经发生过一次）。
+ *
+ * v3 之后加的 `attrib` / `anchors` 是**加表**，没动 calls/hourly/dims 的列与主键，所以不 +1：
+ * DDL 每次开库都跑（`CREATE TABLE IF NOT EXISTS`），旧库自然长出这两张表。
  */
 export const STORE_SCHEMA = 3;
 export const STORE_FILE = join(homedir(), '.miraquota', 'store.db');
@@ -160,6 +163,21 @@ CREATE TABLE IF NOT EXISTS limits (
 );
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+
+-- 点数归因：官方点数增量按同期各家族账本美元占比分摊的结果。以前是 points-attrib.json
+-- （本机 74 KB），现在跟流水同一个库。
+CREATE TABLE IF NOT EXISTS attrib (
+  family TEXT NOT NULL, minute INTEGER NOT NULL, points REAL NOT NULL,
+  PRIMARY KEY (family, minute)
+) WITHOUT ROWID;
+
+-- 窗口锚点：离线推算的依据（最后一次实测的窗口边界、百分比与满额）。**整组替换**——
+-- 它是一组快照而不是累积量，所以没有 upsert 语义，写的时候按 (label, reset_at) 覆盖。
+CREATE TABLE IF NOT EXISTS anchors (
+  label TEXT NOT NULL, reset_at INTEGER NOT NULL, duration INTEGER,
+  captured_at INTEGER, used_percent REAL, budget REAL, used REAL, model_scoped INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (label, reset_at)
+) WITHOUT ROWID;
 `;
 
 /** 视图：把"这一小时听谁的"写在一处。所有查询都走它，于是口径是查询时的事。 */
@@ -363,6 +381,72 @@ export class UsageStore {
   markSeries(model, fromSec, toSec) {
     return this.db.prepare('SELECT at, cum, broken FROM marks WHERE model = ? AND at >= ? AND at <= ? ORDER BY at')
       .all(String(model), Math.floor(fromSec), Math.floor(toSec));
+  }
+
+  // MARK: 点数归因与锚点（Phase 2b 余下：这两个从前各写一个 JSON 文件）
+
+  /**
+   * 归因桶（家族|分钟 → 点数）。**累加由调用方算好**——这里只写最终值，
+   * 因为分摊要按同期的家族美元占比一次算完，不是逐笔 upsert。
+   */
+  insertAttrib(rows) {
+    if (!rows?.length) return 0;
+    const ins = this.db.prepare('INSERT INTO attrib (family,minute,points) VALUES (?,?,?) ON CONFLICT(family,minute) DO UPDATE SET points=excluded.points');
+    this.db.exec('BEGIN');
+    try {
+      for (const r of rows) ins.run(String(r.family), Math.floor(r.minute), r.points);
+      this.db.exec('COMMIT');
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+    return rows.length;
+  }
+
+  /** 区间内每个家族的归因点数（分钟粒度，半开区间）。 */
+  attribRange(fromSec, toSec) {
+    return this.db.prepare(`SELECT family, SUM(points) points FROM attrib
+      WHERE minute >= ? AND minute <= ? GROUP BY family`)
+      .all(Math.floor(fromSec / 60), Math.floor(toSec / 60))
+      .map((r) => ({ family: r.family, points: r.points }));
+  }
+
+  pruneAttrib(cutoffMinute) {
+    return this.db.prepare('DELETE FROM attrib WHERE minute < ?').run(Math.floor(cutoffMinute)).changes;
+  }
+
+  /** 锚点是一组快照：整组替换，不做累积（同一 (label, reset_at) 覆盖）。 */
+  putAnchors(anchors, capturedAt) {
+    const ins = this.db.prepare(`INSERT INTO anchors
+      (label,reset_at,duration,captured_at,used_percent,budget,used,model_scoped) VALUES (?,?,?,?,?,?,?,?)
+      ON CONFLICT(label,reset_at) DO UPDATE SET duration=excluded.duration, captured_at=excluded.captured_at,
+        used_percent=excluded.used_percent, budget=excluded.budget, used=excluded.used, model_scoped=excluded.model_scoped`);
+    this.db.exec('BEGIN');
+    try {
+      // 换了一批窗口（重置时刻变了）就把旧窗口清掉：锚点只对**当前这一组**有意义，
+      // 留着旧的重置时刻会让离线推算在窗口换代后挑错行。
+      this.db.exec('DELETE FROM anchors');
+      for (const a of anchors ?? []) {
+        ins.run(String(a.label), Math.floor(a.resetAt), a.duration ?? null, Math.floor(a.capturedAt ?? capturedAt ?? 0),
+          a.usedPercent ?? null, a.budget ?? null, a.used ?? null, a.modelScoped ? 1 : 0);
+      }
+      this.db.exec('COMMIT');
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+    this.metaSet('anchors_captured_at', String(Math.floor(capturedAt ?? 0)));
+    return (anchors ?? []).length;
+  }
+
+  readAnchors() {
+    return this.db.prepare(`SELECT label,reset_at,duration,captured_at,used_percent,budget,used,model_scoped
+      FROM anchors ORDER BY label`).all().map((r) => ({
+      label: r.label, resetAt: r.reset_at, duration: r.duration, capturedAt: r.captured_at,
+      usedPercent: r.used_percent, budget: r.budget, used: r.used, modelScoped: !!r.model_scoped,
+    }));
+  }
+
+  /** meta 里的标量（游标、口径、归因的小状态）。批量读一次省得逐条查。 */
+  metaGet(k) { return this.db.prepare('SELECT v FROM meta WHERE k = ?').get(String(k))?.v ?? null; }
+
+  metaSet(k, v) {
+    this.db.prepare('INSERT INTO meta (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v')
+      .run(String(k), String(v));
   }
 
   /** 会话轮次（任务归属用）。 */
