@@ -237,3 +237,25 @@ test('source parsers agree with what the old ledger booked', () => {
   assert.equal(turn.task, 'task-9');
   assert.equal(turn.endedAt, T0 + 30);
 });
+
+test('journalSince 出来的行必须能直接进 JSON（BigInt 进不去）', async () => {
+  // 2026-09-23 上线时实咬：`kh` 是 63 位整数，读它必须开 setReadBigInts——但那是**整条语句
+  // 级别**的开关，ts/i/o/… 会跟着一起变 BigInt，于是 `JSON.stringify` 抛
+  // `Do not know how to serialize a BigInt`，流水一条都推不上去（VPS 日志里就这一行）。
+  // hub 那条测试是直接 POST 行的（绕过了 journalSince），所以没拦住——这条专门盯它。
+  const { JournalLedger } = await import('../provider/lib/journal-ledger.mjs');
+  const led = new JournalLedger({ file: join(tmp, 'journal-since.db'), machine: 'm1' });
+  led.store.insertCalls([{
+    key: 'g|json-row', src: 'g', ts: T0, model: 'claude-opus-5', sid: 's1', ws: 'D:\\p',
+    i: 10, o: 2, cr: 3, cw: 4, usd: 1.25, priced: true, billable: true, machine: 'm1',
+  }]);
+  const rows = led.journalSince(0);
+  assert.equal(rows.length, 1);
+  assert.equal(typeof rows[0].kh, 'string', 'kh 只能走字符串');
+  assert.equal(typeof rows[0].ts, 'number', 'ts 必须是 number');
+  assert.equal(typeof rows[0].i, 'number', 'token 计数同理');
+  assert.doesNotThrow(() => JSON.stringify(rows), '这一批要能直接当请求体');
+  assert.equal(JSON.parse(JSON.stringify(rows))[0].model, 'claude-opus-5');
+  assert.equal(rows[rows.length - 1].ts, T0, '水位取最后一行，BigInt 会让 Math.floor 抛');
+  led.close();
+});

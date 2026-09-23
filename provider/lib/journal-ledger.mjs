@@ -149,9 +149,14 @@ export class JournalLedger {
       WHERE c.ts >= ? ORDER BY c.ts LIMIT ?`);
     st.setReadBigInts(true);
     return st.all(Math.floor(sinceSec), Math.floor(limit)).map((r) => ({
-      kh: String(r.kh), ts: r.ts, src: r.src, side: r.side, model: r.model,
+      // `kh` 只能走字符串（63 位，Number 装不下）；其余整型列**必须显式转回 Number**——
+      // setReadBigInts 是整条语句级别的，ts/i/o/… 也会跟着变成 BigInt，而 BigInt 进不了 JSON
+      // （2026-09-23 上线时实咬：`Do not know how to serialize a BigInt`，流水一条都推不上去）。
+      kh: String(r.kh),
+      ts: Number(r.ts), i: Number(r.i), o: Number(r.o), cr: Number(r.cr), cw: Number(r.cw),
+      usd: Number(r.usd), priced: Number(r.priced), billable: Number(r.billable),
+      src: r.src, side: r.side, model: r.model,
       sid: r.sid ?? null, ws: r.ws ?? null, effort: r.effort ?? null, machine: r.machine,
-      i: r.i, o: r.o, cr: r.cr, cw: r.cw, usd: r.usd, priced: r.priced, billable: r.billable,
     }));
   }
 

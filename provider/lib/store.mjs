@@ -322,7 +322,10 @@ export class UsageStore {
           r.effort ? this.dimId('effort', r.effort) : 0,
           r.ws ? this.dimId('ws', r.ws) : 0,
           Math.round(r.i ?? 0), Math.round(r.o ?? 0), Math.round(r.cr ?? 0), Math.round(r.cw ?? 0),
-          r.usd ?? 0, r.priced ?? 1, r.billable ?? 1,
+          // 这两个在流水里是「有没有价 / 算不算钱」的开关，布尔与 0/1 都得收：hub 的 /journal
+          // 收的是**网络上来**的行，而 node:sqlite 绑不了 JS 布尔（参数绑定会直接抛）。
+          r.usd ?? 0, r.priced === false ? 0 : (r.priced == null ? 1 : Number(r.priced) ? 1 : 0),
+          r.billable === false ? 0 : (r.billable == null ? 1 : Number(r.billable) ? 1 : 0),
         );
         if (fresh) added++;
       }
