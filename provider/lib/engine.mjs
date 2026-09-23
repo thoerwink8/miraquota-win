@@ -737,6 +737,8 @@ export class Engine {
     } else { const n = coherenceNotice(coherence); if (n) out.unitPriceNotice = n; }
     const pc = this.#pointCost(limits.windows);
     if (pc) out.pointCost = pc;
+    const pcM = this.#pointCostModels(limits.windows);
+    if (pcM) out.pointCostModels = pcM;
     if (notice) out.accountNotice = notice;
     if (calibDropped > 0) out.calibDropped = calibDropped;
     if (stale) {
@@ -797,6 +799,8 @@ export class Engine {
     // 锚点自带 used/budget/modelScoped，实测倍率按采集时刻算（那一刻账本与官方计数器同期）
     const pcR = this.#pointCost(src.anchors);
     if (pcR) out.pointCost = pcR;
+    const pcRM = this.#pointCostModels(src.anchors);
+    if (pcRM) out.pointCostModels = pcRM;
     out.measured = false;
     if (remote) {
       const who = remote.account && remote.account !== remote.machineId
@@ -840,6 +844,8 @@ export class Engine {
     const out = this.#base('local', now, windows);
     const pcL = this.#pointCost(this.anchors.anchors);
     if (pcL) out.pointCost = pcL;
+    const pcLM = this.#pointCostModels(this.anchors.anchors);
+    if (pcLM) out.pointCostModels = pcLM;
     out.measured = false;
     out.detail = this.opts.noLocal
       // 服务端：它读不了 /v1/limits，也不该叫用户去开 Mirasim——要开的是别的机器
@@ -921,6 +927,27 @@ export class Engine {
         } : {}),
       };
     });
+  }
+
+  /**
+   * **每个模型**的实测点数倍率（官方点数增量 ÷ 我们账本美元 ÷ 100）。
+   *
+   * 这是「算得准不准」唯一可证伪的量：偏离 1 就说明这个模型的价目或倍率不对。
+   * 以前只对配置过的档位组（fable）算，于是最大的那个模型偏了也没人看得见——
+   * 2026-09-23 实测本机：`claude-opus-5` 花了 $197 却量到 **×0.000**（官方几乎不扣点），
+   * 而它是我们账本里最大的一笔；残差 $608 的主因就在这儿，不在「别的机器」。
+   * 计数器用总窗（5h）：它覆盖所有模型、段也最多。
+   */
+  #pointCostModels(windows) {
+    const base = (windows ?? []).find((w) => !w.modelScoped && w.label === '5h')
+      ?? (windows ?? []).find((w) => !w.modelScoped);
+    if (!base) return null;
+    const rows = measureModelRates(this.calibrator.points[base.label], this.calibrator.marks);
+    if (!rows.length) return null;
+    return rows.map((r) => ({
+      model: r.model, measured: r.multiplier, segments: r.segments,
+      usd: r.usd, confidence: r.confidence, window: base.label,
+    }));
   }
 
   /**

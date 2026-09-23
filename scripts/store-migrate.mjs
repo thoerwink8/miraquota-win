@@ -25,6 +25,8 @@ import { UsageStore, STORE_FILE, STORE_SCHEMA, DETAIL_DAYS } from '../provider/l
 import { Pricing } from '../provider/lib/pricing.mjs';
 import { gatewayRows, transcriptRows, turnRows, sourcePaths } from '../provider/lib/sources.mjs';
 import { cleanMachineId } from '../provider/lib/ledger-sync.mjs';
+import { measureModelRates } from '../provider/lib/rate-measure.mjs';
+import { marksFromStore } from '../provider/lib/calibrator.mjs';
 import { hostname } from 'node:os';
 
 const argv = process.argv.slice(2);
@@ -198,6 +200,33 @@ if (flag('report')) {
     }
     console.log(`${head} · 本机账本 ${usd(w.usd)} → ${(pts / w.usd).toFixed(1)} 点/$`
       + `（1× 模型应 ~100，fable 应 ~200；本机口径，他机花得越多这个比值越高${machines > 1 ? `，这份库含 ${machines} 台机器` : ''}）`);
+  }
+
+  // **按模型**实测倍率：官方点数增量 ÷ 我们美元 ÷ 100。这是「算得准不准」唯一可证伪的量——
+  // 整窗比值只能告诉你「对不上」，这张表告诉你**是哪个模型对不上**。
+  // 2026-09-23 实咬：本机 claude-opus-5 花了 $197 却量到 ×0.000（官方几乎不扣点），
+  // 而它是账本里最大的一笔——残差的主因就在这儿，不在「别的机器」。
+  const pm = (() => {
+    // **全部 5h 样本**都给它：`measureModelRates` 自己会跳过跨重置的相邻对（`b.resetAt !== a.resetAt`），
+    // 而窗口刚重置时当前 reset 窗里只有几个采样，只喂那些等于什么都测不出来（第一版就是这么空的）。
+    const samples = store.db.prepare("SELECT at, used, reset_at FROM points WHERE label = '5h' ORDER BY at")
+      .all().map((s) => ({ at: s.at, used: s.used, resetAt: s.reset_at }));
+    if (samples.length < 4) return [];
+    return measureModelRates(samples, marksFromStore(store));
+  })();
+  if (pm.length) {
+    console.log(`按模型实测倍率（5h 窗 · 只有「这一段只有一个模型在花钱」的区间能测）：`);
+    for (const r of pm) {
+      const off = Math.abs(r.multiplier - 1) > 0.15;
+      console.log(`  ${pad(r.model, 26)} ×${r.multiplier.toFixed(3).padStart(6)}  p25=${r.p25.toFixed(2)} p75=${r.p75.toFixed(2)}`
+        + `  段=${String(r.segments).padStart(3)}  ${pad(usd(r.usd), 10)}  ${r.confidence}`
+        + (off ? '   ← 偏离 1：价目或倍率要核' : ''));
+    }
+    const off = pm.filter((r) => Math.abs(r.multiplier - 1) > 0.15);
+    if (off.length) {
+      console.log(`  → 偏离的模型合计 ${usd(off.reduce((a, r) => a + r.usd, 0))}；`
+        + '倍率偏离 1 要么是这个模型有档位倍率（像 fable ×2），要么是我们的价目偏低/偏高。');
+    }
   }
 }
 

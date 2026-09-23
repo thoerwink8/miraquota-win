@@ -107,6 +107,17 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /lastShardSec/);
 });
 
+test('每个模型的实测倍率都要报，偏离 1 的点名', () => {
+  // 「哪个模型对不上」是整窗比值答不了的。2026-09-23 实咬：本机最大的那笔 claude-opus-5
+  // 花了 $197 却量到 ×0.00（官方几乎不扣点）——只报配置过的组（fable）时，它完全看不见。
+  assert.match(renderer, /latest\?\.pointCostModels/);
+  assert.match(renderer, /实测倍率偏离 1/);
+  assert.match(engine, /#pointCostModels\(/);
+  assert.match(engine, /out\.pointCostModels = /);
+  const cli = readFileSync(new URL('../scripts/store-migrate.mjs', import.meta.url), 'utf8');
+  assert.match(cli, /measureModelRates\(samples, marksFromStore\(store\)\)/, 'CLI 也要能看（不开界面）');
+});
+
 test('未计价的调用在账目里单列，不静默成 0', () => {
   // 「用了什么就记什么」：没价目的模型美元是 0（不猜价），但 token 是实打实花掉的。
   // 报表里不写出来，那一列就是静默的 0——用户看到的会是「这笔没记账」。

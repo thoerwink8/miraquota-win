@@ -226,6 +226,10 @@ export class UsageStore {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec('PRAGMA synchronous = NORMAL');
+    // 应用在跑的时候 CLI（--import / --reprice / --report）也要能写：WAL 允许并发读 + 一个写者，
+    // 但默认 busy_timeout 是 0——撞上应用那一瞬间的写就直接 `database is locked` 退出
+    // （2026-09-23 实咬：`--report` 在应用运行时必失败）。等 5 秒，够应用那一轮写完。
+    this.db.exec('PRAGMA busy_timeout = 5000');
     this.db.exec(DDL);
     this.#migrate();
     this.#seedPrices();

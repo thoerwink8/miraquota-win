@@ -35,6 +35,34 @@ const FOREIGN_PAD = 300;              // 他机活跃段向两侧扩散剔除的
 const CONFIDENCE = { none: 0, low: 1, medium: 2, high: 3 };
 const CONFIDENCE_LABEL = { none: '无样本', low: '标定中', medium: '收敛中', high: '高置信' };
 
+/**
+ * 从库里读回 marks 并换算成**增量**（估算器要的形状）。标定自己的 `#marksFromStore` 与
+ * CLI 的「按模型实测倍率」报表共用这一份——两处各写一遍，早晚只改一处。
+ */
+export function marksFromStore(store) {
+  const rows = store.db.prepare('SELECT at, model, cum, broken FROM marks ORDER BY at, model').all();
+  const byAt = new Map();
+  for (const r of rows) {
+    if (!byAt.has(r.at)) byAt.set(r.at, { at: r.at, cum: {}, broken: false });
+    const g = byAt.get(r.at);
+    g.cum[r.model] = r.cum;
+    if (r.broken) g.broken = true;
+  }
+  const out = [];
+  let prev = null;
+  for (const g of [...byAt.values()].sort((a, b) => a.at - b.at)) {
+    if (g.broken || !prev) { out.push({ at: g.at, gap: true }); prev = g.cum; continue; }
+    const d = {};
+    for (const [m, v] of Object.entries(g.cum)) {
+      const delta = v - (prev[m] ?? 0);
+      if (delta !== 0) d[m] = delta;
+    }
+    out.push({ at: g.at, d });
+    prev = g.cum;
+  }
+  return out;
+}
+
 export class Calibrator {
   /**
    * @param stateFile 状态文件路径（测试注入用，默认 ~/.miraquota/calibration.json）
@@ -92,27 +120,7 @@ export class Calibrator {
    * 「跨它不可比」的语义两边一致。
    */
   #marksFromStore() {
-    const rows = this.store.db.prepare('SELECT at, model, cum, broken FROM marks ORDER BY at, model').all();
-    const byAt = new Map();
-    for (const r of rows) {
-      if (!byAt.has(r.at)) byAt.set(r.at, { at: r.at, cum: {}, broken: false });
-      const g = byAt.get(r.at);
-      g.cum[r.model] = r.cum;
-      if (r.broken) g.broken = true;
-    }
-    const out = [];
-    let prev = null;
-    for (const g of [...byAt.values()].sort((a, b) => a.at - b.at)) {
-      if (g.broken || !prev) { out.push({ at: g.at, gap: true }); prev = g.cum; continue; }
-      const d = {};
-      for (const [m, v] of Object.entries(g.cum)) {
-        const delta = v - (prev[m] ?? 0);
-        if (delta !== 0) d[m] = delta;
-      }
-      out.push({ at: g.at, d });
-      prev = g.cum;
-    }
-    return out;
+    return marksFromStore(this.store);
   }
 
   #save() {

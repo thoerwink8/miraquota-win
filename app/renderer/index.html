@@ -1051,7 +1051,16 @@
     const split = fable.agree === false
       ? '<br>⚠ 组内两款量出的倍率不一样——这一个设置值对它们来说是个混合值，按主要在用的那款填。'
       : '';
-    $('fableMeasured').innerHTML = head + (rows.length ? '<br>' + rows.join('<br>') : '') + split;
+    // **每个模型**的实测倍率都报一遍，不只 fable：偏离 1 的模型说明它的价目或倍率不对，
+    // 而「哪个模型对不上」是整窗比值答不了的（2026-09-23 实咬：本机最大的那笔
+    // claude-opus-5 花了 $197 却量到 ×0.00——官方几乎不扣点，残差的主因就是它）。
+    const all = (latest?.pointCostModels ?? []).filter((m) => Math.abs(m.measured - 1) > 0.15);
+    const allText = all.length
+      ? '<br>⚠ 这些模型的实测倍率偏离 1（价目或倍率要核）：' + all.map((m) =>
+        `${esc(m.model)} <b>${m.measured.toFixed(2)}×</b>（${money(m.usd)} · ${m.segments} 段）`).join('、')
+        + '<br>倍率偏离 1 只有两种解释：这个模型有档位倍率（像 fable ×2），或我们的价目偏低/偏高。'
+      : '';
+    $('fableMeasured').innerHTML = head + (rows.length ? '<br>' + rows.join('<br>') : '') + split + allText;
   }
   $('btnRatio').onclick = async () => {
     const ok = await window.miraquota.setPointCost?.('fable', Number($('fableRatio').value));
