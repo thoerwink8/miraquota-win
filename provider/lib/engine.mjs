@@ -601,16 +601,16 @@ export class Engine {
   #journalAt = 0;
 
   /**
-   * 把本机流水增量推给 hub（明细，供账号级对账与任务报表）。
+   * 把本机流水增量推给服务器（明细，供账号级对账与任务报表）。
    *
    * 三件事定成败：
-   *  1. **只有 hub 通道收**——git/收件口那条路是聚合分片，流水块还没做；
+   *  1. **两条 HTTP 通道都收**（hub 与收件口各走各的端点，行格式同一套）；没配同步时不推；
    *  2. **按批推、推完再退水位**：水位存库里（重启不丢），失败就停在那批之前，下一轮重试。
    *     行的 `kh` 是主键，重推幂等，所以「宁可重推一段」是安全的；
    *  3. **不挡主流程**：失败只记一行日志，不抛——它不该让采集/展示跟着挂。
    */
   async #pushJournalDelta() {
-    if (this.sync?.mode !== 'hub' || this.opts.noLocal) return;
+    if (!this.sync?.enabled || this.opts.noLocal) return;
     const now = Date.now() / 1000;
     if (this.#journalBusy || now - this.#journalAt < JOURNAL_EVERY) return;
     this.#journalAt = now;

@@ -12,6 +12,7 @@ import { join } from 'node:path';
 
 import { validateShard, validateJournal, branchFor, hashPassphrase, verifyPassphrase, ACCOUNT_RE } from '../inbox/shared.mjs';
 import { LedgerSync, DEFAULT_INBOX, readInstallId } from '../provider/lib/ledger-sync.mjs';
+import { Engine } from '../provider/lib/engine.mjs';
 import { CostLedger, STATE_SCHEMA } from '../provider/lib/ledger.mjs';
 import { Pricing } from '../provider/lib/pricing.mjs';
 
@@ -283,6 +284,55 @@ test('inbox carries journal blocks: pushed by one machine, ingested by the reade
     assert.match(validateJournal({ installId: 'aaaa0000aaaa0000', rows: [] }), /非空数组/);
     assert.match(validateJournal({ installId: 'aaaa0000aaaa0000', rows: [{ ts: 1 }] }), /第 1 行不完整/);
     assert.equal(validateJournal({ installId: 'aaaa0000aaaa0000', rows }), null);
+  } finally { box.close(); }
+});
+
+/**
+ * 收件口机器**真的会推**流水（不只是 LedgerSync 有那个方法）。
+ *
+ * 2026-09-23 自查逮到：`pushJournal` 加了收件口分支，但 Engine 的 `#pushJournalDelta` 还写着
+ * 「只有 hub 通道收」——于是收件口那条路的推送是死代码：方法在、没人调，测试也全绿。
+ * 这条从 Engine 往下跑，推的是真流水行。
+ */
+test('an inbox-mode engine actually pushes its journal on poll', async () => {
+  const box = await fakeInbox();
+  try {
+    const cfg = join(tmp, 'eng-inbox-sync.json');
+    const led = join(tmp, 'eng-inbox-ledger.json');
+    writeFileSync(led, JSON.stringify({ schemaVersion: STATE_SCHEMA }));
+    const s = new LedgerSync({
+      configFile: cfg, machineId: 'laptop', installId: 'cccc0000cccc0000',
+      cacheFile: join(tmp, 'eng-inbox-cache.json'), inboxUrl: box.url,
+    });
+    assert.equal((await s.login({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', invite: 'code' })).ok, true);
+
+    const engine = new Engine({
+      forceOffline: true,
+      home: join(tmp, 'no-home'),            // 空家目录：refresh 扫不到任何原始记录
+      ledgerFile: led,
+      anchorFile: join(tmp, 'eng-inbox-anchor.json'),
+      settingsFile: join(tmp, 'eng-inbox-set.json'),
+      attribFile: join(tmp, 'eng-inbox-attrib.json'),
+      calibratorFile: join(tmp, 'eng-inbox-cal.json'),
+      syncOpts: {
+        configFile: cfg, machineId: 'laptop', installId: 'cccc0000cccc0000',
+        cacheFile: join(tmp, 'eng-inbox-cache.json'), inboxUrl: box.url,
+      },
+    });
+    assert.equal(engine.sync.mode, 'inbox');
+    const now = Math.floor(Date.now() / 1000);
+    engine.ledger.store.insertCalls([{
+      key: 'g|eng-journal', src: 'g', ts: now, model: 'claude-opus-5', usd: 2,
+      i: 10, o: 0, cr: 0, cw: 0, priced: 1, billable: 1, machine: 'laptop',
+    }]);
+    engine.ledger.invalidate();
+
+    await engine.poll();
+    const pushed = [...box.journals.values()].find((j) => j.installId === 'cccc0000cccc0000');
+    assert.ok(pushed, '收件口模式下 poll() 要把流水推上去（死代码 = 这一条红）');
+    assert.equal(pushed.rows.length, 1);
+    assert.equal(pushed.rows[0].usd, 2);
+    assert.ok(engine.ledger.journalWatermark() >= now, '推完要退水位，否则每轮重推 8 天');
   } finally { box.close(); }
 });
 
