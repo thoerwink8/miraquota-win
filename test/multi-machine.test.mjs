@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import { existsSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,21 +10,13 @@ import { Calibrator } from '../provider/lib/calibrator.mjs';
 import { PointsAttributor } from '../provider/lib/points-attrib.mjs';
 import { readEnabledModels, Engine } from '../provider/lib/engine.mjs';
 import { Pricing } from '../provider/lib/pricing.mjs';
+import { startHub, hubConfig } from './helpers/hub-fixture.mjs';
 
-// 全部状态走注入的临时目录，不碰 ~/.miraquota；远端是本地 bare 仓，不依赖网络。
+// 全部状态走注入的临时目录，不碰 ~/.miraquota；远端是本地 hub（真 HTTP），不依赖网络。
 const tmp = mkdtempSync(join(tmpdir(), 'mq-multi-'));
 
-const git = (...args) => new Promise((resolve, reject) => {
-  execFile('git', args, { timeout: 30_000, windowsHide: true },
-    (err, stdout, stderr) => err ? reject(new Error(String(stderr || err))) : resolve(String(stdout)));
-});
-
-/** 写一份 sync.json，返回路径。 */
-function syncConfig(name, remote, intervalSec = 600) {
-  const file = join(tmp, `${name}-sync.json`);
-  writeFileSync(file, JSON.stringify({ remote, intervalSec }));
-  return file;
-}
+/** 写一份指向该 hub 的 sync.json，返回路径。 */
+const syncConfig = (name, base, intervalSec = 600) => hubConfig(name, base, { extra: { intervalSec } });
 
 /** 预置聚合态的账本（pricing 不参与查询，传空对象即可）。 */
 /** 带真价目表（内置官方价、无缓存）的空账本——测网关行解析要用到 pricing.cost */
@@ -50,11 +41,10 @@ test('machine ids are cleaned into branch-safe short names', () => {
   assert.equal(cleanMachineId('__'), 'machine');
 });
 
-test('two machines publish shards over a bare git remote and read each other', async () => {
-  const remote = join(tmp, 'remote.git');
-  await git('init', '--bare', '--quiet', remote);
+test('two machines publish shards to the hub and read each other', async (t) => {
+  const hub = await startHub(t);
 
-  const T = 1_000_000;
+  const T = Math.floor(Date.now() / 1000) - 120;   // 必须靠近现在：hub 读分片时会把过保留期的清掉
   const MIN = Math.floor(T / 60) - 5;   // 桶分钟取 T 附近，避免被任何窗口逻辑边界干扰
   const ledgerA = ledgerWith('alpha', {
     buckets: { [MIN]: 2 },
@@ -64,8 +54,10 @@ test('two machines publish shards over a bare git remote and read each other', a
     buckets: { [MIN]: 3, [MIN + 1]: 5 },
     family: { [`claude|${MIN + 1}`]: 5, [`gpt|${MIN + 1}`]: 1 },
   });
-  const syncA = new LedgerSync({ configFile: syncConfig('alpha', remote), repoDir: join(tmp, 'alpha-repo'), machineId: 'alpha' });
-  const syncB = new LedgerSync({ configFile: syncConfig('beta', remote), repoDir: join(tmp, 'beta-repo'), machineId: 'beta' });
+  // 两台机器必须各有各的 installId：不注入就都读真机 ~/.miraquota/install.json，两台同 id
+  // ⇒ 各自把对方的分片当成「自己那份」过滤掉（hub 按 installId 认身份，git 通道不认）。
+  const syncA = new LedgerSync({ configFile: syncConfig('alpha', hub.base), machineId: 'alpha', installId: 'aaaaaaaaaaaaaaaa' });
+  const syncB = new LedgerSync({ configFile: syncConfig('beta', hub.base), machineId: 'beta', installId: 'bbbbbbbbbbbbbbbb' });
 
   // B 先发布；A 发布后即应读到 B 的分片
   const rb = await syncB.run(ledgerB, T);
@@ -104,24 +96,25 @@ test('two machines publish shards over a bare git remote and read each other', a
   assert.equal(ledgerA.spent(from, to), 2);
   assert.equal(ledgerA.familySpent(from, to, 'claude'), 2);
 
-  // 单提交覆盖：A 连续发布两次后，远端 machine/alpha 仍只有 1 个提交
+  // 覆盖式发布：A 再发一轮，B 读回来仍是同一台机器一份（hub 按 installId 整份覆盖，不留历史）
   await syncA.run(ledgerA, T + 700);
-  assert.equal((await git('-C', remote, 'rev-list', '--count', 'machine/alpha')).trim(), '1');
-  assert.equal((await git('-C', remote, 'rev-list', '--count', 'machine/beta')).trim(), '1');
+  const rb2 = await syncB.run(ledgerB, T + 701);
+  assert.deepEqual(rb2.shards.map((s) => s.machineId), ['alpha']);
+  assert.equal(rb2.shards[0].generatedAt, T + 700);
 });
 
-/** 只需要 exportShard 的假账本。 */
+/** 只需要 exportShard 的假账本。installId 必须给：hub 会校验（git 通道不校验，所以从前没暴露）。 */
 const fakeLedger = () => ({
   exportShard: (id, now) => ({
-    schemaVersion: 1, machineId: id, generatedAt: now,
+    schemaVersion: 1, machineId: id, installId: 'abcdef0123456789', generatedAt: now,
     coverage: { fromSec: 0, toSec: now }, buckets: {}, scoped: {}, family: {},
   }),
 });
 
-test('a broken remote is reported in status without throwing, and one failure is not red yet', async () => {
+test('a broken endpoint is reported in status without throwing, and one failure is not red yet', async () => {
   const sync = new LedgerSync({
-    configFile: syncConfig('broken', join(tmp, 'no-such-remote.git')),
-    repoDir: join(tmp, 'broken-repo'),
+    // 没人听的端口：真失败，但不是「不认识的通道」
+    configFile: syncConfig('broken', 'http://127.0.0.1:9'),
     machineId: 'broken',
     retryDelayMs: 5,
   });
@@ -138,58 +131,26 @@ test('a broken remote is reported in status without throwing, and one failure is
   assert.equal(r2.failStreak, 2);
 });
 
-test('publish succeeding while fetch fails is a middle state, never red', async () => {
-  // 真链路制造「发上去了、读不回来」：origin.url 指向不存在的路径（fetch 用它 ⇒ 失败），
-  // pushurl 指向真 bare 仓（push 用它 ⇒ 成功）。#ensureRepo 只校准 url，不碰 pushurl。
-  const good = join(tmp, 'half-good.git');
-  await git('init', '--bare', '--quiet', good);
-  const bad = join(tmp, 'half-missing.git');
-  const repoDir = join(tmp, 'half-repo');
-  await git('init', '--quiet', repoDir);
-  await git('-C', repoDir, 'remote', 'add', 'origin', bad);
-  await git('-C', repoDir, 'remote', 'set-url', '--push', 'origin', good);
-
-  const T = 3_000_000;
-  const sync = new LedgerSync({
-    configFile: syncConfig('half', bad), repoDir, machineId: 'half', retryDelayMs: 5,
-  });
-  const r = await sync.run(fakeLedger(), T);
-  assert.equal(r.pushOk, true);       // 本机分片确实上传了
-  assert.ok(r.error);                 // 读取失败仍记原因
-  assert.equal(r.state, 'warn');      // 但不是整体失败（UI 黄，不是红）
-  assert.deepEqual(bare(r.machines), [{ id: 'half', lastShardSec: T, self: true }]);
-  assert.equal((await git('-C', good, 'rev-list', '--count', 'machine/half')).trim(), '1');
-
-  // 连续多轮只有读取失败也不报红——本机数据没丢，只是合并样本少
-  const r2 = await sync.run(fakeLedger(), T + 600);
-  assert.equal(r2.state, 'warn');
-  assert.equal(r2.failStreak, 2);
-});
-
-test('a flaky first attempt is retried inside the round and does not count as a failure', async () => {
-  // 实测本地代理偶发 SSL_ERROR_SYSCALL、紧接着的六次访问全部成功。
-  // 用远端 pre-receive 钩子复现：第一次 push 必被拒（并吐同一句报错），第二次即通过。
-  const remote = join(tmp, 'flaky-remote.git');
-  await git('init', '--bare', '--quiet', remote);
-  writeFileSync(join(remote, 'hooks', 'pre-receive'), [
-    '#!/bin/sh',
-    'if [ -f flaked ]; then exit 0; fi',
-    'touch flaked',
-    'echo "OpenSSL SSL_read: SSL_ERROR_SYSCALL" >&2',
-    'exit 1',
-    '',
-  ].join('\n'));
-
-  const sync = new LedgerSync({
-    configFile: syncConfig('flaky', remote), repoDir: join(tmp, 'flaky-repo'),
-    machineId: 'flaky', retryDelayMs: 50,
-  });
-  const r = await sync.run(fakeLedger(), 4_000_000);
-  assert.ok(existsSync(join(remote, 'flaked')));   // 第一次真的被拒了
-  assert.equal(r.error, undefined);                // 抖动被单轮内重试吃掉
-  assert.equal(r.state, 'ok');
-  assert.equal(r.failStreak, undefined);
-  assert.equal((await git('-C', remote, 'rev-list', '--count', 'machine/flaky')).trim(), '1');
+test('a flaky first attempt is retried inside the round and does not count as a failure', async (t) => {
+  // 实测本地代理偶发 SSL_ERROR_SYSCALL、紧接着的访问全部成功。这里让第一次 fetch 直接抛，
+  // 验单轮内重试把它吃掉（传输层换成 hub 之后，「抖动」的形状就是 fetch 抛）。
+  const hub = await startHub(t);
+  const realFetch = globalThis.fetch;
+  let n = 0;
+  globalThis.fetch = (...a) => {
+    if (++n === 1) throw new Error('fetch failed: OpenSSL SSL_read: SSL_ERROR_SYSCALL');
+    return realFetch(...a);
+  };
+  try {
+    const sync = new LedgerSync({
+      configFile: syncConfig('flaky', hub.base), machineId: 'flaky', retryDelayMs: 50,
+    });
+    const r = await sync.run(fakeLedger(), 4_000_000);
+    assert.ok(n >= 2, '第一次真的被拒了');
+    assert.equal(r.error, undefined);                // 抖动被单轮内重试吃掉
+    assert.equal(r.state, 'ok');
+    assert.equal(r.failStreak, undefined);
+  } finally { globalThis.fetch = realFetch; }
 });
 
 test('retryOnce runs the second attempt and reports the latest reason when both fail', async () => {
@@ -199,46 +160,22 @@ test('retryOnce runs the second attempt and reports the latest reason when both 
   await assert.rejects(retryOnce(async () => { throw new Error(`第 ${++n} 次`); }, 5), /第 4 次/);
 });
 
-test('common git failures get a plain-language reading, unknown ones stay raw', () => {
-  // 人话归纳只是导读，原文另存 sync.error（UI 当次要小字），归纳不出来时返回 null
-  assert.equal(explainSyncError("fatal: unable to access 'https://github.com/x/y.git/': OpenSSL SSL_read: SSL_ERROR_SYSCALL"),
-    '网络连不上（代理或网络问题）');
-  assert.equal(explainSyncError('fatal: unable to access: Could not resolve host: github.com'),
-    '网络连不上（代理或网络问题）');
-  assert.equal(explainSyncError('fatal: Authentication failed for https://github.com/x/y.git/'),
-    '凭据无效或无权限');
-  // 权限类常同时含 unable to access，必须判成权限而不是网络
-  assert.equal(explainSyncError("remote: Permission to x/y.git denied\nfatal: unable to access ...: The requested URL returned error: 403"),
-    '凭据无效或无权限');
-  assert.equal(explainSyncError("remote: Repository not found."), '仓库/收件口地址不对或已不存在');
-  assert.equal(explainSyncError('fatal: 某个没见过的毛病'), null);
+test('common transport failures get a plain-language reading, unknown ones stay raw', () => {
+  // 人话归纳只是导读，原文另存 sync.error（UI 当次要小字），归纳不出来时返回 null。
+  // 归纳表本身与通道无关（现在只剩 HTTP 两条），所以照样拿真报错文本钉住。
+  assert.equal(explainSyncError('fetch failed'), '网络连不上（代理或网络问题）');
+  assert.equal(explainSyncError('connect ECONNREFUSED 127.0.0.1:9'), '网络连不上（代理或网络问题）');
+  assert.equal(explainSyncError('HTTP 401 (401)'), '名字或口令不对（在多机页重新登录）');
+  // 权限类常同时含别的关键词，必须判成权限而不是网络
+  assert.equal(explainSyncError('permission denied (403)'), '凭据无效或无权限');
+  assert.equal(explainSyncError('HTTP 404 (404)'), '仓库/收件口地址不对或已不存在');
+  assert.equal(explainSyncError('某个没见过的毛病'), null);
 });
 
-test('repo-level identity and signing config are re-applied every round, not only on init', async () => {
-  // 实测缺陷：首次 init 后进程提前退出，三项 config 没落盘，之后每轮都以「.git 已存在」跳过补写，
-  // 永久缺失 ⇒ 提交署用户全局身份、开了 GPG 签名则 commit 直接失败。
-  const remote = join(tmp, 'cfg-remote.git');
-  await git('init', '--bare', '--quiet', remote);
-  const repoDir = join(tmp, 'cfg-repo');
-  await git('init', '--quiet', repoDir);   // 只有 .git，三项 config 都没有
-  const readCfg = (k) => git('-C', repoDir, 'config', '--local', '--get', k).then((s) => s.trim(), () => null);
-  assert.equal(await readCfg('user.name'), null);
-
-  const sync = new LedgerSync({
-    configFile: syncConfig('cfg', remote), repoDir, machineId: 'cfg', retryDelayMs: 5,
-  });
-  const r = await sync.run(fakeLedger(), 5_000_000);
-  assert.equal(r.error, undefined);
-  assert.equal(await readCfg('user.name'), 'miraquota');
-  assert.equal(await readCfg('user.email'), 'miraquota@local');
-  assert.equal(await readCfg('commit.gpgsign'), 'false');
-});
-
-test('sync state machine: connecting before first success, ok while fresh, stale falls back', async () => {
-  const remote = join(tmp, 'state-remote.git');
-  await git('init', '--bare', '--quiet', remote);
+test('sync state machine: connecting before first success, ok while fresh, stale falls back', async (t) => {
+  const hub = await startHub(t);
   const T = 2_000_000;
-  const a = new LedgerSync({ configFile: syncConfig('sa', remote), repoDir: join(tmp, 'sa-repo'), machineId: 'sa' });
+  const a = new LedgerSync({ configFile: syncConfig('sa', hub.base), machineId: 'sa' });
   assert.equal(a.status(T).state, 'connecting');   // 启用但从未成功 ⇒ 连接中（UI 灰）
   const r = await a.run(ledgerWith('sa', { buckets: {} }), T);
   assert.equal(r.state, 'ok');                     // 最近一轮成功且无 error ⇒ 已接入（UI 绿）
@@ -298,35 +235,48 @@ test('attribution settle window widens to 2x the sync interval', () => {
   assert.ok(Math.abs(a.familyPoints(0, 999999, 'claude') - 10) < 1e-6);
 });
 
-test('without sync.json the feature is fully off: no repo, no payload field', async () => {
+test('without sync.json the feature is fully off: nothing created, no payload field', async () => {
   const missing = join(tmp, 'no-such-sync.json');
-  const repoDir = join(tmp, 'off-repo');
-  const off = new LedgerSync({ configFile: missing, repoDir, machineId: 'off' });
+  const off = new LedgerSync({ configFile: missing, machineId: 'off' });
   assert.equal(off.enabled, false);
   assert.equal(await off.run(ledgerWith('off', { buckets: {} })), null);
-  assert.ok(!existsSync(repoDir));   // 未配置时绝不创建同步仓
 
-  const engine = new Engine({ forceOffline: true, syncOpts: { configFile: missing, repoDir } });
+  const engine = new Engine({ forceOffline: true, syncOpts: { configFile: missing } });
   assert.ok(!('sync' in engine.payload()));
 });
 
-test('with sync configured the payload carries a sync status field', () => {
+test('a sync.json left over from the retired git channel is off, and says how to switch', async () => {
+  // git 通道 2026-09-23 退役。配着它的机器不静默失联：当未配置，但打一行说清怎么换。
+  const file = join(tmp, 'legacy-git-sync.json');
+  writeFileSync(file, JSON.stringify({ remote: 'https://github.com/x/y.git', intervalSec: 600 }));
+  const warns = [];
+  const realWarn = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    const s = new LedgerSync({ configFile: file, machineId: 'legacy' });
+    assert.equal(s.enabled, false, '退役的通道一律当未配置');
+    assert.equal(s.mode, null);
+  } finally { console.warn = realWarn; }
+  assert.equal(warns.length, 1);
+  assert.match(warns[0], /已退役的 git 通道/);
+  assert.match(warns[0], /--hub/, '要说清怎么换到现役通道');
+});
+
+test('with sync configured the payload carries a sync status field', async (t) => {
+  const hub = await startHub(t);
   const engine = new Engine({
     forceOffline: true,
-    syncOpts: {
-      configFile: syncConfig('engine', join(tmp, 'unused-remote.git')),
-      repoDir: join(tmp, 'engine-repo'),
-      machineId: 'engine',
-    },
+    syncOpts: { configFile: syncConfig('engine', hub.base), machineId: 'engine' },
   });
   // 只比同步状态本身：这个 Engine 读的是真机的账本与锚点（非隔离），
   // 用量字段会随本机数据变，deepEqual 整块会被无关字段带崩。
   const { usage, ...status } = engine.payload().sync;
   assert.deepEqual({ ...status, machines: bare(status.machines) }, {
     state: 'connecting',
-    mode: 'git',
+    mode: 'hub',
     pushOk: false,
     intervalSec: 600,
+    hub: hub.base,
     machines: [{ id: 'engine', lastShardSec: null, self: true }],
   });
 });
@@ -367,28 +317,30 @@ test('the 7d page can say which machine spent what, and what nobody claimed', ()
   assert.match(renderer, /以及各机账本自己的时差漏记/);
 });
 
-test('a cold start uses the shards fetched by the previous round, before any network', async () => {
+test('a cold start uses the shards fetched by the previous round, before any network', async (t) => {
   // 实测踩过：进程启动到第一轮同步跑完之前只认本机账本，美元与标定按单机口径给，
-  // 而他机分片就躺在本地 sync-repo 里（--once 更是活不到第一轮同步完成）。
-  const remote = join(tmp, 'cold.git');
-  await git('init', '--bare', '--quiet', remote);
+  // 而他机分片就躺在本地缓存里（--once 更是活不到第一轮同步完成）。
+  const hub = await startHub(t);
   // cacheFile 必须注入：不注入就读到本机真实的 ~/.miraquota/inbox-shards.json，
   // 那里面是这台机器此刻真在同步的分片，测试结果会随开发机的状态飘（实咬一次）。
   const a = new LedgerSync({
-    configFile: syncConfig('cold-a', remote), repoDir: join(tmp, 'cold-a-repo'), machineId: 'a',
+    configFile: syncConfig('cold-a', hub.base), machineId: 'a', installId: 'aaaaaaaaaaaaaaaa',
     cacheFile: join(tmp, 'cold-a-cache.json'), inboxUrl: null,
   });
   const b = new LedgerSync({
-    configFile: syncConfig('cold-b', remote), repoDir: join(tmp, 'cold-b-repo'), machineId: 'b',
+    configFile: syncConfig('cold-b', hub.base), machineId: 'b', installId: 'bbbbbbbbbbbbbbbb',
     cacheFile: join(tmp, 'cold-b-cache.json'), inboxUrl: null,
   });
-  await a.run(ledgerWith('cold-a', { minutes: { 29000000: { usd: 3 } } }), 29000000 * 60);
-  await b.run(ledgerWith('cold-b', { minutes: {} }), 29000000 * 60);
+  // 时间必须靠近现在：hub 读分片时会把过保留期的清掉，1970 年的时间戳会被当场清空。
+  const T = Math.floor(Date.now() / 1000) - 120;
+  const MIN = Math.floor(T / 60) - 5;
+  await a.run(ledgerWith('cold-a', { minutes: { [MIN]: { usd: 3 } } }), T);
+  await b.run(ledgerWith('cold-b', { minutes: {} }), T);
   assert.equal(b.shards.length, 1, 'b 这一轮应读到 a 的分片');
 
   // 新进程：不跑 run()，只装缓存——拿到的仍是 a 的分片
   const bRestarted = new LedgerSync({
-    configFile: syncConfig('cold-b2', remote), repoDir: join(tmp, 'cold-b-repo'), machineId: 'b',
+    configFile: syncConfig('cold-b2', hub.base), machineId: 'b', installId: 'bbbbbbbbbbbbbbbb',
     cacheFile: join(tmp, 'cold-b-cache.json'), inboxUrl: null,
   });
   assert.deepEqual(bRestarted.shards, [], '构造时不该自带分片');
@@ -437,14 +389,13 @@ test('the enabled-model roster is checked against the price list', () => {
   assert.equal(readEnabledModels(new Pricing(join(tmp, 'no-cache.json')), join(tmp, 'missing.json')), null);
 });
 
-test('a machine ships its own speed snapshot so the other end can look at it', async () => {
-  const remote = join(tmp, 'speed-remote.git');
-  await git('init', '--bare', '--quiet', remote);
-  const T = 2_000_000;
+test('a machine ships its own speed snapshot so the other end can look at it', async (t) => {
+  const hub = await startHub(t);
+  const T = Math.floor(Date.now() / 1000) - 120;   // 靠近现在：hub 会把过保留期的分片清掉
   const ledgerA = ledgerWith('spd-a', { buckets: {} });
   const ledgerB = ledgerWith('spd-b', { buckets: {} });
-  const syncA = new LedgerSync({ configFile: syncConfig('spd-a', remote), repoDir: join(tmp, 'spd-a-repo'), machineId: 'spd-a' });
-  const syncB = new LedgerSync({ configFile: syncConfig('spd-b', remote), repoDir: join(tmp, 'spd-b-repo'), machineId: 'spd-b' });
+  const syncA = new LedgerSync({ configFile: syncConfig('spd-a', hub.base), machineId: 'spd-a', installId: '1111222233334444' });
+  const syncB = new LedgerSync({ configFile: syncConfig('spd-b', hub.base), machineId: 'spd-b', installId: '5555666677778888' });
 
   const speed = { rows: [{ model: 'Opus 5', modelId: 'claude-opus-5', rate: 36, ttft: 2.4, endToEnd: 20, samples: 5, latestAt: T - 60, tasks: [] }], sampleTotal: 5 };
   await syncB.run(ledgerB, T, { speed });
@@ -466,19 +417,16 @@ test('a machine ships its own speed snapshot so the other end can look at it', a
   assert.equal(ra2.machines.find((m) => m.id === 'spd-b').speed, undefined);
 });
 
-test('deploy-linux keeps an existing sync.json and never touches GitHub by default', () => {
-  // 脚本头一直承诺「重复跑不动 sync.json」，但 git 通道那段原先无条件盖写——服务器上真配着
-  // hub 通道（本脚本不认识的一种），盖成 git 通道等于把它从现有面板上踢下来，而它照样发得
-  // 上去、本机读不回来。2026-09-23 升级 vmi3551059 时实咬到，改成默认不动 + --reset-sync 显式换。
+test('deploy-linux keeps an existing sync.json and no longer knows GitHub at all', () => {
+  // 脚本头一直承诺「重复跑不动 sync.json」，但从前 git 通道那段无条件盖写——服务器上真配着
+  // hub 通道（本脚本不认识的一种），盖成 git 通道等于把它从现有面板上踢下来。2026-09-23 实咬，
+  // 改成默认不动 + --reset-sync 显式换。
   //
-  // 同一天用户又拍了「不要存 GitHub」（每台机器每 10 分钟要提交 333 KB ≈ 47 MB/天，还要一把
-  // gh 装的部署密钥），于是 git 通道连**默认**也不再是：不带通道参数就只装服务并提示，
-  // 要 git 得显式 --via-git。
+  // 同一天用户拍了「不要存 GitHub」（每台机器每 10 分钟要提交 333 KB ≈ 47 MB/天，还要一把 gh
+  // 装的部署密钥），于是 git 通道连代码一起删了：这个脚本里不该再出现 gh、部署密钥或 remote。
   const src = readFileSync(new URL('../scripts/deploy-linux.mjs', import.meta.url), 'utf8');
   assert.match(src, /const keepSync = hasSync && !flag\('reset-sync'\)/);
   assert.match(src, /if \(keepSync\) \{/, '已有配置那段必须最先判，否则就是无条件盖写');
   assert.match(src, /else if \(wantHub\) \{/, 'hub 是推荐通道');
-  assert.match(src, /else if \(wantGit\) \{/, 'git 通道要显式给 --via-git');
-  assert.match(src, /--via-git/, '换通道要留显式出口');
-  assert.ok(!src.includes("if (!flag('via-inbox') && !keepSync)"), '别再有"默认走 git"的分支');
+  assert.doesNotMatch(src, /--via-git|gh api|DEFAULT_REMOTE|ssh-keygen/, 'git 通道的代码痕迹要清干净（注释里提历史可以）');
 });

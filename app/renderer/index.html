@@ -843,7 +843,7 @@
           <span class="id">${esc(m.id)}${m.self ? '（本机）' : ''}${u ? `<span class="use">${amount(u.points, u.usd)}</span>` : ''}</span>
           <span class="when">${go}${go ? ' · ' : ''}${when}${expired ? ' · 已过期' : ''}</span></div>`;
       };
-      // 按人分组（收件口登录的机器带 account）；没登录的机器（git 通道）归「额度主人」
+      // 按人分组（收件口登录的机器带 account）；没登录的机器归「额度主人」
       const groups = new Map();
       for (const m of sy.machines ?? []) {
         const g = m.account ?? '';
@@ -870,13 +870,9 @@
       const basis = [`每 ${Math.round((sy.intervalSec ?? 600) / 60)} 分钟同步一轮`,
         `他机时间取自本机最近一轮读到的分片，最多落后一轮（${Math.round((sy.intervalSec ?? 600) / 60)} 分钟）`];
       if (sy.lastSyncSec) basis.push(`上次完整成功 ${ago(sy.lastSyncSec)}`);
-      // 自动接入的机器要把「怎么接上的」和「怎么关掉」一起说清楚：此时删文件会被重新接回，
-      // 真正的关闭是把文件内容改成 {"autoJoin": false}（文件在就不再自动探测）。
+      // 收件口登录的机器要把「怎么接上的」和「怎么关掉」一起说清楚。
       basis.push(sy.mode === 'inbox'
         ? `以「${esc(sy.account ?? '')}」登录收件口 <code>${esc(sy.inbox ?? '')}</code> · 配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即退出）`
-        : sy.autoJoined
-        ? '本机未配置，探到默认仓可读后自动接入 · 配置在 <code>~/.miraquota/sync.json</code>'
-          + '（要关掉就把内容改成 <code>{"autoJoin": false}</code>；直接删会在 1 小时内自动接回）'
         : '配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即完全关闭）');
       $('syncBasis').innerHTML = basis.join(' · ');
     }

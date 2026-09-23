@@ -98,7 +98,7 @@ VPS   $4667.76 = 明细 $23.64   + 汇总 $4644.12
 | hub 分片目录 `shards/*.json` + `limits.json` | N 个小文件 | 进库（一台机一行），省 inode 与 rename |
 | 价目缓存 `~/.mirasim/models-dev-cache.json` | 只读输入 | 只把**用到的那几列**种进 `prices`（代码里的 `BUILTIN` 是种子）；原始缓存不动 |
 | `settings.json` / `sync.json` / `install.json` / `ui.json` / `inbox-admin.json` / `feed.token` | 配置与密钥 | **留 JSON**：人要能手改、密钥不该进库、坏了要能一眼看懂 |
-| `sync-repo/`（git 通道） | 目录 | **删掉**（见下） |
+| `sync-repo/`（git 通道） | 目录 | **已删**（git 通道 2026-09-23 退役，见下） |
 
 ## 收件口（Cloudflare Worker）不需要 SQLite
 
@@ -127,14 +127,15 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
 
 ## 传输：只留 hub
 
-`git 通道`（把分片提交进一个私有 GitHub 仓）要退役，理由是可量化的：
+`git 通道`（把分片提交进一个私有 GitHub 仓）**2026-09-23 已退役并删掉代码**，理由是可量化的：
 
 - 每个分片 333 KB（实测），每 10 分钟一推 → **47 MB/天/机**的提交量，而它换来的只是"不用自建服务器"；
 - 它还要 `gh` 凭据（本机 `gh` 登录态失效时整条路就断了）；
 - 流水明细比聚合分片大得多，走 git 只会更糟。
 
-保留两条：**hub（HTTP，主力）** 与 **收件口（没有服务器的场景）**。hub 加一个 `PUT /journal`
-收流水增量（Phase 2），此后 hub 手里就是全账号的流水，任务级报表与逐点对账都在它上面出。
+保留两条：**hub（HTTP，主力）** 与 **收件口（没有服务器的场景）**。hub 的 `PUT /journal`
+收流水明细，此后 hub 手里就是全账号的流水，任务级报表与逐点对账都在它上面出。
+配着老 git 配置的机器当「未配置」处理，启动日志说清怎么换（不静默失联）。
 
 ## 契约（改动时按这张表自查）
 
@@ -168,9 +169,11 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
   (机器, 分钟) 逐格让位）——实测 VPS 两样都推之后，账号 7 天合计从 $120.07 虚高到 $121.88。
 - ✅ **Phase 3c**：任务/工作区/会话报表进界面（payload 的 `ledger` 块 + 口径页一张卡）。
   真机一帧：近 7 天 $1733.05，能归到任务的 $1484.99（86%），归不上的 $248.07 单列不摊派。
-- ⏳ **Phase 3（余下）**：删 git 通道与 `gh` 依赖（实测 333 KB/10 分钟 = 47 MB/天/机的提交量）——
-  已退出所有默认路径（要 `--via-git` 显式），代码与那十来条多机测试还在；
-  收件口（Cloudflare KV）按同一套行格式收流水块；**Phase 2b 余下的归因与锚点**。
+- ✅ **Phase 3（git 退役）**：git 通道的**代码与测试都删了**（`ledger-sync.mjs` 里的 git 模式、
+  `tryAutoJoin` 自动接入、`deploy-linux.mjs` 的 `--via-git` 与 `gh` 装密钥那一段），多机测试
+  整体换成 hub 夹具（本地真 HTTP，不再依赖本地 bare 仓）。`gh` 依赖随之清零。
+- ⏳ **Phase 3（余下）**：收件口（Cloudflare KV）按同一套行格式收流水块——**Phase 2b 余下的
+  点数归因与锚点已完成**，所以这一条是最后一处。
 
 ### 2026-09-23 上线时实咬的三处（都已修 + 都有测试）
 

@@ -5,7 +5,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
@@ -15,19 +15,12 @@ import { CostLedger, STATE_SCHEMA } from '../provider/lib/ledger.mjs';
 import { LedgerSync } from '../provider/lib/ledger-sync.mjs';
 import { Engine } from '../provider/lib/engine.mjs';
 import { anchorsFrom } from '../provider/lib/anchors.mjs';
+import { startHub, hubConfig } from './helpers/hub-fixture.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mq-quota-'));
 
-const git = (...args) => new Promise((resolve, reject) => {
-  execFile('git', args, { timeout: 30_000, windowsHide: true },
-    (err, stdout, stderr) => err ? reject(new Error(String(stderr || err))) : resolve(String(stdout)));
-});
-
-function syncConfig(name, remote, extra = {}) {
-  const file = join(tmp, `${name}-sync.json`);
-  writeFileSync(file, JSON.stringify({ remote, intervalSec: 600, ...extra }));
-  return file;
-}
+/** 写一份指向该 hub 的 sync.json，返回路径（远端是本地 hub，不依赖网络）。 */
+const syncConfig = (name, base, extra = {}) => hubConfig(name, base, { extra: { intervalSec: 600, ...extra } });
 
 function emptyLedger(name) {
   const file = join(tmp, `${name}-ledger.json`);
@@ -38,7 +31,8 @@ function emptyLedger(name) {
 /** 本机锚点不可用/可用的替身：AnchorStore 认死 ~/.miraquota，测试不碰真机状态。 */
 const anchorStub = (capturedAt = 0, anchors = []) => ({ anchors, capturedAt, get usable() { return anchors.length > 0; }, update() {} });
 
-const NOW = 3_000_000;
+// 时间锚在现在附近：分片经 hub 走时，过保留期的会被读时清掉（1970 年的时间戳等于当场丢）。
+const NOW = Math.floor(Date.now() / 1000) - 120;
 const LIMITS = {
   capturedAt: NOW - 120,
   windows: [
@@ -60,15 +54,14 @@ test('limits windows become anchors without touching any on-disk state', () => {
   assert.deepEqual(anchorsFrom(null, NOW), []);
 });
 
-test('a machine ships the account quota so the offline one need not guess it', async () => {
-  const remote = join(tmp, 'quota-remote.git');
-  await git('init', '--bare', '--quiet', remote);
+test('a machine ships the account quota so the offline one need not guess it', async (t) => {
+  const hub = await startHub(t);
   const syncB = new LedgerSync({
-    configFile: syncConfig('q-b', remote), repoDir: join(tmp, 'q-b-repo'),
+    configFile: syncConfig('q-b', hub.base),
     machineId: 'q-b', installId: 'bbbbbbbbbbbbbbbb',
   });
   const syncA = new LedgerSync({
-    configFile: syncConfig('q-a', remote), repoDir: join(tmp, 'q-a-repo'),
+    configFile: syncConfig('q-a', hub.base),
     machineId: 'q-a', installId: 'aaaaaaaaaaaaaaaa', inboxUrl: null,
   });
 
@@ -82,11 +75,10 @@ test('a machine ships the account quota so the offline one need not guess it', a
   assert.equal(shard.schemaVersion, 1);
 });
 
-test('the offline machine reckons from the running one, and says whose number it is', async () => {
-  const remote = join(tmp, 'engine-remote.git');
-  await git('init', '--bare', '--quiet', remote);
+test('the offline machine reckons from the running one, and says whose number it is', async (t) => {
+  const hub = await startHub(t);
   const syncB = new LedgerSync({
-    configFile: syncConfig('e-b', remote), repoDir: join(tmp, 'e-b-repo'),
+    configFile: syncConfig('e-b', hub.base),
     machineId: 'vmi-server', installId: 'bbbbbbbbbbbbbbbb',
   });
   const now = Date.now() / 1000;
@@ -107,7 +99,7 @@ test('the offline machine reckons from the running one, and says whose number it
     attribFile: join(tmp, 'e-a-attrib.json'),
     calibratorFile: join(tmp, 'e-a-calibration.json'),
     syncOpts: {
-      configFile: syncConfig('e-a', remote), repoDir: join(tmp, 'e-a-repo'),
+      configFile: syncConfig('e-a', hub.base),
       machineId: 'e-a', installId: 'aaaaaaaaaaaaaaaa', inboxUrl: null,
       cacheFile: join(tmp, 'e-a-cache.json'),
     },
@@ -203,21 +195,21 @@ test('a fresher local anchor still wins: freshness is the only rule', () => {
 });
 
 test('the quota-bearing rounds run on their own faster clock', () => {
-  const cfg = syncConfig('cadence', join(tmp, 'unused.git'));
-  const s = new LedgerSync({ configFile: cfg, repoDir: join(tmp, 'cadence-repo'), machineId: 'c' });
+  const cfg = syncConfig('cadence', 'http://127.0.0.1:1');   // 只读配置，不发请求
+  const s = new LedgerSync({ configFile: cfg, machineId: 'c' });
   assert.equal(s.intervalSec, 600);
   assert.equal(s.quotaIntervalSec, 120, '账本可以迟到，额度不行——它是对面唯一的额度来源');
 
   const slow = new LedgerSync({
-    configFile: syncConfig('cadence-slow', join(tmp, 'unused.git'), { quotaIntervalSec: 300 }),
-    repoDir: join(tmp, 'cadence-slow-repo'), machineId: 'c2',
+    configFile: syncConfig('cadence-slow', 'http://127.0.0.1:1', { quotaIntervalSec: 300 }),
+    machineId: 'c2',
   });
   assert.equal(slow.quotaIntervalSec, 300, 'sync.json 说了算');
 
   // 配得比常规轮还慢是配错了，快节奏不该反过来拖慢同步
   const tight = new LedgerSync({
-    configFile: syncConfig('cadence-tight', join(tmp, 'unused.git'), { quotaIntervalSec: 9999 }),
-    repoDir: join(tmp, 'cadence-tight-repo'), machineId: 'c3',
+    configFile: syncConfig('cadence-tight', 'http://127.0.0.1:1', { quotaIntervalSec: 9999 }),
+    machineId: 'c3',
   });
   assert.equal(tight.quotaIntervalSec, 600);
 });

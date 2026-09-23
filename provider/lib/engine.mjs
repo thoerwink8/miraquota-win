@@ -63,7 +63,6 @@ import { AnchorStore, anchorsFrom, ANCHOR_MAX_AGE } from './anchors.mjs';
 const CHANNEL_DEFAULT = 4970;
 const STALE_AFTER = 90;      // 秒；超过转 stale
 const RECKON_AFTER = 600;    // 秒；stale 超过此龄期转锚点推算
-const AUTOJOIN_EVERY = 3600; // 秒；未配置多机同步时，隔多久静默探一次默认仓能不能读
 // 流水增量推给 hub 的节奏与批量：明细比聚合大得多（一批 2000 行 ≈ 300 KB），所以比同步轮
 // （10 分钟）密一档、但一轮最多推几批——推不完下轮接着推，水位保证不重不漏。
 const JOURNAL_EVERY = 300;      // 秒；两次推流水之间的最小间隔
@@ -80,7 +79,7 @@ const LEDGER_REPORT_EVERY = 60;
  * 按固定节奏发有个说不通的地方：别人正盯着这台机器的速度看，而它这一秒刚跑完一个请求，
  * 压着两分钟不发，对面读到的就是两分钟前的数——用户 2026-09-06 问的正是这个。
  * 所以有新样本就早发，只留一个下限防抖（一串连续请求不至于变成一串 PUT）。
- * 只对 hub 生效：git 通道每 15 秒来一次 force-push 是另一回事。
+ * 只对 hub 生效：收件口那条路是另一回事。
  */
 const FAST_PUSH_FLOOR = 15;
 export const LEVELS = {
@@ -216,8 +215,6 @@ export class Engine {
   #syncBusy = false;
   #syncKickedAt = 0;
   #shardsWarmed = false;
-  #autoJoinBusy = false;
-  #autoJoinAt = 0;
   #quotaPullBusy = false;
   #quotaPullAt = 0;
   #lastStamp = null;
@@ -233,25 +230,9 @@ export class Engine {
   }
 
   /**
-   * 没配置多机同步时，隔一阵静默探一次默认仓能不能读，能读就自己接上（见 ledger-sync）。
-   * 探不通什么都不发生，所以这里不记状态、不进 payload——用户看到的仍是「没有多机页」。
-   * 首次在启动后第一跳就探（#autoJoinAt=0），之后每 AUTOJOIN_EVERY 一次：
-   * 这台机器刚 gh auth login 完，不用重启应用也能在下一轮自己接上。
-   */
-  #maybeAutoJoin(now) {
-    if (this.#autoJoinBusy || now - this.#autoJoinAt < AUTOJOIN_EVERY) return;
-    this.#autoJoinAt = now;
-    this.#autoJoinBusy = true;
-    this.sync.tryAutoJoin()
-      .then((joined) => { if (joined) this.pointsAttrib.relaxSettle(this.sync.intervalSec); })
-      .catch(() => { /* tryAutoJoin 自吞错误，这里兜底防未处理拒绝 */ })
-      .finally(() => { this.#autoJoinBusy = false; });
-  }
-
-  /**
-   * 冷启动一次性装载上一轮已 fetch 到的分片（只读本地仓，不联网，百毫秒级）。
+   * 冷启动一次性装载上一轮已 fetch 到的分片（只读缓存，不联网，百毫秒级）。
    * 首轮 poll 前 await：否则从启动到第一轮同步跑完（最长 intervalSec），美元、标定单价、
-   * 多机机器数全按单机口径给，而他机数据其实就躺在本地 sync-repo 里——`--once` 尤其明显，
+   * 多机机器数全按单机口径给，而他机数据其实就躺在本地缓存里——`--once` 尤其明显，
    * 它根本活不到第一轮同步完成（本次核算 fable 倍率时就被这个坑过一回）。
    */
   async #warmShards() {
@@ -298,7 +279,7 @@ export class Engine {
    * 额度是别的机器唯一的额度来源，压着十分钟不发，对面主行印的就是十分钟前的数。
    */
   #maybeSync() {
-    if (!this.sync.enabled) { this.#maybeAutoJoin(Date.now() / 1000); return; }
+    if (!this.sync.enabled) return;
     if (this.#syncBusy) return;
     const now = Date.now() / 1000;
     const limits = this.#shardLimits();

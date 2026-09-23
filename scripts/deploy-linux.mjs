@@ -21,8 +21,6 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULT_REMOTE } from '../provider/lib/ledger-sync.mjs';
-
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const ADMIN_FILE = join(homedir(), '.miraquota', 'inbox-admin.json');
 const SERVICE = 'miraquota-sync';
@@ -39,14 +37,11 @@ if (flag('help') || !opt('host')) {
   --hub <地址>        走自建服务器通道（**推荐**）：配 ${'`'}{"hub":…,"token":…}${'`'} 写进那台机器的 sync.json
   --token <令牌>      --hub 用的共享令牌（去 hub 那台机器的 <data>/config.json 里看）
   --via-inbox         走收件口通道（没有自建服务器时用）：--account <名字> / --invite <码> / --inbox <地址>
-  --via-git           走 git 通道（把分片提交进一个私有 GitHub 仓）。**不推荐**，也不再是默认：
-                      每台机器每 10 分钟要提交 333 KB（≈47 MB/天），还要一把 gh 装的部署密钥；
-                      见 docs/STORE.md「传输：只留 hub」
   --reset-sync        已有 sync.json 时也覆盖。默认**不动**它——盖掉会把那台机器从现有面板上踢下来
   --uninstall         停掉并删除那台机器上的服务与代码（sync.json 保留）
 
 不带通道参数时：已有 sync.json 就原样保留；没有的话只装服务并提示你选一条通道
-（不猜、更不默认去 GitHub 装部署密钥）。收件口通道要求**看面板的那台机器**能连上
+（不猜）。收件口通道要求**看面板的那台机器**能连上
 workers.dev，国内直连不通（见 docs/MULTI-MACHINE.md），所以自建 hub 才是首选。`);
   process.exit(opt('host') ? 0 : 1);
 }
@@ -122,16 +117,15 @@ await new Promise((resolve, reject) => {
 say(`代码已同步到 ${HOST}:${DIR}/provider`);
 
 /* ---------------- 3. 同步通道 ----------------
- * 优先级：已有 sync.json 不动 → --hub（推荐）→ --via-inbox → --via-git（不推荐）。
- * git 通道**不再默认**：每台机器每 10 分钟要提交 333 KB（≈47 MB/天），还要一把 gh 装的
- * 部署密钥，而它换来的只是"不用自建服务器"。没有通道参数时只装服务并提示，不猜。
+ * 优先级：已有 sync.json 不动 → --hub（推荐）→ --via-inbox。
+ * git 通道 2026-09-23 退役并删掉了（用户：「不要存 Github，占项目大小和烧 cpu」——实测每台机器
+ * 每 10 分钟要提交 333 KB ≈ 47 MB/天，还要一把 gh 装的部署密钥）。没有通道参数时只装服务并提示。
  */
 const keepSync = hasSync && !flag('reset-sync');
 const wantHub = !!opt('hub');
-const wantGit = flag('via-git');
 
 if (keepSync) {
-  say(`同步配置已有（保持不动）：${HOST}:~/.miraquota/sync.json。要换通道加 --reset-sync 并给出 --hub / --via-inbox / --via-git`);
+  say(`同步配置已有（保持不动）：${HOST}:~/.miraquota/sync.json。要换通道加 --reset-sync 并给出 --hub / --via-inbox`);
 } else if (wantHub) {
   const hub = String(opt('hub')).replace(/\/+$/, '');
   const token = opt('token');
@@ -181,61 +175,6 @@ writeFileSync(process.env.HOME + "/.miraquota/sync.json",
 console.log(how);
 '`);
   say(`收件口${out.includes('REGISTER') ? '已注册' : '已登录'}：${account} · 口令在 ${HOST}:~/.miraquota/sync.json`);
-} else if (wantGit) {
-  const repo = opt('repo', DEFAULT_REMOTE);
-  const m = /github\.com[:/]([^/]+)\/([^/.]+)/.exec(repo);
-  if (!m) { console.error(`看不懂账本仓地址：${repo}`); process.exit(1); }
-  const [, owner, name] = m;
-  // 别名 Host：只有这个别名走这把 key，那台机器上其他 GitHub 用途一律不受影响
-  const alias = 'github.com-miraquota';
-  const sshRemote = `git@${alias}:${owner}/${name}.git`;
-
-  const pub = (await remote(`set -e
-mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-[ -f "$HOME/.ssh/miraquota-ledger" ] || ssh-keygen -q -t ed25519 -N '' -C "miraquota-${hostShort}" -f "$HOME/.ssh/miraquota-ledger"
-grep -q '${alias}' "$HOME/.ssh/config" 2>/dev/null || cat >> "$HOME/.ssh/config" <<CFG
-
-Host ${alias}
-  HostName github.com
-  User git
-  IdentityFile ~/.ssh/miraquota-ledger
-  IdentitiesOnly yes
-  StrictHostKeyChecking accept-new
-CFG
-chmod 600 "$HOME/.ssh/config"
-cat "$HOME/.ssh/miraquota-ledger.pub"`)).trim();
-
-  // 装到仓上（幂等：同一把公钥重复添加，GitHub 报 key is already in use，视作已装好）
-  const title = `miraquota-${hostShort}`;
-  try {
-    await run('gh', ['api', `repos/${owner}/${name}/keys`, '-f', `title=${title}`, '-f', `key=${pub}`, '-F', 'read_only=false']);
-    say(`部署密钥已装到 ${owner}/${name}（标题 ${title}，可写，仅此仓）`);
-  } catch (e) {
-    // 重复添加同一把公钥，GitHub 只回 422 Validation Failed，正文里的「key is already in use」
-    // gh 不一定带出来——所以别猜报错文本，直接去仓上核对这把公钥在不在。
-    const installed = await run('gh', ['api', `repos/${owner}/${name}/keys`, '--jq', '.[].key'])
-      .then((s) => s.split('\n').some((k) => k.trim() && pub.startsWith(k.trim())))
-      .catch(() => false);
-    if (installed) say(`部署密钥已在 ${owner}/${name} 上（跳过）`);
-    else { console.error(`装部署密钥失败（本机 gh 要有该仓的管理权）：\n${e.message}`); process.exit(1); }
-  }
-
-  // 连通性自检：推不上去的话，服务连起来也只会一直红
-  const probe2 = await remote(`GIT_TERMINAL_PROMPT=0 git ls-remote ${sshRemote} >/dev/null 2>&1 && echo REPO_OK || echo REPO_FAIL`);
-  if (!probe2.includes('REPO_OK')) {
-    console.error(`${HOST} 还是读不到 ${sshRemote}——密钥没生效或那台机器连不上 github.com`);
-    process.exit(1);
-  }
-  // 内容固定，直接盖写即可幂等（也把可能存在的旧收件口配置换成 git 通道）
-  await remote(`set -e
-mkdir -p "$HOME/.miraquota"
-cat > "$HOME/.miraquota/sync.json" <<JSON
-{
-  "remote": "${sshRemote}",
-  "intervalSec": 600
-}
-JSON`);
-  say(`同步配置：git 通道 → ${sshRemote}`);
 } else {
   // 没给通道参数、那台机器也没有 sync.json：只装服务，不猜也不去 GitHub 装密钥。
   say(`同步通道未配置：${HOST} 上还没有 ~/.miraquota/sync.json。`);

@@ -8,7 +8,7 @@ Mirasim 的额度点是**账号级**（所有机器共用一个池），而本�
 强度（点/活跃小时）虚高。
 
 解法：每台机器把本机账本的**聚合态**（分钟桶 buckets/scoped/family + 覆盖区间）序列化
-为一个 JSON 分片，经一个**私有 Git 仓**自动互读。合并后：
+为一个 JSON 分片，与其它机器互读。合并后：
 
 - `spent / activeMinutes / familySpent` 默认返回本机 + 全部外机分钟桶之和
   （`{ localOnly: true }` 仍可查纯本机口径）；
@@ -16,43 +16,40 @@ Mirasim 的额度点是**账号级**（所有机器共用一个池），而本�
   才豁免他机剔除（覆盖门）；不全覆盖的时段沿用原有 CARRY_TIMEOUT 剔除兜底；
 - 点数归因的静置放宽为 max(300, 2×intervalSec)——外机支出要等它下一轮发布分片才可见。
 
-通道设计：每台机器只写自己的分支 `machine/<machineId>`（hostname 清洗的短名），
-**单提交覆盖不留历史**（首次 commit，之后 `commit --amend` + `push --force`），仓库体积
-恒定，无清理任务；读他机只 fetch `machine/*` 并 `git show` 文件内容。互不写对方分支，
-永无冲突。
+## 两条通道
+
+| 通道 | 配置文件 | 谁适合 | 服务器要什么 |
+|---|---|---|---|
+| **hub**（推荐） | `{ "hub": "https://…/mq", "token": "…" }` | 有自建服务器的人 | 跑 `server/hub.mjs`（见 `server/README.md`），写接口要 token |
+| **收件口** | `{ "inbox": "https://…workers.dev", "account": "…", "passphrase": "…" }` | 没有服务器的人 | 部署 `inbox/` 到 Cloudflare Workers，只认名字+口令+邀请码 |
+
+两条都是 HTTP：发布 = 一次 PUT（分片），读取 = 一次 GET（全部分片，剔掉自己）。
+hub 另外收**流水明细**（`PUT /journal`），所以 hub 手里有全账号的逐笔，能出任务级报表与逐点对账；
+分片与明细盖住同一分钟时只算一次（按 (机器, 分钟) 逐格让明细优先）。
+
+**git 通道（把分片提交进一个私有 GitHub 仓）2026-09-23 退役并删掉了**：用户
+「不要存 Github，占项目大小和烧 cpu」——实测每台机器每 10 分钟要提交 333 KB（≈47 MB/天），
+还要一把用 `gh` 装到仓上的部署密钥。配着它的老 `sync.json` 现在当「未配置」处理，
+启动日志里会说清怎么换。
 
 ## 部署步骤
 
-1. 建一个**私有**空仓（GitHub/Gitea/自建裸仓均可，账本金额属敏感信息，务必私有），
-   确保每台机器的 git 凭据能读写它。
+1. 选一条通道：自建服务器（`node scripts/deploy-hub.mjs --host <机器>`，见 `server/README.md`）
+   或收件口（`inbox/README.md`）。
 2. 每台机器写 `~/.miraquota/sync.json`：
 
    ```json
-   { "remote": "git@github.com:you/miraquota-sync.git", "intervalSec": 600 }
+   { "hub": "https://your-host/mq", "token": "<hub 那台机器 config.json 里的 token>", "intervalSec": 600 }
    ```
 
-   `intervalSec` 可省略（默认 600 秒）。**文件不存在或无 remote 时功能完全关闭，
+   `intervalSec` 可省略（默认 600 秒）。**文件不存在、或既无 hub 也无 inbox 时功能完全关闭，
    行为与从前完全一致。**
+
+   Linux 机器不用手写：`node scripts/deploy-linux.mjs --host <ssh 别名> --hub <地址> --token <令牌>`
+   会送代码、写配置、装 systemd 服务（已有 `sync.json` 一律不动，要换通道加 `--reset-sync`）。
 3. 重启 MiraQuota（桌面版或 provider）。首轮 poll 即同步一次，之后按 intervalSec 节流。
-
-### 新机器免手写：自动接入（v0.6 起）
-
-没有 `sync.json` 的机器，每小时会静默探一次内置的默认仓
-（`DEFAULT_REMOTE`，见 `provider/lib/ledger-sync.mjs`）能不能读：
-
-- **能读**（这台机器本来就有本人的 GitHub 凭据）⇒ 自动写好 `sync.json` 并开始同步，
-  多机页会注明「探到默认仓可读后自动接入」；
-- **读不动**（陌生人装了公开版、没凭据、没网）⇒ 什么都不发生，不记错误也不进界面，
-  与「没配置就整个功能关闭」逐字一致。
-
-探测只跑 `git ls-remote`（只读、不建仓、不留痕），且所有后台 git 都禁用交互
-（`GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never`），不会弹出登录窗口。
-
-**关掉自动接入**：把 `~/.miraquota/sync.json` 的内容改成 `{"autoJoin": false}`——
-文件存在就一律不再探测，而无 remote 又意味着同步关闭。直接删文件不行，一小时内会被接回。
-4. 验证：面板页签末尾出现「多机」页（未配置时这一页与页签都不存在），状态绿标「GitHub 已接入」，每台机器一行
-   「<id> · N 分钟前推送」（本机有标注）；远端仓出现 `machine/<各机器名>`
-   分支且各只有 1 个提交；`~/.miraquota/sync-repo` 里只有本机的 `shard.json`。
+4. 验证：面板页签末尾出现「多机」页（未配置时这一页与页签都不存在），状态绿标「已接入」，
+   每台机器一行「<id> · N 分钟前推送」（本机有标注）。
 
 ## 故障表现
 
@@ -127,9 +124,8 @@ Mirasim 的额度点是**账号级**（所有机器共用一个池），而本�
 ## 收件口通道：没有 GitHub 的人怎么加入（v0.9.22）
 
 用户 2026-09-02 拍板：共享额度的人没有 GitHub，也不想每加一个人就去开令牌。
-于是走一个 Cloudflare Worker（`inbox/`）：分片直接存它的 KV，**不写 GitHub 仓、不需要任何
-GitHub 令牌**，唯一的秘密是邀请码。客户端零仓库凭据。git 通道的机器读远端分支之余也顺带
-读一次收件口（只读、无鉴权），两条通道的人在同一张多机页上。
+于是走一个 Cloudflare Worker（`inbox/`）：分片直接存它的 KV，**不写任何仓、不需要任何
+GitHub 令牌**，唯一的秘密是邀请码。客户端零仓库凭据。
 
 ```
 sync.json（收件口模式）
@@ -142,9 +138,9 @@ sync.json（收件口模式）
 - **两种客户端**：完整应用在多机页登录；不装软件的机器下载 `<地址>/lite.bat` 双击，
   它建一个每 10 分钟的计划任务，只上传**原始行**（时间、模型、token 数），定价在读它的
   那一端做（`CostLedger.#materialize`），它机器上不带价目表。
-- **读**：收件口模式从 Worker 一次拿全所有分片，落缓存供冷启动；git 通道机器的分片不在
-  KV 里，所以收件口用户看不到额度主人的机器——主人的机器却看得到所有人（它两边都读）。
-- **多机页**按人分组：每人一行汇总，下面缩进列机器；git 通道的机器归「额度主人」。
+- **读**：从 Worker 一次拿全**同一个账号**的所有分片，落缓存供冷启动。
+  跨账号看不见（KV 按 shard:<名字>--<installId12> 分键）——要跨账号就都改用 hub。
+- **多机页**按人分组：每人一行汇总，下面缩进列机器。
 - **网络**：收件口在 `*.workers.dev`，国内实测 DNS 投毒直连不通（连 1.1.1.1 也被劫持），
   经代理可用。用户 2026-09-03 拍板暂不绑自有域名——登录卡与轻客户端都写明「需开代理」。
   要过墙时给 Worker 绑一个托管在 Cloudflare 的域名即可，代码不用改。
@@ -167,10 +163,9 @@ node scripts/deploy-linux.mjs --host <ssh 别名>
 `miraquota-sync`（`provider --sync-only`：不起 feed、不注入、不需要 Mirasim 调试端口，
 每分钟读一次账本，按 `intervalSec` 发分片）。
 
-**默认走 git 通道**，密钥是在那台机器上现生成的**部署密钥**（deploy key，只对账本仓有效、
-不碰它的其他 GitHub 用途），用本机的 `gh` 装到仓上。为什么不默认走收件口：收件口在
-`*.workers.dev`，**看面板的那台机器**（国内）直连不通，服务器发得上去、本机读不回来，
-等于没接。那台机器连不上 GitHub 时才 `--via-inbox`。
+**通道靠参数显式给**：`--hub <地址> --token <令牌>`（推荐）或 `--via-inbox`。两者都不给时
+只装服务并提示——不猜、也不去任何地方装密钥。为什么不默认收件口：收件口在 `*.workers.dev`，
+**看面板的那台机器**（国内）直连不通，服务器发得上去、本机读不回来，等于没接。
 
 拆掉：`node scripts/deploy-linux.mjs --host <别名> --uninstall`（保留 sync.json）。
 

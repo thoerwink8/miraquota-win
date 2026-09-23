@@ -4,30 +4,30 @@
  * 合并全机分片后，标定/归因/强度的分子才与账号级点数同口径（见 docs/MULTI-MACHINE.md）。
  *
  * 两种通道，配置文件 ~/.miraquota/sync.json 决定走哪条：
- *  - git 通道 { remote }：本机 GitHub 凭据直推私有仓，每台机器只写 machine/<machineId> 分支，
- *    单提交覆盖不留历史（首次 commit，之后 commit --amend + push --force），仓库体积恒定；
- *  - 收件口通道 { inbox, account, passphrase }（2026-09-02 用户拍板）：没有 GitHub 的人走这里。
+ *  - hub 通道 { hub, token }（自建服务器，**推荐**）：POST 分片、GET 全部分片，另外 PUT 流水明细
+ *    （`/journal`，见 pushJournal）。一台机器一份，服务端按 installId 整份覆盖。
+ *  - 收件口通道 { inbox, account, passphrase }（2026-09-02 用户拍板）：没有自建服务器的人走这里。
  *    客户端零仓库凭据，只带自报名字 + 自设口令，HTTP 推给 Cloudflare Worker，分片存它的 KV
- *    （见 inbox/worker.mjs），Worker 也不需要 GitHub 令牌。读他机从收件口一次拿全；
- *    git 通道的机器读远端分支之余也顺带读一次收件口，两条通道的人在同一张多机页上。
- *  - 文件不存在、或既无 remote 也无 inbox ⇒ 功能完全关闭，零副作用。
+ *    （见 inbox/worker.mjs），Worker 也不需要 GitHub 令牌。
+ *  - 文件不存在、或既无 hub 也无 inbox ⇒ 功能完全关闭，零副作用。
+ *
+ * git 通道（{ remote }，把分片提交进一个私有 GitHub 仓）2026-09-23 退役并**删掉了**：用户
+ * 「不要存 Github，占项目大小和烧 cpu」——实测每台机器每 10 分钟要提交 333 KB（≈47 MB/天）。
+ * 配着它的老 sync.json 当未配置处理，并在日志里说清怎么换（不静默失联）。
  *
  * 故障呈现取舍（2026-09-01 实测：本地代理偶发 SSL_ERROR_SYSCALL，紧接着的六次访问全成功）：
  * 抖动不该报红——红色只留给用户真要处置的持续故障。三道闸依次拦：
  *  ① 单轮内短退避重试一次；② 发布成功而只读取失败算中间态（本机数据已上传，合并样本少一点而已）；
  *  ③ 仍失败要连续 ERROR_STREAK 轮、或上次成功已过期，才进 error。
  */
-import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 
 const CONFIG_FILE = join(homedir(), '.miraquota', 'sync.json');
-const REPO_DIR = join(homedir(), '.miraquota', 'sync-repo');
 const INSTALL_FILE = join(homedir(), '.miraquota', 'install.json');
 const INBOX_CACHE = join(homedir(), '.miraquota', 'inbox-shards.json');
-const SHARD_FILE = 'shard.json';
 const DEFAULT_INTERVAL = 600;   // 秒；sync.json 未写 intervalSec 时的节流间隔
 /**
  * 「有账号额度在手/急着要账号额度」那几轮的快节奏（秒）。账本迟到十分钟无所谓——
@@ -42,13 +42,6 @@ const HTTP_TIMEOUT_MS = 30_000;
 export const SHARD_SCHEMA = 1;
 
 /**
- * 新机器免手写配置：没有 sync.json 时先静默探一下这个仓能不能读，能读才自动接入
- * （2026-09-02 用户拍板）。地址写在这里是有意的——仓是私有的，读得动的前提是那台机器
- * 本来就有本人的 GitHub 凭据；陌生人装了公开版探测必然失败，于是什么都不发生，
- * 与今天「没配置就整个功能关闭」的行为逐字一致。不想自动接入见 AUTOJOIN_OFF。
- */
-export const DEFAULT_REMOTE = 'https://github.com/thoerwink8/miraquota-ledger.git';
-/**
  * 默认收件口。部署 inbox/ 后把 workers.dev 地址填到这里；多机页的登录框预填它、允许改。
  * 地址本身不是秘密（Worker 只认名字+口令+邀请码），放在公开代码里没关系。
  */
@@ -59,13 +52,11 @@ export const DEFAULT_INBOX = 'https://miraquota-inbox.miraquota.workers.dev';
  * 预填它是为了新机器只用粘一个 token，不用记地址。
  */
 export const DEFAULT_HUB = 'https://156.224.28.95.sslip.io/mq';
-/** 探测超时；托盘常驻应用后台跑，宁可等久一点也不要因为网络慢误判成「不能接」。 */
-const PROBE_TIMEOUT_MS = 20_000;
 const ACCOUNT_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
 
 /**
  * 单轮内退避重试一次：网络抖动不该被记成一次失败。
- * 代价：git 调用自带 30s 超时，重试后单步最坏 ~62s，仍远小于同步间隔（默认 600s），
+ * 代价：HTTP 请求自带 30s 超时，重试后单步最坏 ~62s，仍远小于同步间隔（默认 600s），
  * 且 run() 在 engine 里是后台异步任务，不阻断轮询主流程。
  */
 export async function retryOnce(fn, delayMs = RETRY_DELAY_MS) {
@@ -82,8 +73,10 @@ export async function retryOnce(fn, delayMs = RETRY_DELAY_MS) {
 const ERROR_HINTS = [
   [/名字或口令不对|401/i, '名字或口令不对（在多机页重新登录）'],
   [/authentication|could not read username|invalid credentials|403|permission|denied/i, '凭据无效或无权限'],
-  [/repository not found|not found|not appear to be a git repos|no such endpoint|404/i, '仓库/收件口地址不对或已不存在'],
-  [/ssl|unable to access|could not resolve host|resolve|timed out|timeout|connection (?:reset|refused|closed)|network is unreachable|proxy|failed to connect|fetch failed|aborted/i,
+  [/repository not found|not found|no such endpoint|404/i, '仓库/收件口地址不对或已不存在'],
+  // 网络类要把 Node 的 errno 码也算进来：真机上见过 fetch failed（fetch 的包装），
+  // 也见过裸的 ECONNREFUSED/ENOTFOUND/EAI_AGAIN（写进 sync.error 的就是它们）。
+  [/ssl|unable to access|could not resolve host|resolve|timed out|timeout|connection (?:reset|refused|closed)|network is unreachable|proxy|failed to connect|fetch failed|aborted|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN/i,
     '网络连不上（代理或网络问题）'],
 ];
 
@@ -115,27 +108,6 @@ export function readInstallId(file = INSTALL_FILE) {
   return id;
 }
 
-/**
- * 后台跑的 git 一律禁止任何交互：托盘应用弹不出终端，凭据管理器却可能弹出登录窗口，
- * 用户看到的是「我没干什么，突然要我登 GitHub」。凭据已存在则照常走 helper，不受影响。
- */
-const NO_PROMPT_ENV = {
-  ...process.env,
-  GIT_TERMINAL_PROMPT: '0',
-  GIT_ASKPASS: 'echo',      // 问密码就返回空 → 立刻失败，不弹窗
-  GCM_INTERACTIVE: 'never', // Windows 凭据管理器不弹登录界面
-};
-
-/** 系统 git CLI。stderr 并入报错信息，供 payload 的 sync.error 展示一行。 */
-const git = (cwd, args, timeout = 30_000) => new Promise((resolve, reject) => {
-  execFile('git', ['-C', cwd, ...args],
-    { timeout, maxBuffer: 8 << 20, windowsHide: true, env: NO_PROMPT_ENV },
-    (err, stdout, stderr) => {
-      if (err) reject(new Error(String(stderr || err.message || err).trim() || 'git 失败'));
-      else resolve(String(stdout));
-    });
-});
-
 /** 收件口 HTTP：非 2xx 一律抛，错误体里的 error 字段就是人话原因。 */
 async function http(url, { method = 'GET', headers = {}, body = null, timeout = HTTP_TIMEOUT_MS } = {}) {
   const r = await fetch(url, {
@@ -154,19 +126,17 @@ async function http(url, { method = 'GET', headers = {}, body = null, timeout = 
 export class LedgerSync {
   /**
    * @param opts.configFile 配置文件路径（测试注入用，默认 ~/.miraquota/sync.json）
-   * @param opts.repoDir    同步仓工作目录（默认 ~/.miraquota/sync-repo）
    * @param opts.machineId  机器短名（默认 os.hostname() 清洗）
    * @param opts.installId  安装 id（默认读/生成 ~/.miraquota/install.json）
    * @param opts.cacheFile  收件口分片缓存（默认 ~/.miraquota/inbox-shards.json）
-   * @param opts.inboxUrl   git 通道顺带读分片的收件口（默认 DEFAULT_INBOX；传 null 关掉）
+   * @param opts.inboxUrl   收件口地址（默认 DEFAULT_INBOX；传 null 关掉）
    * @param opts.retryDelayMs 单轮内重试的等待（测试注入用，默认 2 秒）
    */
-  constructor({ configFile = CONFIG_FILE, repoDir = REPO_DIR, machineId = cleanMachineId(),
+  constructor({ configFile = CONFIG_FILE, machineId = cleanMachineId(),
     installId = null, installFile = INSTALL_FILE, cacheFile = INBOX_CACHE, inboxUrl = DEFAULT_INBOX,
     retryDelayMs = RETRY_DELAY_MS } = {}) {
     this.inboxUrl = inboxUrl;
     this.configFile = configFile;
-    this.repoDir = repoDir;
     this.machineId = machineId;
     this.installId = installId ?? readInstallId(installFile);
     this.cacheFile = cacheFile;
@@ -178,10 +148,9 @@ export class LedgerSync {
     this.pushOk = false;       // 最近一轮本机分片是否发布成功（区分「只是读不到他机」）
     this.failStreak = 0;       // 连续失败轮数：抖动一次不报红，达 ERROR_STREAK 才报
     this.config = this.#loadConfig();
-    this.autoJoined = !!this.config?.autoJoinedAt;   // 配置是自动接入写的（UI 交代一句来源）
   }
 
-  /** 文件不存在、解析失败、既无 remote 也无 inbox ⇒ 功能关闭（硬性验收：现行为零变化）。 */
+  /** 文件不存在、解析失败、既无 hub 也无 inbox ⇒ 功能关闭（硬性验收：现行为零变化）。 */
   #loadConfig() {
     try {
       const c = JSON.parse(readFileSync(this.configFile, 'utf8'));
@@ -191,7 +160,7 @@ export class LedgerSync {
       // 快节奏不该反过来比常规轮还慢，min() 兜住配错的情况
       const quotaIntervalSec = Number.isFinite(quota) && quota > 0
         ? Math.min(quota, intervalSec) : Math.min(DEFAULT_QUOTA_INTERVAL, intervalSec);
-      // hub 通道优先：自建服务器是「唯一真相」，配了它就不该再走 git / 收件口那两条
+      // hub 通道优先：自建服务器是「唯一真相」，配了它就不该再走收件口那条
       // 「没有服务器时的替代品」（用户 2026-09-05 拍板）。
       if (typeof c?.hub === 'string' && c.hub.trim()) {
         return {
@@ -203,15 +172,14 @@ export class LedgerSync {
         && typeof c.passphrase === 'string' && c.passphrase.length >= 4) {
         return { mode: 'inbox', inbox: c.inbox.trim().replace(/\/+$/, ''), account: c.account, passphrase: c.passphrase, intervalSec, quotaIntervalSec };
       }
-      if (typeof c?.remote !== 'string' || !c.remote.trim()) return null;
-      return {
-        mode: 'git',
-        remote: c.remote.trim(),
-        intervalSec,
-        quotaIntervalSec,
-        // 自动接入写下的来源标记，重启后仍认得出（UI 据此说明这台机器是自己接上的）
-        ...(typeof c.autoJoinedAt === 'string' ? { autoJoinedAt: c.autoJoinedAt } : {}),
-      };
+      // git 通道 2026-09-23 退役（用户：「不要存 Github，占项目大小和烧 cpu」——实测每台机器
+      // 每 10 分钟要提交 333 KB）。配着它的机器不静默失联：说清楚该怎么换，然后当未配置。
+      if (typeof c?.remote === 'string' && c.remote.trim()) {
+        console.warn('[sync] sync.json 配的是已退役的 git 通道（remote='
+          + `${c.remote.trim()}）——同步不会启动。改用自建服务器或收件口：`
+          + 'node scripts/deploy-linux.mjs --host <机器> --hub <地址> --token <令牌>');
+      }
+      return null;
     } catch { return null; }
   }
 
@@ -223,36 +191,6 @@ export class LedgerSync {
   /** 分片上的身份：收件口模式带 account，两种模式都带 installId。 */
   get identity() {
     return { installId: this.installId, ...(this.config?.mode === 'inbox' ? { account: this.config.account } : {}) };
-  }
-
-  /**
-   * 新机器自动接入：没有 sync.json 时，静默探一下默认仓能不能读，能读才写配置并启用。
-   *
-   * 三条硬边界——
-   *  ① 文件存在就一律不动（哪怕内容是空的、坏的、autoJoin:false）：用户配过的就是他说了算；
-   *  ② 探测用 git ls-remote，只读、不建仓、不留痕，失败就当没发生过（不记 error、不进界面），
-   *     这样陌生人装公开版仍是「整个功能关闭」，与今天零差别；
-   *  ③ 写进去的 remote 和探通的是同一个地址，不给「探 A 用 B」留缝。
-   *
-   * @returns true 表示本次接上了（调用方据此放宽归因静置），其余情况一律 false。
-   */
-  async tryAutoJoin({ remote = DEFAULT_REMOTE, now = new Date() } = {}) {
-    if (this.enabled || existsSync(this.configFile) || !remote) return false;
-    try {
-      await git(homedir(), ['ls-remote', '--heads', remote], PROBE_TIMEOUT_MS);
-    } catch { return false; }   // 没凭据/没网/不是这台机器该管的仓：静默作罢，下次再探
-    try {
-      mkdirSync(join(this.configFile, '..'), { recursive: true });
-      writeFileSync(this.configFile, JSON.stringify({
-        remote,
-        intervalSec: DEFAULT_INTERVAL,
-        // 留个来源标记：以后看到这台机器怎么接上的，不用猜（也让 UI 能说一句人话）
-        autoJoinedAt: now.toISOString(),
-      }, null, 2) + '\n');
-    } catch { return false; }
-    this.config = this.#loadConfig();
-    this.autoJoined = this.enabled;
-    return this.enabled;
   }
 
   /**
@@ -287,7 +225,6 @@ export class LedgerSync {
       writeFileSync(this.configFile, JSON.stringify({ inbox: base, account, passphrase, intervalSec: DEFAULT_INTERVAL }, null, 2) + '\n');
     } catch (e) { return { ok: false, error: `配置写不进去：${e.message}` }; }
     this.config = this.#loadConfig();
-    this.autoJoined = false;
     this.lastError = null; this.failStreak = 0;
     return { ok: true, registered };
   }
@@ -328,55 +265,12 @@ export class LedgerSync {
       writeFileSync(this.configFile, JSON.stringify({ hub: base, token, intervalSec: DEFAULT_INTERVAL }, null, 2) + '\n');
     } catch (e) { return { ok: false, error: `配置写不进去：${e.message}` }; }
     this.config = this.#loadConfig();
-    this.autoJoined = false;
     this.lastError = null; this.failStreak = 0;
     return { ok: true };
   }
 
-  /** 同步仓就绪：init + repo 级身份（不碰全局配置）+ origin 对齐 sync.json 的 remote。 */
-  async #ensureRepo() {
-    if (!existsSync(join(this.repoDir, '.git'))) {
-      mkdirSync(this.repoDir, { recursive: true });
-      await git(this.repoDir, ['init', '--quiet']);
-    }
-    // 这三项每轮都幂等重设，不放在 init 分支里：实测首次 init 后进程提前退出（--once），
-    // config 没落盘，之后每轮都以「.git 已存在」跳过补写，永久缺失——提交会署用户全局
-    // git 身份，用户若开了 GPG 签名则 commit 直接失败。三次本地 git config 很便宜。
-    await git(this.repoDir, ['config', 'user.name', 'miraquota']);
-    await git(this.repoDir, ['config', 'user.email', 'miraquota@local']);
-    await git(this.repoDir, ['config', 'commit.gpgsign', 'false']);
-    const remotes = (await git(this.repoDir, ['remote'])).split('\n').map((s) => s.trim());
-    if (!remotes.includes('origin')) {
-      await git(this.repoDir, ['remote', 'add', 'origin', this.config.remote]);
-    } else if ((await git(this.repoDir, ['remote', 'get-url', 'origin'])).trim() !== this.config.remote) {
-      await git(this.repoDir, ['remote', 'set-url', 'origin', this.config.remote]);
-    }
-  }
-
-  /** 发布本机分片：单提交覆盖不留历史，远端 machine/<id> 分支恒为一个提交。 */
-  async #publish(shard) {
-    writeFileSync(join(this.repoDir, SHARD_FILE), JSON.stringify(shard));
-    await git(this.repoDir, ['add', SHARD_FILE]);
-    const hasHead = await git(this.repoDir, ['rev-parse', '--verify', '--quiet', 'HEAD'])
-      .then(() => true, () => false);
-    const msg = `shard ${this.machineId} @ ${new Date(shard.generatedAt * 1000).toISOString()}`;
-    // --allow-empty：内容未变时也要能提交（覆盖区间在分片里、时间戳在 message 里，都在变）。
-    await git(this.repoDir, hasHead
-      ? ['commit', '--amend', '--allow-empty', '--quiet', '-m', msg]
-      : ['commit', '--allow-empty', '--quiet', '-m', msg]);
-    // force 只作用于同步数据仓自己的 machine/<id> 分支——它就是「覆盖式发布」的语义。
-    await git(this.repoDir, ['push', '--quiet', '--force', 'origin', `HEAD:machine/${this.machineId}`]);
-  }
-
-  /** 读全部外机分片：fetch machine/* 后逐分支 git show，坏分片跳过不拖垮整轮。 */
-  async #fetchForeign() {
-    await git(this.repoDir, ['fetch', '--quiet', '--prune', 'origin',
-      '+refs/heads/machine/*:refs/remotes/origin/machine/*']);
-    return this.#mergeShards(await this.#readForeignRefs(), await this.#readInboxQuietly());
-  }
-
   /**
-   * git 通道的机器也看得见收件口的人：分片存在 Worker 的 KV 里，不在仓里，所以 fetch 拿不到。
+   * 收件口通道的机器也看得见别人：分片存在 Worker 的 KV 里。
    * 这是附加来源——读不到只是少几台机器，不记 error、不改状态色。
    */
   async #readInboxQuietly() {
@@ -462,7 +356,7 @@ export class LedgerSync {
     });
   }
 
-  /** 收件口：一次 GET 拿全部分片（含 git 通道机器的），剔掉自己，顺手落缓存供冷启动。 */
+  /** 收件口：一次 GET 拿全部分片，剔掉自己，顺手落缓存供冷启动。 */
   async #fetchInbox() {
     const all = await http(`${this.config.inbox}/shards`);
     const shards = (Array.isArray(all) ? all : []).filter((s) => this.#isForeign(s));
@@ -491,37 +385,14 @@ export class LedgerSync {
   async loadCachedShards() {
     if (!this.enabled) return [];
     try {
+      // HTTP 两条通道没有本地仓，冷启动只有缓存这一份
       const cached = () => {
         try { return JSON.parse(readFileSync(this.cacheFile, 'utf8')).filter((s) => this.#isForeign(s)); } catch { return []; }
       };
-      let shards;
-      if (this.mode !== 'git') {
-        shards = cached();          // HTTP 两条通道没有本地仓，冷启动只有缓存这一份
-      } else {
-        shards = this.#mergeShards(existsSync(join(this.repoDir, '.git')) ? await this.#readForeignRefs() : [], cached());
-      }
+      const shards = cached();
       if (shards.length) this.shards = shards;
       return shards;
     } catch { return []; }
-  }
-
-  /** 本地 refs/remotes/origin/machine/* 里的分片，逐个 git show，坏分片跳过。 */
-  async #readForeignRefs() {
-    const refs = (await git(this.repoDir, ['for-each-ref', '--format=%(refname)',
-      'refs/remotes/origin/machine/'])).split('\n').map((s) => s.trim()).filter(Boolean);
-    const shards = [];
-    for (const ref of refs) {
-      const id = ref.slice('refs/remotes/origin/machine/'.length);
-      if (id === this.machineId) continue;
-      try {
-        const shard = JSON.parse(await git(this.repoDir, ['show', `${ref}:${SHARD_FILE}`]));
-        // v1 聚合态与 v2 原始行都收；账本那边负责把 v2 定价落成 v1
-        if ((shard?.schemaVersion !== SHARD_SCHEMA && shard?.schemaVersion !== 2) || !shard.machineId) continue;
-        if (!this.#isForeign(shard)) continue;
-        shards.push(shard);
-      } catch { /* 单个分片坏不影响其余机器 */ }
-    }
-    return shards;
   }
 
   /**
@@ -535,7 +406,6 @@ export class LedgerSync {
     const firstLine = (e) => String(e.message || e).split('\n')[0].slice(0, 200);
     let err = null;
     try {
-      if (this.#needsRepo) await this.#ensureRepo();
       // extras 只供「看那台机器」的视角切换用，不参与合并：分片格式没变（schemaVersion 仍是 1），
       // 老版本读到多出来的字段直接忽略，两代客户端可以混跑。
       const shard = { ...ledger.exportShard(this.machineId, nowSec, this.identity), ...(extras ?? {}) };
@@ -559,7 +429,7 @@ export class LedgerSync {
    * 只读一轮：不发布本机分片，只把他机分片重新拉一遍。
    *
    * 用在「本机 Mirasim 没在跑」的时候——这台机器自己的账本几乎不动（没有 relay 在扣点），
-   * 没什么可发的，但账号额度得跟上还在跑的那台机器。省掉 push 那半程，git 通道就只剩
+   * 没什么可发的，但账号额度得跟上还在跑的那台机器。省掉 push 那半程，就只剩
    * 一次 fetch，快节奏拉取（quotaIntervalSec）才不至于把远端仓刷成提交流水。
    *
    * 失败静默：状态色仍由 run() 那条主链判——一次额外的读取失败不该让界面变红，
@@ -569,30 +439,26 @@ export class LedgerSync {
   async refreshOnly(nowSec = Date.now() / 1000) {
     if (!this.enabled) return null;
     try {
-      if (this.#needsRepo) await this.#ensureRepo();
       this.shards = await this.#fetchAll();
       this.lastSyncSec = nowSec;
       return this.shards;
     } catch { return null; }
   }
 
-  /** 只有 git 通道要维护本地同步仓；HTTP 那两条一个文件都不建。 */
-  get #needsRepo() { return this.mode === 'git'; }
-
   /**
-   * 发布 / 读取按通道分派。写成表而不是布尔判断：加第四条通道时改这两处，
+   * 发布 / 读取按通道分派。写成表而不是布尔判断：加第三条通道时改这两处，
    * 不用满文件找 `inbox ? … : …`（这个坑在加 hub 时就已经踩到了）。
    */
   #publishTo(shard) {
     if (this.mode === 'hub') return this.#publishHub(shard);
     if (this.mode === 'inbox') return this.#publishInbox(shard);
-    return this.#publish(shard);
+    return Promise.reject(new Error(`不认识的同步通道：${this.mode}`));
   }
 
   #fetchAll() {
     if (this.mode === 'hub') return this.#fetchHub();
     if (this.mode === 'inbox') return this.#fetchInbox();
-    return this.#fetchForeign();
+    return Promise.reject(new Error(`不认识的同步通道：${this.mode}`));
   }
 
   /**
@@ -604,7 +470,7 @@ export class LedgerSync {
    *  - 'connecting'（灰）启用但从未成功，或成功记录已过期且当轮没有失败原因。
    * 另带 pushOk / failStreak 供 UI 挑文案，error 是原始首行、errorHint 是人话（归纳得出才有）。
    *  - machines：每台机器一行 { id, key, account, lastShardSec, self }——id 是主机短名（显示用），
-   *    key 是 installId（没有就退回 id，老分片），account 是自报名字（git 通道为 null）。
+   *    key 是 installId（没有就退回 id，老分片），account 是自报名字（hub 通道为 null）。
    */
   status(nowSec = Date.now() / 1000) {
     const fresh = this.lastSyncSec != null && nowSec - this.lastSyncSec <= 2 * this.intervalSec;
@@ -631,8 +497,7 @@ export class LedgerSync {
           ...(s.speed?.rows?.length ? { speed: s.speed } : {}),
         })),
       ],
-      ...(this.autoJoined ? { autoJoined: true } : {}),
-      ...(this.lastSyncSec != null ? { lastSyncSec: this.lastSyncSec } : {}),
+        ...(this.lastSyncSec != null ? { lastSyncSec: this.lastSyncSec } : {}),
       ...(this.lastError ? { error: this.lastError } : {}),
       ...(hint ? { errorHint: hint } : {}),
       ...(this.failStreak > 0 ? { failStreak: this.failStreak } : {}),

@@ -196,25 +196,30 @@ test('the default inbox is a real https url and the login card only shows when s
   assert.ok(renderer.includes("$('syncHubCard').style.display = canLogin ? '' : 'none';"));
 });
 
-test('a git-channel machine also sees inbox people, and a dead inbox costs it nothing', async () => {
-  // 分片存在 Worker 的 KV 里、不在仓里，git fetch 拿不到——git 通道顺带读一次收件口，
-  // 两条通道的人才在同一张多机页上。收件口读不到只是少几台机器，不记 error。
+test('an inbox machine reads its own cache on cold start, and a dead inbox costs it nothing', async () => {
+  // 分片存在 Worker 的 KV 里。冷启动（不联网）只读上一轮落下的缓存；收件口读不到只是少几台
+  // 机器，不记 error、不改状态色。
+  //
+  // 从前这条测的是「git 通道的机器顺带读一次收件口，两条通道的人在同一张多机页上」。
+  // git 通道 2026-09-23 退役并删掉了，那半句没了前提；缓存与「收件口挂了不抛」这两条照旧。
   const box = await fakeInbox();
   try {
     const MIN = 29_400_000;
-    const lite = new LedgerSync({ configFile: join(tmp, 'lite-sync.json'), repoDir: join(tmp, 'lite-repo'), machineId: 'laptop', installId: 'dddd0000dddd0000', cacheFile: join(tmp, 'lite-cache.json'), retryDelayMs: 1 });
+    const lite = new LedgerSync({ configFile: join(tmp, 'lite-sync.json'), machineId: 'laptop', installId: 'dddd0000dddd0000', cacheFile: join(tmp, 'lite-cache.json'), retryDelayMs: 1 });
     assert.equal((await lite.login({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', invite: 'code' })).ok, true);
     await lite.run(pricedLedger('lite', { buckets: { [MIN]: 3 } }), MIN * 60);
-    // git 通道的机器：上一轮已把收件口分片落进缓存 → 冷启动（不起 git 仓、不联网）就能拿到
-    writeFileSync(join(tmp, 'owner-sync.json'), JSON.stringify({ remote: join(tmp, 'nowhere.git') }));
+    // 上一轮已把收件口分片落进缓存 → 冷启动（不联网）就能拿到
     writeFileSync(join(tmp, 'owner-cache.json'), JSON.stringify([...box.shards.values()]));
-    const owner = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), repoDir: join(tmp, 'owner-repo'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache.json'), inboxUrl: box.url });
-    assert.equal(owner.mode, 'git');
+    // 配置文件要在构造**之前**写好：构造时就 #loadConfig 定模式，晚写等于没配
+    writeFileSync(join(tmp, 'owner-sync.json'), JSON.stringify({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', intervalSec: 600 }));
+    const owner = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache.json'), inboxUrl: box.url });
+    assert.equal(owner.mode, 'inbox');
     const got = await owner.loadCachedShards();
     assert.deepEqual(got.map((s) => [s.machineId, s.account]), [['laptop', 'fxc']]);
-    assert.deepEqual(owner.status().machines.map((m) => [m.id, m.account, m.self]), [['desk', null, true], ['laptop', 'fxc', false]]);
+    // 本机那行也带 account：收件口模式下身份就是「登录的那个名字」（git 通道下它是 null）
+    assert.deepEqual(owner.status().machines.map((m) => [m.id, m.account, m.self]), [['desk', 'fxc', true], ['laptop', 'fxc', false]]);
     // 收件口挂了：冷启动只读缓存，不抛；没缓存就是空
-    const dead = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), repoDir: join(tmp, 'owner-repo'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache2.json'), inboxUrl: 'http://127.0.0.1:9' });
+    const dead = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache2.json'), inboxUrl: 'http://127.0.0.1:9' });
     assert.deepEqual(await dead.loadCachedShards(), []);
   } finally { box.close(); }
 });
