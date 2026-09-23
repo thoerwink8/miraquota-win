@@ -25,7 +25,7 @@
  *
  * 分层（磁盘与保留时间靠这个兼顾）：
  *   calls   逐笔明细，保留 30 天（可配，见 docs/STORE.md 的实测表）。
- *   daily   日汇总，**永久**保留。明细删掉后报表照出。
+ *   hourly  小时汇总，**永久**保留。明细删掉后报表照出，且与明细同一个口径（见下）。
  *   points / marks  官方点数采样与同瞬的模型累计，给倍率标定与对账用。
  *   prices / families  价目与家族表（代码里的常量开库时种进来，供 SQL join）。
  *   machines / limits  hub 侧：各机推上来的分片与账号额度快照。
@@ -44,7 +44,20 @@ import { dirname, join } from 'node:path';
 import { BUILTIN, FAMILY } from './pricing.mjs';
 import { familyLabel, modelFamily } from './model-families.mjs';
 
-export const STORE_SCHEMA = 1;
+/**
+ * 库的形状版本。改动 `calls`/`hourly`/`dims` 的列或主键就必须 +1。
+ *
+ * v2（2026-09-23）：汇总层的主键补上 `side`/`priced`/`billable`——原来少这三列，两个不同的
+ * 分组会撞进同一行、后者覆盖前者，而这是"先汇总后删"路径上的静默丢数。
+ * v3（2026-09-23）：汇总层由 `daily`（按天）改成 `hourly`（按小时）。按天那版实测在 VPS 上
+ * 历史区间比明细层少 $6.87（0.15%）：逐小时取大之和恒 ≥ 先按天求和再取大，按天存等于给自己
+ * 留了一个恒偏低的口径偏差，而对账工具不该有偏差。
+ *
+ * v1/v2 都没发布过，所以旧库直接**重建派生表**（见 `#migrate`）：流水能从原始记录重扫回来。
+ * 从 v3 起，任何破坏性改形状都必须先写就地迁移，否则宁可拒绝打开——原始记录不是永远都在
+ * （transcript 会被 Claude Code 清掉，那天已经发生过一次）。
+ */
+export const STORE_SCHEMA = 3;
 export const STORE_FILE = join(homedir(), '.miraquota', 'store.db');
 /** 明细默认保留天数。想留更久就调大——磁盘代价见文件头那张实测表。 */
 export const DETAIL_DAYS = 30;
@@ -92,16 +105,22 @@ CREATE INDEX IF NOT EXISTS calls_hour ON calls(machine, hour, model, side);
 CREATE INDEX IF NOT EXISTS calls_sess ON calls(sess, ts);
 CREATE INDEX IF NOT EXISTS calls_day ON calls(day);
 
--- 日汇总：明细删掉之后报表还出得来。列全是整数维度，主键不含 NULL
--- （WITHOUT ROWID 的主键列隐含 NOT NULL，含 NULL 会让汇总整条插不进去）。
-CREATE TABLE IF NOT EXISTS daily (
-  day INTEGER NOT NULL, machine INTEGER NOT NULL DEFAULT 0, model INTEGER NOT NULL DEFAULT 0,
+-- 汇总层：明细删掉之后报表还出得来。**按小时存**，于是口径（逐小时逐模型取大）与明细层
+-- 完全一致——按天存过一次，实测 VPS 上历史区间比明细层少 $6.87（0.15%）：逐小时取大之和
+-- 恒 ≥ 先按天求和再取大，按天存等于给自己留了一个恒偏低的口径偏差，对账工具不该有。
+-- 代价只是行数多几倍（实测 90 天约 1 MB），换"历史与当下同一个口径"值得。
+-- 主键必须覆盖汇总的每一个分组列（含 side/priced/billable）：少一列，两个不同的组就会撞进
+-- 同一行、后者覆盖前者，而这是"先汇总后删"路径上的静默丢数（2026-09-23 补）。
+CREATE TABLE IF NOT EXISTS hourly (
+  hour INTEGER NOT NULL, day INTEGER NOT NULL,
+  machine INTEGER NOT NULL DEFAULT 0, model INTEGER NOT NULL DEFAULT 0,
   sess INTEGER NOT NULL DEFAULT 0, ws INTEGER NOT NULL DEFAULT 0,
   src TEXT NOT NULL, side TEXT NOT NULL, priced INTEGER NOT NULL, billable INTEGER NOT NULL,
   usd REAL NOT NULL DEFAULT 0, i INTEGER NOT NULL DEFAULT 0, o INTEGER NOT NULL DEFAULT 0,
   cr INTEGER NOT NULL DEFAULT 0, cw INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (day, machine, model, sess, ws, src)
+  PRIMARY KEY (hour, machine, model, sess, ws, src, side, priced, billable)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS hourly_day ON hourly(day);
 
 -- 会话轮次（Mirasim 的会话库）：只用来**归属**任务，不当作花费来源——它的 usage 没有缓存写，
 -- 而缓存读/写占 fable 花费的一半以上；当来源会与 transcript 重复计。
@@ -202,7 +221,27 @@ export class UsageStore {
     if (cur > STORE_SCHEMA) {
       throw new Error(`store.db 的 schema 是 ${cur}，本版只认到 ${STORE_SCHEMA}——升级程序或换文件，别降级读`);
     }
-    if (cur < STORE_SCHEMA) this.db.exec(`PRAGMA user_version = ${STORE_SCHEMA}`);
+    if (cur === STORE_SCHEMA) return;
+    if (cur > 0) {
+      // 派生表（dims/calls/hourly）能从原始记录重建，所以旧版本就地重建；`meta`（口径等）留着。
+      // 这只在 v1→v2 这次成立——v1 从未发布，且它只是我本机的中间形状。以后要破坏性改形状，
+      // 必须先写就地迁移（契约 #6）：流水一旦成了唯一副本（原始记录被清理），重建就等于丢账。
+      console.warn(`[store] schema ${cur} → ${STORE_SCHEMA}：重建派生表（原始记录还在，跑一次 --import 即可）`);
+      this.db.exec('DROP VIEW IF EXISTS effective');
+      this.db.exec('DROP TABLE IF EXISTS calls');
+      this.db.exec('DROP TABLE IF EXISTS daily');
+      this.db.exec('DROP TABLE IF EXISTS hourly');
+      this.db.exec('DROP TABLE IF EXISTS dims');
+      this.db.exec(DDL);
+      this.db.prepare("INSERT INTO meta (k,v) VALUES ('rebuild_needed','1') ON CONFLICT(k) DO UPDATE SET v='1'").run();
+    }
+    this.db.exec(`PRAGMA user_version = ${STORE_SCHEMA}`);
+  }
+
+  /** 上一次开库是否重建过派生表（还没重新导入）。CLI 据此提示，避免拿空库出报表。 */
+  get needsImport() { return this.db.prepare("SELECT v FROM meta WHERE k='rebuild_needed'").get()?.v === '1'; }
+  clearNeedsImport() {
+    this.db.prepare("DELETE FROM meta WHERE k='rebuild_needed'").run();
   }
 
   /** 价目与家族常量种进库里，供 SQL join（代码仍是唯一来源，每次开库覆盖）。 */
@@ -402,7 +441,7 @@ export class UsageStore {
       .all(...params, Math.floor(fromSec), Math.floor(toSec));
   }
 
-  /** 按天（明细删掉之后走 daily 表，见 totalWithDaily）。 */
+  /** 按天（明细删掉之后走 hourly 汇总表，见 totalWithDaily）。 */
   byDay(fromSec, toSec, opts = {}) {
     const { where, params } = this.#filters(opts, 'e');
     return this.db.prepare(`SELECT e.day, SUM(e.usd) usd, COUNT(*) n FROM effective e ${where}
@@ -464,8 +503,8 @@ export class UsageStore {
   // MARK: 保留与汇总
 
   /**
-   * 把 `beforeDay` 之前的明细汇进 daily 再删掉。**先汇总后删**是硬顺序：反了就永久丢数。
-   * @param beforeDay YYYYMMDD 整数
+   * 把 `beforeDay` 之前的明细汇进 `hourly` 再删掉。**先汇总后删**是硬顺序：反了就永久丢数。
+   * @param beforeDay YYYYMMDD 整数（或 'YYYY-MM-DD'）
    * @returns {{ rolled: number, deleted: number }}
    */
   prune({ beforeDay, keepDetailDays = null } = {}) {
@@ -475,35 +514,55 @@ export class UsageStore {
     const day = norm(beforeDay) ?? (keepDetailDays != null ? dayInt(Date.now() / 1000 - keepDetailDays * 86400) : null);
     if (!day) throw new Error('prune 需要 beforeDay（YYYY-MM-DD 或 YYYYMMDD）或 keepDetailDays');
     const rolled = this.db.prepare(`SELECT COUNT(*) n FROM (
-      SELECT 1 FROM calls WHERE day < ? GROUP BY day, machine, model, sess, ws, src, side, priced, billable)`).get(day).n;
+      SELECT 1 FROM calls WHERE day < ? GROUP BY hour, machine, model, sess, ws, src, side, priced, billable)`).get(day).n;
     this.db.exec('BEGIN');
     try {
       // 必须用 prepare().run(day) 而不是 exec()：**exec 不绑定参数**，SQL 里的 `?` 会当 NULL，
       // 于是 `day < NULL` 恒为假——汇总静默插 0 行，接着 DELETE 把明细删光，数据就永久没了。
       // 2026-09-23 契约测试逮到的正是这个（先汇总后删的顺序对，但汇总那步什么都没干）。
-      this.db.prepare(`INSERT INTO daily (day,machine,model,sess,ws,src,side,priced,billable,usd,i,o,cr,cw,n)
-        SELECT day,machine,model,sess,ws,src,side,priced,billable,SUM(usd),SUM(i),SUM(o),SUM(cr),SUM(cw),COUNT(*)
+      this.db.prepare(`INSERT INTO hourly (hour,day,machine,model,sess,ws,src,side,priced,billable,usd,i,o,cr,cw,n)
+        SELECT hour,day,machine,model,sess,ws,src,side,priced,billable,SUM(usd),SUM(i),SUM(o),SUM(cr),SUM(cw),COUNT(*)
         FROM calls WHERE day < ?
-        GROUP BY day,machine,model,sess,ws,src,side,priced,billable
-        ON CONFLICT(day,machine,model,sess,ws,src) DO UPDATE SET
-          usd=excluded.usd, i=excluded.i, o=excluded.o, cr=excluded.cr, cw=excluded.cw, n=excluded.n,
-          side=excluded.side, priced=excluded.priced, billable=excluded.billable`).run(day);
+        GROUP BY hour,machine,model,sess,ws,src,side,priced,billable
+        ON CONFLICT(hour,machine,model,sess,ws,src,side,priced,billable) DO UPDATE SET
+          usd=excluded.usd, i=excluded.i, o=excluded.o, cr=excluded.cr, cw=excluded.cw, n=excluded.n`).run(day);
       const del = this.db.prepare('DELETE FROM calls WHERE day < ?').run(day);
       this.db.exec('COMMIT');
       return { rolled, deleted: del.changes };
     } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
 
-  /** 明细 + 汇总的合计（报表用：明细窗口内走 calls，窗口外走 daily）。 */
+  /**
+   * 明细 + 汇总的合计（报表用：明细窗口内走 calls，窗口外走 hourly）。
+   *
+   * **历史区间也按同一套口径算**，不能把汇总直接加起来——那是并集（旧账本的做法），
+   * 而且会把 `billable = 0` 的调用也算进账号花费（2026-09-23 实咬：本该 $35 的汇总报成 $90）。
+   * 汇总表按小时存，所以这里的 max 与 `effective` 视图**逐字一致**，历史与当下不会两个数。
+   */
   totalWithDaily(fromSec, toSec, opts = {}) {
     const live = this.spend(fromSec, toSec, opts);
     const fromDay = dayInt(Math.floor(fromSec)), toDay = dayInt(Math.floor(toSec));
-    const w = ['day >= ?', 'day < ?'];
+    const w = ['day >= ?', 'day < ?', 'billable = 1'];
     const p = [fromDay, toDay];
     if (opts.machine) { w.push('machine = (SELECT id FROM dims WHERE kind = ? AND name = ?)'); p.push('machine', String(opts.machine)); }
     if (opts.model) { w.push('model = (SELECT id FROM dims WHERE kind = ? AND name = ?)'); p.push('model', String(opts.model)); }
     if (opts.group) { w.push("model IN (SELECT id FROM dims WHERE kind = 'model' AND name LIKE ?)"); p.push('%' + String(opts.group).toLowerCase() + '%'); }
-    const rolled = this.db.prepare(`SELECT COALESCE(SUM(usd),0) usd, COALESCE(SUM(n),0) n FROM daily WHERE ${w.join(' AND ')}`).get(...p);
+    const where = w.join(' AND ');
+    const basis = this.basis;
+    let sql;
+    if (basis === 'union') {
+      sql = `SELECT COALESCE(SUM(usd),0) usd, COALESCE(SUM(n),0) n FROM hourly WHERE ${where}`;
+    } else if (basis === 't' || basis === 'g') {
+      sql = `SELECT COALESCE(SUM(usd),0) usd, COALESCE(SUM(n),0) n FROM hourly WHERE ${where} AND side = '${basis}'`;
+    } else {
+      // max：与 effective 视图同一个分区、同一个排序（合计降序、同分按 side）
+      sql = `SELECT COALESCE(SUM(usd),0) usd, COALESCE(SUM(n),0) n FROM (
+        SELECT hour, machine, model, side, SUM(usd) usd, SUM(n) n,
+               ROW_NUMBER() OVER (PARTITION BY machine, model, hour ORDER BY SUM(usd) DESC, side) rn
+        FROM hourly WHERE ${where} GROUP BY machine, model, hour, side
+      ) WHERE rn = 1`;
+    }
+    const rolled = this.db.prepare(sql).get(...p);
     return { usd: live.usd + rolled.usd, calls: live.calls + rolled.n, liveUSD: live.usd, rolledUSD: rolled.usd };
   }
 
@@ -534,11 +593,11 @@ export class UsageStore {
       const version = db.prepare('PRAGMA user_version').get().user_version ?? 0;
       const integrity = db.prepare('PRAGMA integrity_check').get().integrity_check;
       const calls = db.prepare('SELECT COUNT(*) n FROM calls').get().n;
-      const daily = db.prepare('SELECT COUNT(*) n FROM daily').get().n;
+      const rolled = db.prepare('SELECT COUNT(*) n FROM hourly').get().n;
       const span = db.prepare('SELECT MIN(ts) a, MAX(ts) b FROM calls').get();
       const ps = db.prepare('PRAGMA page_size').get().page_size;
       const pc = db.prepare('PRAGMA page_count').get().page_count;
-      return { file, version, integrity, calls, daily, from: span.a, to: span.b, bytes: ps * pc };
+      return { file, version, integrity, calls, rolled, from: span.a, to: span.b, bytes: ps * pc };
     } finally { db.close(); }
   }
 

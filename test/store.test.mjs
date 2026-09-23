@@ -6,7 +6,7 @@
  *   1. 流水是唯一真相：两份来源都留着、各自打标，**没有任何一条记录在写入时被丢掉**；
  *   2. 口径是视图：四种口径在同一份数据上给出四个数，切换不动一个字节；
  *   3. 去重靠主键：重读同一个文件是幂等的，且"同一响应多行"取较大值；
- *   4. 保留：先汇总后删，明细删掉后 daily 还能出同样的数（顺序反了就永久丢数）。
+ *   4. 保留：先汇总后删，明细删掉后 hourly 汇总还能出同样的数（顺序反了就永久丢数）。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -108,7 +108,7 @@ test('a non-billable call is kept in the journal but kept out of the money', () 
   s.close();
 });
 
-test('retention rolls up before deleting, so the daily totals survive', () => {
+test('retention rolls up before deleting, so the hourly totals survive', () => {
   const s = fresh();
   s.insertCalls([
     tRow(Date.parse('2026-08-01T10:00:00Z') / 1000, 'claude-opus-5', 1_000_000, 'old1'),
@@ -119,7 +119,7 @@ test('retention rolls up before deleting, so the daily totals survive', () => {
   const r = s.prune({ beforeDay: '2026-09-01' });
   assert.equal(r.deleted, 2);
   assert.equal(s.db.prepare('SELECT COUNT(*) n FROM calls').get().n, 1);
-  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM daily').get().n, 1, '两小时合成一行日汇总');
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM hourly').get().n, 2, '两小时合成两行小时汇总');
   const all = s.totalWithDaily(0, Date.now() / 1000);
   assert.ok(Math.abs(all.usd - before) < 1e-9, `明细删掉后总额不变：${all.usd} vs ${before}`);
   assert.ok(all.rolledUSD > 0 && all.liveUSD > 0);

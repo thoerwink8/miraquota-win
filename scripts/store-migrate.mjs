@@ -5,7 +5,7 @@
  *   node scripts/store-migrate.mjs --import                  # 扫原始记录 → 写进 store.db（去重、幂等）
  *   node scripts/store-migrate.mjs --report --days 8         # 对账报告：两边各记多少、差在哪
  *   node scripts/store-migrate.mjs --tasks --days 7          # 任务/工作区报表
- *   node scripts/store-migrate.mjs --rollup --keep-days 90   # 明细汇进 daily 后删掉（永久保留汇总）
+ *   node scripts/store-migrate.mjs --rollup --keep-days 90   # 明细汇进 hourly 后删掉（永久保留汇总）
  *   node scripts/store-migrate.mjs --pack /tmp/store.db      # 出一份单文件快照（迁 VPS 用）
  *   node scripts/store-migrate.mjs --inspect /tmp/store.db   # 校验一份快照能不能用
  *
@@ -21,7 +21,7 @@ import { homedir } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { UsageStore, STORE_FILE } from '../provider/lib/store.mjs';
+import { UsageStore, STORE_FILE, STORE_SCHEMA, DETAIL_DAYS } from '../provider/lib/store.mjs';
 import { Pricing } from '../provider/lib/pricing.mjs';
 import { gatewayRows, transcriptRows, turnRows, sourcePaths } from '../provider/lib/sources.mjs';
 import { cleanMachineId } from '../provider/lib/ledger-sync.mjs';
@@ -51,7 +51,7 @@ if (flag('help') || argv.length === 0) {
   --import            扫 transcript / 网关 / 会话轮次，写进 store.db（幂等，可重复跑）
   --report            对账报告：两来源各记多少、缺口在哪、官方点数对上没有
   --tasks             任务与会话报表（含"归不上任务"的部分）
-  --rollup            把 --keep-days 之前的明细汇进 daily 再删（先汇总后删，顺序不可反）
+  --rollup            把 --keep-days 之前的明细汇进 hourly 再删（先汇总后删，顺序不可反）
   --pack <文件>       出一份一致的单文件快照（VACUUM INTO）
   --inspect <文件>    校验快照：schema 版本、integrity、行数、时间跨度
 
@@ -59,7 +59,7 @@ if (flag('help') || argv.length === 0) {
   --home <路径>       原始记录所在的家目录，默认 ${HOME}
   --machine <id>      写进流水的机器 id，默认本机名
   --days <N>          报告窗口，默认 8
-  --keep-days <N>     明细保留天数，默认 90
+  --keep-days <N>     明细保留天数，默认 ${DETAIL_DAYS}（store.mjs 的 DETAIL_DAYS，磁盘代价见 docs/STORE.md）
   --basis <口径>      max / t / g / union（默认沿用库里存的）`);
   process.exit(argv.length === 0 ? 1 : 0);
 }
@@ -68,9 +68,11 @@ if (flag('help') || argv.length === 0) {
 if (flag('inspect')) {
   const info = UsageStore.inspect(opt('inspect'));
   console.log(`快照 ${info.file}`);
-  console.log(`  schema ${info.version} · integrity ${info.integrity} · 明细 ${info.calls} 行 · 日汇总 ${info.daily} 行`);
+  console.log(`  schema ${info.version} · integrity ${info.integrity} · 明细 ${info.calls} 行 · 小时汇总 ${info.rolled} 行`);
   console.log(`  时间跨度 ${info.from ? `${day(info.from)} ${hhmm(info.from)} → ${day(info.to)} ${hhmm(info.to)}` : '（空）'}`);
-  process.exit(info.integrity === 'ok' && info.version === 1 ? 0 : 1);
+  // 退出码要跟着 STORE_SCHEMA 走，别写死数字：写死过一次（=== 1），升到 2 之后 --inspect
+  // 对着一份完好的快照返回 1，脚本里 `--inspect && 用` 会莫名其妙地不走。
+  process.exit(info.integrity === 'ok' && info.version === STORE_SCHEMA ? 0 : 1);
 }
 
 const store = new UsageStore({ file: FILE, machine, ...(opt('basis') ? { basis: opt('basis') } : {}) });
@@ -79,7 +81,7 @@ if (flag('pack')) {
   const target = opt('pack');
   store.pack(target);
   const info = UsageStore.inspect(target);
-  console.log(`已打包 ${target}（${info.calls} 行明细 + ${info.daily} 行日汇总，schema ${info.version}）`);
+  console.log(`已打包 ${target}（${info.calls} 行明细 + ${info.rolled} 行小时汇总，schema ${info.version}）`);
   store.close();
   process.exit(0);
 }
@@ -129,6 +131,7 @@ if (flag('import')) {
     }
   }
   console.log(`  标定点数 ${pts} 条 · 标定 marks ${marks} 条`);
+  store.clearNeedsImport();
 
   const span = store.db.prepare('SELECT MIN(ts) a, MAX(ts) b, COUNT(*) n FROM calls').get();
   console.log(`导入完成（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
@@ -219,10 +222,10 @@ if (flag('tasks')) {
 
 /* ---------------- 汇总与保留 ---------------- */
 if (flag('rollup')) {
-  const keep = num('keep-days', 90);
+  const keep = num('keep-days', DETAIL_DAYS);
   const before = day(Math.floor(Date.now() / 1000 - keep * 86400));
   const r = store.prune({ beforeDay: before });
-  console.log(`已把 ${before} 之前的明细汇进 daily：汇总 ${r.rolled} 组、删除 ${r.deleted} 行`);
+  console.log(`已把 ${before} 之前的明细汇进 hourly：汇总 ${r.rolled} 组、删除 ${r.deleted} 行`);
 }
 
 store.close();
