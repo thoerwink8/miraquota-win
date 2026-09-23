@@ -378,6 +378,31 @@ export class Engine {
   #speedReport() { if (!this.speed) return null; try { return this.speed.report(); } catch { return null; } }
 
   /**
+   * 速度卡每一行补上「这个模型**本轮**花了多少」。
+   *
+   * 速度表原来只有 tok/s 与时间——用户 2026-09-23：「速度那一栏，能不能顺便填写一下这一行
+   * 本次消耗的费用，这样更直观」。花费的权威来源是账本（不是速度模块自己的事件），所以在这里
+   * 合流：`byModel` 按模型给窗口内的美元，挂到对应的行上；窗口取**5h 池**——它是最短的官方窗口，
+   * 「本轮」指的就是它。行上的模型名是短名，所以按 modelId 匹配。
+   */
+  #speedWithCost(report, nowSec, windows) {
+    if (!report?.rows?.length) return report;
+    // 窗口取**5h 池**（最短的官方窗口，「本轮」指的就是它）；读不到就用「最近 5 小时」兜底。
+    const w = (windows ?? []).find((x) => x.label === '5h' && !x.modelScoped);
+    const from = w?.resetAt != null && w?.durationSeconds ? w.resetAt - w.durationSeconds : nowSec - 5 * 3600;
+    let byModel = [];
+    try { byModel = this.ledger.store.byModel(from, nowSec); } catch { byModel = []; }
+    const usd = new Map(byModel.map((r) => [r.model, r.usd]));
+    let total = 0;
+    const rows = report.rows.map((r) => {
+      const u = usd.get(r.modelId) ?? 0;
+      total += u;
+      return u > 0 ? { ...r, usd: u } : r;
+    });
+    return { ...report, rows, usdWindow: '5h', usdTotal: total, usdFrom: from };
+  }
+
+  /**
    * 随分片发出去的速度快照：别人要看「这台机器跑得多快」，只有这台机器答得了
    * （账本分片是分钟桶，里面没有时长与 token 速率）。
    * 只带 rows 与样本数——在途条目（inflightSince）到对面早就结束了，带过去只会显示假在途。
@@ -1075,7 +1100,7 @@ export class Engine {
       buckets: this.ledger.bucketCount,
       windows,
       today: this.#todaySummary(Date.now() / 1000),
-      speed: this.#speedReport(),
+      speed: this.#speedWithCost(this.#speedReport(), Date.now() / 1000, windows),
       // 无同步配置时不出现该字段，显示面据此不画任何新 UI（硬性验收项）。
       ...(this.sync.enabled ? { sync: { ...this.sync.status(), ...this.#machineUsage(windows) } } : {}),
       // 没同步时给登录入口（收件口地址可改）：没有 GitHub 的人从这里进（2026-09-02）

@@ -1029,7 +1029,8 @@
     } else {
       if (c.pulse) { c.tag.textContent = ''; c.tag.__v = undefined; c.pulse = null; }
       c.tag.style.color = 'var(--ink3)';
-      setText(c.tag, `最近 ${(sp.rows || []).length} 种`);
+      // 本轮（5h 窗）这些模型一共花了多少——速度卡原来只有 tok/s，没有钱
+      setText(c.tag, `最近 ${(sp.rows || []).length} 种` + (sp.usdTotal > 0 ? ` · 本轮 ${usd(sp.usdTotal)}` : ''));
     }
 
     const rows = sp.rows || [];
@@ -1050,7 +1051,10 @@
       const drift = row.driftNotable;
       setText(r.dr, drift == null ? '' : `${drift > 0 ? '快' : '慢'}${Math.abs(drift).toFixed(0)}%`);
       setTone(r.dr, 'dr', drift == null ? '' : drift > 0 ? 'fast' : 'slow');
-      setTick(r.n, ago(row.latestAt));
+      // 这一行**本轮**花了多少（与桌面面板同一条信息，两个显示面不各讲一套）。
+      // 用 setTick（记忆化）而不是 setText：这一格每帧都在重画，没必要每次都写 DOM。
+      setTick(r.n, (row.usd > 0 ? usd(row.usd) + ' · ' : '') + ago(row.latestAt));
+      if (row.usd > 0) r.n.title = `本轮（${sp.usdWindow ?? '5h'} 窗）这个模型在本机账本上的花费`;
       const rowTasks = row.tasks || [];
       r.tasks.innerHTML = rowTasks.map((task, taskIndex) => {
         const speed = task.rate == null ? '—' : `${task.rate.toFixed(0)} tok/s`;

@@ -107,6 +107,19 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /lastShardSec/);
 });
 
+test('速度卡每一行要带本轮花费（tok/s 旁边得有钱）', () => {
+  // 用户 2026-09-23：「速度那一栏，能不能顺便填写一下这一行本次消耗的费用，这样更直观」。
+  // 花费的权威来源是账本，所以在引擎里合流（速度模块自己的事件里没有美元），
+  // 两个显示面都要显示，且行上的模型名是短名 ⇒ 必须按 modelId 匹配。
+  assert.match(engine, /#speedWithCost\(this\.#speedReport\(\)/);
+  assert.match(engine, /this\.ledger\.store\.byModel\(from, nowSec\)/);
+  assert.match(engine, /usd\.get\(r\.modelId\)/);
+  assert.match(renderer, /本轮 \$\{money\(sp\.usdTotal\)\}/);
+  assert.match(renderer, /本轮（\$\{sp\.usdWindow/);
+  assert.match(widget, /本轮 \$\{usd\(sp\.usdTotal\)\}/);
+  assert.match(widget, /row\.usd > 0 \? usd\(row\.usd\)/);
+});
+
 test('美元主行必须与进度条同源，账本数退到副行并标注', () => {
   // 2026-09-23 用户：「$256，但进度条和实际这么多」。根子是两个来源并排摆：
   // 进度条/百分比/满额/余都是**官方点数**算的，而主行是**本机账本**——用户只会读成「算错了」。
