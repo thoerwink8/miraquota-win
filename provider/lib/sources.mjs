@@ -141,20 +141,34 @@ export function transcriptLine(line, { cutoff = 0, pricing, machine = null } = {
  * `billable` 记下来但不在这里筛：流水要留全量（分析任务花费时"这次调用有没有走 relay"也是
  * 信息），是否计入由视图决定。旧账本在解析时就丢掉不可计费的整条记录，于是那些调用在
  * 任何报表里都不存在。
+ *
+ * @param opts.cursors 按文件的字节游标。**必须给**：这份日志一天 1.7 MB，每次轮询全读一遍
+ *   会把主进程 CPU 打满（2026-09-23 实咬：应用装上新引擎后卡死，137 秒 CPU 全花在重读
+ *   这个文件和会话库上）。追加写的日志用偏移游标最省。
  */
-export function* gatewayRows({ dir, cutoff, pricing, machine = null }) {
+export function* gatewayRows({ dir, cutoff, pricing, machine = null, cursors = null }) {
   let files;
   try { files = readdirSync(dir); } catch { return; }
   for (const name of files) {
     if (!name.startsWith('usage-') || !name.endsWith('.ndjson')) continue;
     const path = join(dir, name);
-    let text;
-    try { text = readRange(path, 0, statSync(path).size); } catch { continue; }
-    for (const line of text.split('\n')) {
+    let st;
+    try { st = statSync(path); } catch { continue; }
+    const size = st.size;
+    let from = cursors?.[path]?.offset ?? 0;
+    if (size < from) from = 0;              // 被截断/轮转，从头读
+    if (size <= from) continue;
+    const text = readRange(path, from, size);
+    if (!text) continue;
+    let start = 0, nl, consumed = 0;
+    while ((nl = text.indexOf('\n', start)) >= 0) {
+      const line = text.slice(start, nl);
+      start = nl + 1; consumed = start;
       if (!line.trim()) continue;
       const row = gatewayLine(line, { cutoff, pricing, machine });
       if (row) yield row;
     }
+    if (cursors) cursors[path] = { size, offset: from + Buffer.byteLength(text.slice(0, consumed), 'utf8') };
   }
 }
 
@@ -204,8 +218,11 @@ export function sourcePaths(home) {
  *
  * @param opts.dir    `~/.mirasim/sessions`（下面按 agent 分子目录）
  * @param opts.cutoff 只读这个时刻（秒）之后还在活动的轮次
+ * @param opts.cursors 按文件的 `{size, mtimeMs}`。**必须给**：166 个会话文件合计 30 MB，
+ *   每次轮询全读一遍会把主进程 CPU 打满。这里用"变了才读"而不是偏移游标——轮次文件可能被
+ *   改写（不是纯追加），偏移会漏掉更新；反正单个文件只有几十到几百 KB，重读一遍是幂等的。
  */
-export function* turnRows({ dir, cutoff = 0 }) {
+export function* turnRows({ dir, cutoff = 0, cursors = null }) {
   let agents;
   try { agents = readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const a of agents) {
@@ -216,8 +233,13 @@ export function* turnRows({ dir, cutoff = 0 }) {
     for (const s of sessions) {
       if (!s.isDirectory()) continue;
       const path = join(agentDir, s.name, 'turns.jsonl');
+      let st;
+      try { st = statSync(path); } catch { continue; }
+      const seen = cursors?.[path];
+      if (seen && seen.size === st.size && seen.mtimeMs === st.mtimeMs) continue;   // 没变就不读
       let text;
-      try { text = readRange(path, 0, statSync(path).size); } catch { continue; }
+      try { text = readRange(path, 0, st.size); } catch { continue; }
+      if (cursors) cursors[path] = { size: st.size, mtimeMs: st.mtimeMs };
       for (const line of text.split('\n')) {
         if (!line.trim()) continue;
         const row = turnLine(line, { cutoff });

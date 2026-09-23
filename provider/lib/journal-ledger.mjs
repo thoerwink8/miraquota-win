@@ -93,13 +93,13 @@ export class JournalLedger {
     for (const row of transcriptRows({
       root: this.paths.transcripts, cutoff, pricing: this.pricing, machine: this.machine, cursors: this.#cursors,
     })) { batch.push(row); if (batch.length >= 2000) flush(); }
-    for (const row of gatewayRows({ dir: this.paths.gateway, cutoff, pricing: this.pricing, machine: this.machine })) {
-      batch.push(row); if (batch.length >= 2000) flush();
-    }
+    for (const row of gatewayRows({
+      dir: this.paths.gateway, cutoff, pricing: this.pricing, machine: this.machine, cursors: this.#cursors,
+    })) { batch.push(row); if (batch.length >= 2000) flush(); }
     flush();
 
-    // 会话轮次（任务归属）跟着一起收：它很小，每次全量重扫也就几百行
-    const turns = [...turnRows({ dir: this.paths.sessions, cutoff })].filter((t) => t.task);
+    // 会话轮次（任务归属）跟着一起收：它很小，但文件多（166 个 / 30 MB），靠"变了才读"压住
+    const turns = [...turnRows({ dir: this.paths.sessions, cutoff, cursors: this.#cursors })].filter((t) => t.task);
     if (turns.length) this.store.insertTurns(turns);
 
     this.#saveCursors();     // sources 在读文件时顺手更新了 this.#cursors（只影响性能）

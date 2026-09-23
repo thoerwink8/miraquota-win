@@ -552,23 +552,37 @@ export class Engine {
     return true;
   }
 
-  /** 一轮采集。返回是否拿到实测。 */
+  /**
+   * 一轮采集。返回是否拿到实测。
+   *
+   * **不许重入**：调用方是 `setInterval(() => engine.poll(), 15s)`，没有等待上一轮结束。
+   * 一轮要是慢过间隔（第一轮要全量扫原始记录），轮询就会一轮压一轮，事件循环被同步的
+   * `refresh()` 占满——窗口直接变成"未响应"，而 CPU 全花在重复读同一批文件上。
+   * 2026-09-23 实咬：应用装上新引擎后卡死，主进程烧了 137 秒 CPU。两道防线：慢的那一轮
+   * 直接跳过（这里），以及游标让每一轮本来就快（`sources.mjs`）。
+   */
   async poll() {
-    if (!this.opts.forceOffline) {
-      const processes = await mirasimProcesses();
-      const channelPort = await this.#discoverChannelPort(processes);
-      const router = await this.#discoverRouter(processes, channelPort);
-      const limits = router ? await this.#fetchLimits(router) : null;
-      if (limits) this.ingestLimits(limits, Date.now() / 1000);
-    }
-    if (!this.opts.noLocal) this.ledger.refresh();
-    this.#speedRefresh();   // 必须在 #maybeSync 之前：分片要带这一轮的速度，否则首轮发出去的是空速度
-    await this.#warmShards();
-    this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
-    this.#maybeQuotaPull(Date.now() / 1000);   // 本机没实测时，额度从还在跑的那台机器补
-    this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
-    return !!this.last;
+    if (this.#pollBusy) return !!this.last;
+    this.#pollBusy = true;
+    try {
+      if (!this.opts.forceOffline) {
+        const processes = await mirasimProcesses();
+        const channelPort = await this.#discoverChannelPort(processes);
+        const router = await this.#discoverRouter(processes, channelPort);
+        const limits = router ? await this.#fetchLimits(router) : null;
+        if (limits) this.ingestLimits(limits, Date.now() / 1000);
+      }
+      if (!this.opts.noLocal) this.ledger.refresh();
+      this.#speedRefresh();   // 必须在 #maybeSync 之前：分片要带这一轮的速度，否则首轮发出去的是空速度
+      await this.#warmShards();
+      this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
+      this.#maybeQuotaPull(Date.now() / 1000);   // 本机没实测时，额度从还在跑的那台机器补
+      this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
+      return !!this.last;
+    } finally { this.#pollBusy = false; }
   }
+
+  #pollBusy = false;
 
   /** 契约 A 的 quota.json。只填有据可查的字段，控件对缺字段是容忍的。 */
   payload() {
