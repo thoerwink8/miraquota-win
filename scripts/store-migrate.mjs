@@ -25,7 +25,7 @@ import { UsageStore, STORE_FILE, STORE_SCHEMA, DETAIL_DAYS } from '../provider/l
 import { Pricing } from '../provider/lib/pricing.mjs';
 import { gatewayRows, transcriptRows, turnRows, sourcePaths } from '../provider/lib/sources.mjs';
 import { cleanMachineId } from '../provider/lib/ledger-sync.mjs';
-import { measureModelRates } from '../provider/lib/rate-measure.mjs';
+import { measurePerModel } from '../provider/lib/rate-measure.mjs';
 import { marksFromStore } from '../provider/lib/calibrator.mjs';
 import { hostname } from 'node:os';
 
@@ -207,19 +207,25 @@ if (flag('report')) {
   // 2026-09-23 实咬：本机 claude-opus-5 花了 $197 却量到 ×0.000（官方几乎不扣点），
   // 而它是账本里最大的一笔——残差的主因就在这儿，不在「别的机器」。
   const pm = (() => {
-    // **全部 5h 样本**都给它：`measureModelRates` 自己会跳过跨重置的相邻对（`b.resetAt !== a.resetAt`），
-    // 而窗口刚重置时当前 reset 窗里只有几个采样，只喂那些等于什么都测不出来（第一版就是这么空的）。
-    const samples = store.db.prepare("SELECT at, used, reset_at FROM points WHERE label = '5h' ORDER BY at")
-      .all().map((s) => ({ at: s.at, used: s.used, resetAt: s.reset_at }));
-    if (samples.length < 4) return [];
-    return measureModelRates(samples, marksFromStore(store));
+    // **每个模型用它自己那个池**（Claude 的点在 7d_claude 分池里，拿总池量恒得 0）。
+    // 样本要全部给：`measureModelRates` 自己会跳过跨重置的相邻对。
+    const byLabel = {};
+    for (const r of store.db.prepare('SELECT label, at, used, reset_at FROM points ORDER BY label, at').all()) {
+      (byLabel[r.label] ??= []).push({ at: r.at, used: r.used, resetAt: r.reset_at });
+    }
+    if (!Object.keys(byLabel).length) return [];
+    const wins = Object.entries(byLabel).map(([label, list]) => ({
+      label, modelScoped: /_/.test(label), // 分池的 label 形如 7d_claude / 7d_fable
+      points: list,
+    }));
+    return measurePerModel(byLabel, marksFromStore(store), wins);
   })();
   if (pm.length) {
-    console.log(`按模型实测倍率（5h 窗 · 只有「这一段只有一个模型在花钱」的区间能测）：`);
+    console.log('按模型实测倍率（每个模型用它自己那个池：Claude 的点在 7d_claude 分池里，拿总池量恒得 0）：');
     for (const r of pm) {
       const off = Math.abs(r.multiplier - 1) > 0.15;
       console.log(`  ${pad(r.model, 26)} ×${r.multiplier.toFixed(3).padStart(6)}  p25=${r.p25.toFixed(2)} p75=${r.p75.toFixed(2)}`
-        + `  段=${String(r.segments).padStart(3)}  ${pad(usd(r.usd), 10)}  ${r.confidence}`
+        + `  段=${String(r.segments).padStart(3)}  池=${pad(r.window ?? '-', 10)}  ${pad(usd(r.usd), 10)}  ${r.confidence}`
         + (off ? '   ← 偏离 1：价目或倍率要核' : ''));
     }
     const off = pm.filter((r) => Math.abs(r.multiplier - 1) > 0.15);

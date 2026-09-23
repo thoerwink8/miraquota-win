@@ -20,7 +20,7 @@ import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
 import { evaluateCoherence, coherenceNotice, weightedSpend } from './coherence.mjs';
-import { measureModelRates, groupRate } from './rate-measure.mjs';
+import { measureModelRates, groupRate, measurePerModel } from './rate-measure.mjs';
 
 /**
  * 官方汇率：额度点 ÷ 100 = 美元（2026-09-02 用户向官方求证确认时，三窗 560000→5600、
@@ -935,18 +935,20 @@ export class Engine {
    * 这是「算得准不准」唯一可证伪的量：偏离 1 就说明这个模型的价目或倍率不对。
    * 以前只对配置过的档位组（fable）算，于是最大的那个模型偏了也没人看得见——
    * 2026-09-23 实测本机：`claude-opus-5` 花了 $197 却量到 **×0.000**（官方几乎不扣点），
-   * 而它是我们账本里最大的一笔；残差 $608 的主因就在这儿，不在「别的机器」。
-   * 计数器用总窗（5h）：它覆盖所有模型、段也最多。
+   * 而它是我们账本里最大的一笔。
+   *
+   * **每个模型必须用它自己那个池当计数器**：账号的额度池是**互不相交**的——Claude 模型的点
+   * 扣在 `7d_claude` 分池里，**不在总池**。2026-09-23 实查：拿总池（5h/7d）量
+   * `claude-opus-5` 得 ×0.000（看着像「官方不扣点」，差点据此去改残差口径），
+   * 换成 `7d_claude` 得 **×1.000**。拿总池量分池里的模型**恒得 0**，因为那些点根本没记在总池上。
+   * 选池与测量都在 `rate-measure.mjs` 的 `measurePerModel` 里（CLI 用同一份）。
    */
   #pointCostModels(windows) {
-    const base = (windows ?? []).find((w) => !w.modelScoped && w.label === '5h')
-      ?? (windows ?? []).find((w) => !w.modelScoped);
-    if (!base) return null;
-    const rows = measureModelRates(this.calibrator.points[base.label], this.calibrator.marks);
+    const rows = measurePerModel(this.calibrator.points, this.calibrator.marks, windows);
     if (!rows.length) return null;
     return rows.map((r) => ({
       model: r.model, measured: r.multiplier, segments: r.segments,
-      usd: r.usd, confidence: r.confidence, window: base.label,
+      usd: r.usd, confidence: r.confidence, window: r.window,
     }));
   }
 

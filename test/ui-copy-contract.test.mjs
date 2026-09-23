@@ -107,15 +107,21 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /lastShardSec/);
 });
 
-test('每个模型的实测倍率都要报，偏离 1 的点名', () => {
-  // 「哪个模型对不上」是整窗比值答不了的。2026-09-23 实咬：本机最大的那笔 claude-opus-5
-  // 花了 $197 却量到 ×0.00（官方几乎不扣点）——只报配置过的组（fable）时，它完全看不见。
+test('每个模型的实测倍率都要报，且每个模型用它自己那个池当计数器', () => {
+  // 「哪个模型对不上」是整窗比值答不了的。2026-09-23 实查两轮：
+  //  ① 只报配置过的组（fable）时，本机最大那笔 claude-opus-5 完全看不见；
+  //  ② 用**总池**当计数器量它得 ×0.000（看着像「官方不扣点」，差点据此去改残差口径），
+  //     换成 **7d_claude 分池**得 ×1.000——池是互不相交的，拿总池量分池里的模型恒得 0。
   assert.match(renderer, /latest\?\.pointCostModels/);
   assert.match(renderer, /实测倍率偏离 1/);
   assert.match(engine, /#pointCostModels\(/);
   assert.match(engine, /out\.pointCostModels = /);
+  assert.match(engine, /measurePerModel\(this\.calibrator\.points/, '选池与测量只许有一份实现');
+  const lib = readFileSync(new URL('../provider/lib/rate-measure.mjs', import.meta.url), 'utf8');
+  assert.match(lib, /export function measurePerModel/);
+  assert.match(lib, /Claude 模型的点扣在 `7d_claude` 分池里/, '为什么不能拿总池量：写进注释，别再犯');
   const cli = readFileSync(new URL('../scripts/store-migrate.mjs', import.meta.url), 'utf8');
-  assert.match(cli, /measureModelRates\(samples, marksFromStore\(store\)\)/, 'CLI 也要能看（不开界面）');
+  assert.match(cli, /measurePerModel\(byLabel, marksFromStore\(store\), wins\)/, 'CLI 也要能看（不开界面）');
 });
 
 test('未计价的调用在账目里单列，不静默成 0', () => {

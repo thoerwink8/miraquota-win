@@ -22,6 +22,42 @@
 /** 官方汇率的点数侧：额度点 ÷ 100 = 美元，故基准是每美元 100 点（倍率 1 的模型）。 */
 export const POINTS_PER_USD = 100;
 
+/**
+ * **每个模型**的实测倍率，**每个模型用它自己那个池当计数器**。
+ *
+ * 账号的额度池是**互不相交**的：Claude 模型的点扣在 `7d_claude` 分池里，**不在总池**。
+ * 2026-09-23 实查：拿总池（5h/7d）量 `claude-opus-5` 得 **×0.000**（看着像「官方不扣点」，
+ * 差点据此去改残差口径），换成 `7d_claude` 得 **×1.000**——拿总池量分池里的模型恒得 0，
+ * 因为那些点根本没记在总池上。
+ *
+ * @param pointsByLabel { '5h': [样本], '7d_claude': [样本], … }（Calibrator.points 那张表）
+ * @param windows      有 label/modelScoped 的窗口数组（用来定「哪个池管哪个模型」）
+ * @param marks        同一批 tick 上的各模型美元增量
+ * @returns [{ model, multiplier, p25, p75, segments, usd, points, confidence, window, scoped }]
+ */
+export function measurePerModel(pointsByLabel, marks, windows, opts = {}) {
+  const all = windows ?? [];
+  const scoped = all.filter((w) => w.modelScoped && w.label);
+  const total = all.find((w) => !w.modelScoped && w.label === '5h') ?? all.find((w) => !w.modelScoped);
+  const byModel = new Map();
+  const consider = (rows, window, isScoped, group) => {
+    for (const r of rows) {
+      const cur = byModel.get(r.model);
+      const mine = !!group && group === modelFamily(r.model).id;          // 名字对得上这个池
+      const curMine = !!cur?.group && cur.group === modelFamily(r.model).id;
+      // 分池优先；同是分池时，名字对得上家族的那个优先
+      const better = !cur || (isScoped && !cur.scoped) || (isScoped && cur.scoped && mine && !curMine);
+      if (better) byModel.set(r.model, { ...r, window, scoped: isScoped, group });
+    }
+  };
+  for (const w of scoped) consider(measureModelRates(pointsByLabel[w.label], marks, opts), w.label, true, modelGroup(w.label));
+  if (total) consider(measureModelRates(pointsByLabel[total.label], marks, opts), total.label, false, null);
+  return [...byModel.values()].sort((a, b) => b.usd - a.usd);
+}
+
+import { modelFamily } from './model-families.mjs';
+import { modelGroup } from './windows.mjs';
+
 const MIN_SEG_USD = 0.2;     // 段内支出下限：太小的段一次取整误差就能翻倍
 const MIN_TOTAL_USD = 2;     // 给出一个模型的倍率所需的累计支出
 const MIN_SEGMENTS = 3;      // 给出一个模型的倍率所需的段数
