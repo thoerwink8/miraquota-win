@@ -164,6 +164,18 @@ test('swapping the shard set rebuilds the merged per-model table, not just the t
   assert.ok(Math.abs(perModel() - 1) < 1e-9, '换了一批分片，按模型的表必须跟着换');
 });
 
+test('a dated snapshot id is not a guess, but a stripped version number is', () => {
+  // 剥掉日期快照（-20251001）是同款同价，不该点名；剥掉版本号（opus-5-9 → opus-5）是另一个
+  // 模型，必须点名。2026-09-23 服务器日志实咬：前者被当成猜价报了警，界面上会多一行假警报，
+  // 而假警报会让真警报没人信。
+  const p = pricing();
+  assert.deepEqual(p.price('claude-haiku-4-5-20251001'), [1, 5, 0.1, 1.25], '日期快照按同款记价');
+  assert.deepEqual(p.guessedModels(), [], '同款快照不算猜，别在界面上点名');
+  assert.deepEqual(p.price('claude-opus-5-9'), [5, 25, 0.5, 6.25], '版本号兜底照旧保命');
+  assert.deepEqual(p.guessedModels(), [{ model: 'claude-opus-5-9', via: 'claude-opus-5' }],
+    '另一个模型借了旧价，必须留痕');
+});
+
 test('the cached price list cannot quietly override the official built-in one', () => {
   const cache = join(tmp, 'drifted-cache.json');
   writeFileSync(cache, JSON.stringify({

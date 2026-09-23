@@ -42,6 +42,13 @@ const FAMILY = [
   ['sonnet', 'claude-sonnet-5'], ['haiku', 'claude-haiku-4-5'],
 ];
 
+// 版本快照后缀：`claude-haiku-4-5-20251001` 是 `claude-haiku-4-5` 的某日快照，**同款同价**。
+// 剥掉它不算猜价——否则每个带日期的 id 都会在界面上被点名（2026-09-23 服务器日志实咬：
+// 一条 `claude-haiku-4-5-20251001 不在价目表，按 claude-haiku-4-5 的价记账`）。反过来，
+// 剥掉的是版本号（`claude-opus-5-5` → `claude-opus-5`）就是**另一个模型**，必须留痕报警——
+// 当初那个静默偏高的价正是这么来的。区分二者只看剥掉的那一段是不是纯数字日期。
+const SNAPSHOT_SUFFIX = /^\d{6,}$/;
+
 // 缓存里几百个 provider 对同一模型标价不一。官方源优先，其余按名字序兜底——兜底价只用来
 // 让 kimi/gemini/qwen/glm 这类模型「有个数」而不是整行消失（用户 2026-09-02）。
 const PREFERRED_PROVIDERS = ['anthropic', 'ai-router', 'openai', 'google', 'moonshotai', 'alibaba', 'zhipuai', 'deepseek', 'xai'];
@@ -111,10 +118,10 @@ export class Pricing {
 
     const parts = id.split('-');
     while (parts.length > 2) {
-      parts.pop();
+      const popped = parts.pop();
       const key = parts.join('-');
       const hit = this.table[key];
-      if (hit) return this.#guess(id, key, hit);
+      if (hit) return SNAPSHOT_SUFFIX.test(popped) ? hit : this.#guess(id, key, hit);
     }
     for (const [family, key] of FAMILY) {
       if (id.includes(family)) return this.#guess(id, key, this.table[key]);
