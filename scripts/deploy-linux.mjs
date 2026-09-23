@@ -36,17 +36,18 @@ if (flag('help') || !opt('host')) {
 
   --host <目标>       必填。要能免密 ssh 上去（~/.ssh/config 里的别名最省事）
   --dir <路径>        代码落点，默认 /opt/miraquota
-  --repo <地址>       账本仓，默认 ${DEFAULT_REMOTE}
-  --reset-sync        已有 sync.json 时也覆盖成 git 通道。默认**不动**它——那台机器可能
-                      配的是 hub 通道（本脚本不认识），盖掉会把它从现有面板上踢下来
-  --via-inbox         改走收件口通道（那台机器读不到 GitHub 时用）：
-                      --account <名字> / --invite <码> / --inbox <地址>，
-                      后两者默认读 ${ADMIN_FILE}
+  --hub <地址>        走自建服务器通道（**推荐**）：配 ${'`'}{"hub":…,"token":…}${'`'} 写进那台机器的 sync.json
+  --token <令牌>      --hub 用的共享令牌（去 hub 那台机器的 <data>/config.json 里看）
+  --via-inbox         走收件口通道（没有自建服务器时用）：--account <名字> / --invite <码> / --inbox <地址>
+  --via-git           走 git 通道（把分片提交进一个私有 GitHub 仓）。**不推荐**，也不再是默认：
+                      每台机器每 10 分钟要提交 333 KB（≈47 MB/天），还要一把 gh 装的部署密钥；
+                      见 docs/STORE.md「传输：只留 hub」
+  --reset-sync        已有 sync.json 时也覆盖。默认**不动**它——盖掉会把那台机器从现有面板上踢下来
   --uninstall         停掉并删除那台机器上的服务与代码（sync.json 保留）
 
-默认走 git 通道：在那台机器上生成一把只对账本仓有效的部署密钥（deploy key），
-用本机的 gh 装到仓上。收件口通道要求**看面板的那台机器**能连上 workers.dev，
-国内直连不通（见 docs/MULTI-MACHINE.md），所以不作默认。`);
+不带通道参数时：已有 sync.json 就原样保留；没有的话只装服务并提示你选一条通道
+（不猜、更不默认去 GitHub 装部署密钥）。收件口通道要求**看面板的那台机器**能连上
+workers.dev，国内直连不通（见 docs/MULTI-MACHINE.md），所以自建 hub 才是首选。`);
   process.exit(opt('host') ? 0 : 1);
 }
 
@@ -120,14 +121,67 @@ await new Promise((resolve, reject) => {
 });
 say(`代码已同步到 ${HOST}:${DIR}/provider`);
 
-/* ---------------- 3a. git 通道（默认）：部署密钥 + sync.json ---------------- */
-// 已有 sync.json 就**不动它**（脚本头承诺的幂等）。这台机器可能配的是 hub 通道——本脚本
-// 不认识它，而 hub 的机器照样在发分片；盖成 git 通道会把它从现有面板上踢下来，本机又读
-// 不回来，白折腾还静默。要换通道显式给 --reset-sync。
+/* ---------------- 3. 同步通道 ----------------
+ * 优先级：已有 sync.json 不动 → --hub（推荐）→ --via-inbox → --via-git（不推荐）。
+ * git 通道**不再默认**：每台机器每 10 分钟要提交 333 KB（≈47 MB/天），还要一把 gh 装的
+ * 部署密钥，而它换来的只是"不用自建服务器"。没有通道参数时只装服务并提示，不猜。
+ */
 const keepSync = hasSync && !flag('reset-sync');
-if (!flag('via-inbox') && keepSync) {
-  say(`同步配置已有（保持不动）：${HOST}:~/.miraquota/sync.json。要改成 git 通道加 --reset-sync`);
-} else if (!flag('via-inbox')) {
+const wantHub = !!opt('hub');
+const wantGit = flag('via-git');
+
+if (keepSync) {
+  say(`同步配置已有（保持不动）：${HOST}:~/.miraquota/sync.json。要换通道加 --reset-sync 并给出 --hub / --via-inbox / --via-git`);
+} else if (wantHub) {
+  const hub = String(opt('hub')).replace(/\/+$/, '');
+  const token = opt('token');
+  if (!token) { console.error('--hub 要配 --token（去 hub 那台机器的 <data>/config.json 里看）'); process.exit(1); }
+  await remote(`set -e
+mkdir -p "$HOME/.miraquota"
+cat > "$HOME/.miraquota/sync.json" <<JSON
+{
+  "hub": "${hub}",
+  "token": "${token}",
+  "intervalSec": 600
+}
+JSON`);
+  say(`同步配置：自建服务器 → ${hub}`);
+} else if (flag('via-inbox') && !hasSync) {
+  let admin = {};
+  try { admin = JSON.parse(readFileSync(ADMIN_FILE, 'utf8')); } catch { /* 下面统一报错 */ }
+  const inbox = opt('inbox', admin.inbox);
+  const invite = opt('invite', admin.invite);
+  if (!inbox || !invite) {
+    console.error(`缺收件口地址或邀请码：${ADMIN_FILE} 读不到，命令行也没给 --inbox / --invite`);
+    process.exit(1);
+  }
+  const account = (opt('account') ?? `${hostShort}-server`).toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 24);
+  const passphrase = randomBytes(12).toString('hex');
+  // 注册在那台机器上做：收件口在 workers.dev，国内直连被 DNS 投毒（见 docs/MULTI-MACHINE.md），
+  // 而服务器在墙外反而直通。口令因此也只落在它自己盘上。
+  const out = await remote(`set -e
+mkdir -p "$HOME/.miraquota"
+export INBOX='${inbox}' ACCOUNT='${account}' PASS='${passphrase}' INVITE='${invite}'
+node --input-type=module -e '
+import { writeFileSync } from "node:fs";
+const base = process.env.INBOX.replace(/\\/+$/, "");
+const post = async (path, body) => {
+  const r = await fetch(base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) { const e = new Error((await r.text()).slice(0, 200)); e.status = r.status; throw e; }
+};
+const acct = { account: process.env.ACCOUNT, passphrase: process.env.PASS };
+let how = "LOGIN";
+try { await post("/login", acct); } catch (e) {
+  if (e.status !== 401) { console.error(e.message); process.exit(1); }
+  await post("/register", { ...acct, invite: process.env.INVITE });
+  how = "REGISTER";
+}
+writeFileSync(process.env.HOME + "/.miraquota/sync.json",
+  JSON.stringify({ inbox: base, account: acct.account, passphrase: acct.passphrase, intervalSec: 600 }, null, 2) + "\\n");
+console.log(how);
+'`);
+  say(`收件口${out.includes('REGISTER') ? '已注册' : '已登录'}：${account} · 口令在 ${HOST}:~/.miraquota/sync.json`);
+} else if (wantGit) {
   const repo = opt('repo', DEFAULT_REMOTE);
   const m = /github\.com[:/]([^/]+)\/([^/.]+)/.exec(repo);
   if (!m) { console.error(`看不懂账本仓地址：${repo}`); process.exit(1); }
@@ -182,45 +236,14 @@ cat > "$HOME/.miraquota/sync.json" <<JSON
 }
 JSON`);
   say(`同步配置：git 通道 → ${sshRemote}`);
+} else {
+  // 没给通道参数、那台机器也没有 sync.json：只装服务，不猜也不去 GitHub 装密钥。
+  say(`同步通道未配置：${HOST} 上还没有 ~/.miraquota/sync.json。`);
+  say(`  推荐：node scripts/deploy-linux.mjs --host ${HOST} --hub <地址> --token <令牌>`);
+  say('  没有自建服务器就用 --via-inbox（需要看面板的机器能连 workers.dev）。');
+  say('  服务照常起来，只是不上报；补上 sync.json 后下一轮就会开始发。');
 }
 
-/* ---------------- 3b. 收件口通道（--via-inbox） ---------------- */
-if (flag('via-inbox') && !hasSync) {
-  let admin = {};
-  try { admin = JSON.parse(readFileSync(ADMIN_FILE, 'utf8')); } catch { /* 下面统一报错 */ }
-  const inbox = opt('inbox', admin.inbox);
-  const invite = opt('invite', admin.invite);
-  if (!inbox || !invite) {
-    console.error(`缺收件口地址或邀请码：${ADMIN_FILE} 读不到，命令行也没给 --inbox / --invite`);
-    process.exit(1);
-  }
-  const account = (opt('account') ?? `${hostShort}-server`).toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 24);
-  const passphrase = randomBytes(12).toString('hex');
-  // 注册在那台机器上做：收件口在 workers.dev，国内直连被 DNS 投毒（见 docs/MULTI-MACHINE.md），
-  // 而服务器在墙外反而直通。口令因此也只落在它自己盘上。
-  const out = await remote(`set -e
-mkdir -p "$HOME/.miraquota"
-export INBOX='${inbox}' ACCOUNT='${account}' PASS='${passphrase}' INVITE='${invite}'
-node --input-type=module -e '
-import { writeFileSync } from "node:fs";
-const base = process.env.INBOX.replace(/\\/+$/, "");
-const post = async (path, body) => {
-  const r = await fetch(base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  if (!r.ok) { const e = new Error((await r.text()).slice(0, 200)); e.status = r.status; throw e; }
-};
-const acct = { account: process.env.ACCOUNT, passphrase: process.env.PASS };
-let how = "LOGIN";
-try { await post("/login", acct); } catch (e) {
-  if (e.status !== 401) { console.error(e.message); process.exit(1); }
-  await post("/register", { ...acct, invite: process.env.INVITE });
-  how = "REGISTER";
-}
-writeFileSync(process.env.HOME + "/.miraquota/sync.json",
-  JSON.stringify({ inbox: base, account: acct.account, passphrase: acct.passphrase, intervalSec: 600 }, null, 2) + "\\n");
-console.log(how);
-'`);
-  say(`收件口${out.includes('REGISTER') ? '已注册' : '已登录'}：${account} · 口令在 ${HOST}:~/.miraquota/sync.json`);
-}
 
 /* ---------------- 4. systemd 常驻 ---------------- */
 const unit = await remote(`set -e

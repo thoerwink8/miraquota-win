@@ -466,13 +466,19 @@ test('a machine ships its own speed snapshot so the other end can look at it', a
   assert.equal(ra2.machines.find((m) => m.id === 'spd-b').speed, undefined);
 });
 
-test('deploy-linux keeps an existing sync.json, so a hub-mode machine is not switched to git', () => {
+test('deploy-linux keeps an existing sync.json and never touches GitHub by default', () => {
   // 脚本头一直承诺「重复跑不动 sync.json」，但 git 通道那段原先无条件盖写——服务器上真配着
   // hub 通道（本脚本不认识的一种），盖成 git 通道等于把它从现有面板上踢下来，而它照样发得
   // 上去、本机读不回来。2026-09-23 升级 vmi3551059 时实咬到，改成默认不动 + --reset-sync 显式换。
+  //
+  // 同一天用户又拍了「不要存 GitHub」（每台机器每 10 分钟要提交 333 KB ≈ 47 MB/天，还要一把
+  // gh 装的部署密钥），于是 git 通道连**默认**也不再是：不带通道参数就只装服务并提示，
+  // 要 git 得显式 --via-git。
   const src = readFileSync(new URL('../scripts/deploy-linux.mjs', import.meta.url), 'utf8');
   assert.match(src, /const keepSync = hasSync && !flag\('reset-sync'\)/);
-  assert.ok(src.includes("if (!flag('via-inbox') && keepSync)"),
-    'git 通道那段必须先看 hasSync，否则就是无条件盖写');
-  assert.match(src, /--reset-sync/, '换通道要留一个显式出口');
+  assert.match(src, /if \(keepSync\) \{/, '已有配置那段必须最先判，否则就是无条件盖写');
+  assert.match(src, /else if \(wantHub\) \{/, 'hub 是推荐通道');
+  assert.match(src, /else if \(wantGit\) \{/, 'git 通道要显式给 --via-git');
+  assert.match(src, /--via-git/, '换通道要留显式出口');
+  assert.ok(!src.includes("if (!flag('via-inbox') && !keepSync)"), '别再有"默认走 git"的分支');
 });
