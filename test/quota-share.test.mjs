@@ -5,8 +5,8 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -97,6 +97,14 @@ test('the offline machine reckons from the running one, and says whose number it
 
   const engine = new Engine({
     forceOffline: true,
+    // 全部状态路径都注入：这条测试会跑 poll()，而 poll 会 refresh 账本、settle 归因——
+    // 用默认路径就是去改真机的 ~/.miraquota（2026-09-23 实咬：正好撞上账本升 schema，
+    // 把用户的 ledger.json 就地迁移重写了）。
+    ledgerFile: join(tmp, 'e-a-ledger.json'),
+    anchorFile: join(tmp, 'e-a-anchor.json'),
+    settingsFile: join(tmp, 'e-a-settings.json'),
+    attribFile: join(tmp, 'e-a-attrib.json'),
+    calibratorFile: join(tmp, 'e-a-calibration.json'),
     syncOpts: {
       configFile: syncConfig('e-a', remote), repoDir: join(tmp, 'e-a-repo'),
       machineId: 'e-a', installId: 'aaaaaaaaaaaaaaaa', inboxUrl: null,
@@ -119,6 +127,53 @@ test('the offline machine reckons from the running one, and says whose number it
   assert.match(p.detail, /vmi-server/);
   assert.match(p.detail, /他人占用已计到那一刻/);
   assert.doesNotMatch(p.detail, /他人占用不可见/, '账号级数字里别人的占用是算进去的，别照抄单机文案');
+});
+
+test('a fully injected engine writes nothing into the default state dir', () => {
+  // 2026-09-23 实咬：一条测试用 Engine 的默认路径跑 poll()，而账本正好在这一版升 schema，
+  // 于是它把**真机的** ledger.json 就地迁移重写了。测试改用户的生产状态，比它要测的 bug 更糟。
+  // 这条用「假 HOME」把默认路径整体挪到一个空目录，再在子进程里构造一个**全注入**的 Engine
+  // 跑一轮会落盘的动作：默认目录里只要出现任何东西，就说明有模块没被注入（新模块加了落盘、
+  // 忘了加注入，就会从这里冒出来）。
+  const home = mkdtempSync(join(tmpdir(), 'mq-fakehome-'));
+  const work = mkdtempSync(join(tmpdir(), 'mq-inject-'));
+  // 假 HOME 里放一条 transcript：让账本这一轮**真的**有事可做（扫到 → 入桶 → 落盘），
+  // 否则「没写默认目录」可能只是因为压根没写。
+  const proj = join(home, '.claude', 'projects', 'p');
+  mkdirSync(proj, { recursive: true });
+  writeFileSync(join(proj, 's.jsonl'), JSON.stringify({
+    timestamp: new Date().toISOString(), requestId: 'req_iso',
+    message: { model: 'claude-fable-5-1', usage: { input_tokens: 1000, output_tokens: 10 } },
+  }) + '\n');
+
+  const script = `
+    const { Engine } = await import(${JSON.stringify(new URL('../provider/lib/engine.mjs', import.meta.url).href)});
+    const { join } = await import('node:path');
+    const w = ${JSON.stringify(work)};
+    const e = new Engine({
+      forceOffline: true,
+      ledgerFile: join(w, 'ledger.json'), anchorFile: join(w, 'anchor.json'),
+      settingsFile: join(w, 'settings.json'), attribFile: join(w, 'attrib.json'),
+      calibratorFile: join(w, 'calibration.json'),
+      // installFile 也得给：LedgerSync 构造函数里就会读/生成安装 id 并落盘，
+      // 漏了它这条测试第一次跑就是这么红起来的（假 HOME 里冒出 .miraquota/install.json）。
+      syncOpts: { configFile: join(w, 'none.json'), repoDir: join(w, 'repo'), installFile: join(w, 'install.json') },
+    });
+    const now = Date.now() / 1000;
+    e.ingestLimits({ capturedAt: now, windows: [
+      { label: '7d', used: 5, budget: 100, resetAt: now + 86400 },
+    ] }, now);
+    e.ledger.refresh();
+    e.pointsAttrib.settle(e.ledger, now);
+  `;
+  execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, HOME: home, USERPROFILE: home }, timeout: 60_000, windowsHide: true,
+  });
+
+  assert.ok(existsSync(join(work, 'ledger.json')), '注入的那份账本要真写出来，否则这条测试是空转');
+  assert.ok(existsSync(join(work, 'calibration.json')), '标定采样同理');
+  assert.equal(existsSync(join(home, '.miraquota')), false,
+    '默认状态目录被碰了——有模块没走路径注入，测试正在改真机状态');
 });
 
 test('a fresher local anchor still wins: freshness is the only rule', () => {

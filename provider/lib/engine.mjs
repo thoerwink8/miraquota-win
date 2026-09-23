@@ -162,15 +162,22 @@ export class Engine {
    * @param opts.syncOpts    多机账本同步的路径注入（测试用，默认走 ~/.miraquota）
    * @param opts.ledgerFile  账本落盘路径（默认 ~/.miraquota/ledger.json）
    * @param opts.anchorFile  锚点落盘路径（默认 ~/.miraquota/anchor.json）
+   * @param opts.settingsFile 口径设置路径（默认 ~/.miraquota/settings.json）
+   * @param opts.attribFile  点数归因状态路径（默认 ~/.miraquota/points-attrib.json）
+   * @param opts.calibratorFile 标定采样路径（默认 ~/.miraquota/calibration.json）
    * @param opts.noLocal     不扫本机 transcript 与网关账本。服务端 hub 用：那台机器上
    *   没有任何人的会话记录，账本全部来自各机推上来的分片，扫本地只是白跑一趟。
+   *
+   * **路径注入要覆盖每一个会落盘的模块。** 少一个，测试就会去改真机的状态：2026-09-23
+   * 实咬过一次——quota-share 那条测试用默认路径跑 poll()，而账本正好在这一版升级 schema，
+   * 于是它把用户的 ledger.json 就地迁移重写了。会落盘的都在这张表上，加新模块时一起加。
    */
   constructor(opts = {}) {
     this.opts = opts;
     this.pricing = new Pricing();
     this.ledger = new CostLedger(this.pricing, opts.ledgerFile);
-    this.pointsAttrib = new PointsAttributor();
-    this.calibrator = new Calibrator();
+    this.pointsAttrib = new PointsAttributor(opts.attribFile);
+    this.calibrator = new Calibrator(opts.calibratorFile);
     this.anchors = new AnchorStore(opts.anchorFile);
     this.settings = new Settings(opts.settingsFile);
     this.sync = new LedgerSync(opts.syncOpts);

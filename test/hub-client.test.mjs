@@ -134,6 +134,8 @@ test('a busy machine publishes early instead of sitting on fresh numbers', async
   const e = new Engine({
     forceOffline: true, noLocal: true, ledgerFile: led,
     anchorFile: join(tmp, 'nudge-anchor.json'), settingsFile: join(tmp, 'nudge-set.json'),
+    // poll() 里 settle 归因也会落盘；noLocal 只挡账本重扫，不挡它。路径全注入，别碰真机状态。
+    attribFile: join(tmp, 'nudge-attrib.json'), calibratorFile: join(tmp, 'nudge-cal.json'),
     syncOpts: { configFile: cfg, machineId: 'busy', installId: 'ffffffffffffffff', cacheFile: join(tmp, 'nudge-cache.json'), inboxUrl: null },
   });
   assert.equal(e.sync.mode, 'hub');
