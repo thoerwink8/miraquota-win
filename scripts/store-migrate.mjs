@@ -51,6 +51,7 @@ if (flag('help') || argv.length === 0) {
   --import            扫 transcript / 网关 / 会话轮次，写进 store.db（幂等，可重复跑）
   --report            对账报告：两来源各记多少、缺口在哪、官方点数对上没有
   --tasks             任务与会话报表（含"归不上任务"的部分）
+  --reprice           按**当前**价目表重算全库美元（补了价目之后修历史，明细还在的部分）
   --rollup            把 --keep-days 之前的明细汇进 hourly 再删（先汇总后删，顺序不可反）
   --pack <文件>       出一份一致的单文件快照（VACUUM INTO）
   --inspect <文件>    校验快照：schema 版本、integrity、行数、时间跨度
@@ -217,6 +218,24 @@ if (flag('tasks')) {
   console.log(`\n== 会话（top 10）==`);
   for (const r of sess.slice(0, 10)) {
     console.log(`  ${pad(r.sid?.slice(0, 8) ?? '(无会话)', 10)} ${pad(usd(r.usd), 10)} ${pad(r.n + ' 笔', 8)} ${pad((r.models ?? '').slice(0, 40), 42)} ${day(r.first_at)} ${hhmm(r.first_at)}→${hhmm(r.last_at)}`);
+  }
+}
+
+/* ---------------- 按当前价目重算 ---------------- */
+if (flag('reprice')) {
+  const before = store.db.prepare('SELECT ROUND(SUM(usd), 4) usd FROM calls WHERE billable = 1').get().usd ?? 0;
+  const r = store.reprice({ pricing });
+  const after = store.db.prepare('SELECT ROUND(SUM(usd), 4) usd FROM calls WHERE billable = 1').get().usd ?? 0;
+  console.log(`\n== 重算 ==`);
+  console.log(`  模型 ${r.models} 个 · 改动 ${r.calls} 行 · 汇总层重算 ${r.hourly} 行`);
+  console.log(`  计费美元合计 ${usd(before)} → ${usd(after)}`);
+  if (r.hourlyStale) {
+    console.log(`  注意：汇总层还有 ${r.hourlyStale} 行**没动**——那些小时的明细已被修剪，`
+      + '没有原始 token 可重算，只能保持原样（要修它们得先 --import 把明细扫回来）');
+  }
+  if (r.unpriced.length) {
+    console.log(`  仍然没价（只记 token）：${r.unpriced.join('、')}`);
+    console.log('  补进 provider/lib/pricing.mjs 的内置表（或价目缓存）后再跑一次 --reprice 即可。');
   }
 }
 

@@ -259,3 +259,37 @@ test('journalSince 出来的行必须能直接进 JSON（BigInt 进不去）', a
   assert.equal(rows[rows.length - 1].ts, T0, '水位取最后一行，BigInt 会让 Math.floor 抛');
   led.close();
 });
+
+test('reprice 按当前价目重算，且不动已被修剪的汇总行', async () => {
+  // 「流水进 SQLite」最直接的回报：价目表补一个模型之后，历史不用重建——重算一遍就对了。
+  // 旧账本时代美元在解析那一刻就写死了，补价目只能影响以后。
+  const store = new UsageStore({ file: join(tmp, 'reprice.db'), machine: 'm1' });
+  const HOUR = Math.floor(T0 / 3600);
+  store.insertCalls([
+    // 一行价写错的（模拟「当时没价、后来补了」）
+    { key: 'g|a', src: 'g', ts: T0, model: 'claude-opus-5', i: 1_000_000, o: 0, cr: 0, cw: 0, usd: 0, priced: 0, billable: 1, machine: 'm1' },
+    // 一行价目表里永远没有的（原来那 99 是错的）
+    { key: 'g|b', src: 'g', ts: T0 + 1, model: 'totally-bogus-model', i: 1_000_000, o: 0, cr: 0, cw: 0, usd: 99, priced: 1, billable: 1, machine: 'm1' },
+  ]);
+  // 一条「明细已被修剪」的汇总行：它的小时在 calls 里找不到，重算不该碰它
+  store.db.prepare(`INSERT INTO hourly (hour,day,machine,model,sess,ws,src,side,priced,billable,usd,i,o,cr,cw,n)
+    VALUES (?,?,0,0,0,0,'g','g',1,1,7,0,0,0,0,1)`).run(HOUR - 1000, 20260101);
+
+  const fake = { price: (m) => (m === 'claude-opus-5' ? [5, 25, 0.5, 6.25] : null) };
+  const r = store.reprice({ pricing: fake });
+  assert.equal(r.unpriced.includes('totally-bogus-model'), true, '没价的模型要点名');
+
+  const opus = store.db.prepare("SELECT usd, priced FROM calls c JOIN dims d ON d.id=c.model WHERE d.name='claude-opus-5'").get();
+  assert.equal(opus.priced, 1, '补了价 → priced 翻回 1');
+  assert.ok(Math.abs(opus.usd - 5) < 1e-9, `1M input × $5/M = $5，实际 ${opus.usd}`);
+
+  const bogus = store.db.prepare("SELECT usd, priced FROM calls c JOIN dims d ON d.id=c.model WHERE d.name='totally-bogus-model'").get();
+  assert.equal(bogus.priced, 0, '没价 → 标 priced=0');
+  assert.equal(bogus.usd, 0, '没价就不猜：原来那 99 是错的，清成 0');
+  assert.equal(r.hourlyStale, 1, '被修剪过的那条汇总行如实报出来（没动它）');
+  assert.equal(store.db.prepare('SELECT usd FROM hourly WHERE hour = ?').get(HOUR - 1000).usd, 7, '它保持原样');
+
+  // 幂等：再跑一次不改任何行（价没变，重算就该是空操作）
+  assert.equal(store.reprice({ pricing: fake }).calls, 0, '价格没变时重算是空操作');
+  store.close();
+});

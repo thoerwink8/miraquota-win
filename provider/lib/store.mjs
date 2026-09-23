@@ -549,6 +549,51 @@ export class UsageStore {
       GROUP BY c.model ORDER BY tokens DESC`).all(Math.floor(fromSec), Math.floor(toSec));
   }
 
+  /**
+   * 按**当前**价目表重算全库美元。这是「流水进 SQLite」最直接的回报：价目表补一个模型之后，
+   * 历史不用重建——重算一遍就对了。旧账本时代做不到：美元在解析那一刻就写死了。
+   *
+   * 三件事必须说清（不然就是「看起来重算了」）：
+   *  1. `calls.usd` 按当前价目重算，`priced` 跟着翻（原来没价、现在有价 → 变 1）；
+   *  2. `hourly`（汇总层）里**还能在明细里找到的那些小时**跟着重算——更早的明细已经被修剪掉，
+   *     那部分没有原始 token 可重算，只能保持原样；`hourlyStale` 如实报出有多少行没动；
+   *  3. 没价的模型**不猜**：usd=0、priced=0，仍然只记 token（有人看得见，见 `unpriced()`）。
+   *
+   * @returns {{ models:number, calls:number, hourly:number, hourlyStale:number, unpriced:string[] }}
+   */
+  reprice({ pricing }) {
+    const dims = this.db.prepare("SELECT id, name FROM dims WHERE kind = 'model'").all();
+    const unpriced = [];
+    let calls = 0;
+    this.db.exec('BEGIN');
+    try {
+      for (const m of dims) {
+        const p = pricing?.price?.(m.name);
+        if (!p) {
+          // 没价 → 清成 0 并标 priced=0（不借用别的模型的价：那是静默的偏差）
+          calls += this.db.prepare('UPDATE calls SET usd = 0, priced = 0 WHERE model = ? AND (usd != 0 OR priced != 0)').run(m.id).changes;
+          if (this.db.prepare('SELECT 1 FROM calls WHERE model = ? AND (i+o+cr+cw) > 0 LIMIT 1').get(m.id)) unpriced.push(m.name);
+          continue;
+        }
+        calls += this.db.prepare(`UPDATE calls SET
+            usd = (i * ? + o * ? + cr * ? + cw * ?) / 1000000.0, priced = 1
+          WHERE model = ? AND (priced != 1 OR usd != (i * ? + o * ? + cr * ? + cw * ?) / 1000000.0)`)
+          .run(p[0], p[1], p[2], p[3], m.id, p[0], p[1], p[2], p[3]).changes;
+      }
+      // 汇总层：只重算「明细还在」的那些小时。删了再插，与 prune 那条路同一个口径。
+      const stale = this.db.prepare('SELECT COUNT(*) n FROM hourly WHERE hour NOT IN (SELECT DISTINCT hour FROM calls)').get().n;
+      this.db.exec('DELETE FROM hourly WHERE hour IN (SELECT DISTINCT hour FROM calls)');
+      const hourly = this.db.prepare(`INSERT INTO hourly
+          (hour, day, machine, model, sess, ws, src, side, priced, billable, usd, i, o, cr, cw, n)
+        SELECT hour, day, machine, model, sess, ws, src, side, priced, billable,
+               SUM(usd), SUM(i), SUM(o), SUM(cr), SUM(cw), COUNT(*)
+        FROM calls GROUP BY hour, machine, model, sess, ws, src, side, priced, billable`).run().changes;
+      this.db.exec('COMMIT');
+      this.invalidate?.();
+      return { models: dims.length, calls, hourly, hourlyStale: stale, unpriced };
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+  }
+
   /** 同一窗口里两边各记了多少——对账页那张表。 */
   reconcile(fromSec, toSec, { tolerance = 1.1 } = {}) {
     const rows = this.db.prepare(`SELECT d.name model, c.side, SUM(c.usd) usd FROM calls c

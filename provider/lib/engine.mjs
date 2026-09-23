@@ -1001,6 +1001,15 @@ export class Engine {
         .map((r) => ({ ws: r.ws, usd: r.usd, calls: r.n, sessions: r.sessions })),
       sessions: store.bySession(from, now).slice(0, LEDGER_REPORT_ROWS)
         .map((r) => ({ sid: r.sid, usd: r.usd, calls: r.n, models: r.models, firstAt: r.first_at, lastAt: r.last_at })),
+      // 没价目的调用：**单列，不摊进上面任何一行**。它们的美元是 0（不猜价），但 token 是实打实
+      // 花掉的——报表里必须看得见，否则「用了什么就记什么」在美元那一列就成了静默的 0。
+      unpriced: (() => {
+        const rows = store.unpriced(from, now)
+          .map((r) => ({ model: r.model, calls: r.n, tokens: r.tokens + (r.cache_tokens ?? 0) }));
+        return rows.length
+          ? { calls: rows.reduce((a, r) => a + r.calls, 0), tokens: rows.reduce((a, r) => a + r.tokens, 0), rows: rows.slice(0, LEDGER_REPORT_ROWS) }
+          : null;
+      })(),
     };
     this.#ledgerRepAt = now;
     this.#ledgerRepCache = out;

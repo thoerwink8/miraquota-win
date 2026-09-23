@@ -977,6 +977,13 @@
       out.push(line('会话', l.sessions.map((r) =>
         `<code>${esc((r.sid ?? '').slice(0, 8))}</code> <b>${money(r.usd)}</b> · ${r.calls} 笔 · ${esc(r.models ?? '')}`).join('<br>')));
     }
+    // 没价目的调用单列：它们的美元是 0（不猜价），但 token 实打实花了——不写出来，
+    // 「用了什么就记什么」在美元那一列就是静默的 0。
+    if (l.unpriced) {
+      out.push(line('未计价', `${l.unpriced.calls} 笔 · ${fmtK(l.unpriced.tokens)} token`
+        + `（${l.unpriced.rows.map((r) => esc(r.model)).join('、')}）——价目表没这些模型，只记 token 不记美元；`
+        + '补进价目表后跑一次 <code>node scripts/store-migrate.mjs --reprice</code> 就能补上'));
+    }
     $('ledgerReport').innerHTML = out.join('<br>');
   }
 
