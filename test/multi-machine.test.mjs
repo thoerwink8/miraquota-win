@@ -465,3 +465,14 @@ test('a machine ships its own speed snapshot so the other end can look at it', a
   const ra2 = await syncA.run(ledgerA, T + 701);
   assert.equal(ra2.machines.find((m) => m.id === 'spd-b').speed, undefined);
 });
+
+test('deploy-linux keeps an existing sync.json, so a hub-mode machine is not switched to git', () => {
+  // 脚本头一直承诺「重复跑不动 sync.json」，但 git 通道那段原先无条件盖写——服务器上真配着
+  // hub 通道（本脚本不认识的一种），盖成 git 通道等于把它从现有面板上踢下来，而它照样发得
+  // 上去、本机读不回来。2026-09-23 升级 vmi3551059 时实咬到，改成默认不动 + --reset-sync 显式换。
+  const src = readFileSync(new URL('../scripts/deploy-linux.mjs', import.meta.url), 'utf8');
+  assert.match(src, /const keepSync = hasSync && !flag\('reset-sync'\)/);
+  assert.ok(src.includes("if (!flag('via-inbox') && keepSync)"),
+    'git 通道那段必须先看 hasSync，否则就是无条件盖写');
+  assert.match(src, /--reset-sync/, '换通道要留一个显式出口');
+});

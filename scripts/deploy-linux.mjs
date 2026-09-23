@@ -11,7 +11,8 @@
  * 而收件口只要「名字 + 口令 + 一次性邀请码」（见 inbox/README.md）。口令是脚本随机生成的，
  * 落在那台机器的 ~/.miraquota/sync.json 里，本机不留副本——要用时去那台机器看。
  *
- * 幂等：重复跑只更新代码并重启服务；已有的 sync.json 不动（不会把机器改名或换口令）。
+ * 幂等：重复跑只更新代码并重启服务；已有的 sync.json 一律不动（不会把机器改名、换口令，
+ * 也不会把它从 hub 通道换成 git 通道——要换得显式给 --reset-sync）。
  */
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -36,6 +37,8 @@ if (flag('help') || !opt('host')) {
   --host <目标>       必填。要能免密 ssh 上去（~/.ssh/config 里的别名最省事）
   --dir <路径>        代码落点，默认 /opt/miraquota
   --repo <地址>       账本仓，默认 ${DEFAULT_REMOTE}
+  --reset-sync        已有 sync.json 时也覆盖成 git 通道。默认**不动**它——那台机器可能
+                      配的是 hub 通道（本脚本不认识），盖掉会把它从现有面板上踢下来
   --via-inbox         改走收件口通道（那台机器读不到 GitHub 时用）：
                       --account <名字> / --invite <码> / --inbox <地址>，
                       后两者默认读 ${ADMIN_FILE}
@@ -116,7 +119,13 @@ await new Promise((resolve, reject) => {
 say(`代码已同步到 ${HOST}:${DIR}/provider`);
 
 /* ---------------- 3a. git 通道（默认）：部署密钥 + sync.json ---------------- */
-if (!flag('via-inbox')) {
+// 已有 sync.json 就**不动它**（脚本头承诺的幂等）。这台机器可能配的是 hub 通道——本脚本
+// 不认识它，而 hub 的机器照样在发分片；盖成 git 通道会把它从现有面板上踢下来，本机又读
+// 不回来，白折腾还静默。要换通道显式给 --reset-sync。
+const keepSync = hasSync && !flag('reset-sync');
+if (!flag('via-inbox') && keepSync) {
+  say(`同步配置已有（保持不动）：${HOST}:~/.miraquota/sync.json。要改成 git 通道加 --reset-sync`);
+} else if (!flag('via-inbox')) {
   const repo = opt('repo', DEFAULT_REMOTE);
   const m = /github\.com[:/]([^/]+)\/([^/.]+)/.exec(repo);
   if (!m) { console.error(`看不懂账本仓地址：${repo}`); process.exit(1); }
