@@ -36,9 +36,15 @@ const CONFIDENCE = { none: 0, low: 1, medium: 2, high: 3 };
 const CONFIDENCE_LABEL = { none: '无样本', low: '标定中', medium: '收敛中', high: '高置信' };
 
 export class Calibrator {
-  /** @param stateFile 状态文件路径（测试注入用，默认 ~/.miraquota/calibration.json） */
-  constructor(stateFile = STATE_FILE) {
+  /**
+   * @param stateFile 状态文件路径（测试注入用，默认 ~/.miraquota/calibration.json）
+   * @param opts.store UsageStore；给了就以**库**为准（点数与 marks 进 SQLite 的 points/marks 表），
+   *   JSON 只在库里一条都没有时读一次当迁移源。内存里的形状不变——估算器（rate-measure）
+   *   照旧吃 `points[label]` 与增量的 `marks`，换的只是落盘那一层。
+   */
+  constructor(stateFile = STATE_FILE, { store = null } = {}) {
     this.stateFile = stateFile;
+    this.store = store;
     this.points = {};   // label → [{ at, used, budget, resetAt }]
     // 与点数读数同一瞬间的「各模型美元增量」：[{ at, d: { 模型: 美元 } }]，`gap` 为真表示
     // 累计基准断了（重启、修剪过老桶），跨它的区间不能用。倍率测算只认这个配对——
@@ -48,15 +54,84 @@ export class Calibrator {
     this.#load();
   }
 
+  /** 从 JSON 读一次（只给两条路用：没有库时的正路；有库但库里还空着时的迁移源）。 */
+  #loadJson() {
+    try { return JSON.parse(readFileSync(this.stateFile, 'utf8')); } catch { return null; }
+  }
+
   #load() {
-    try {
-      const p = JSON.parse(readFileSync(this.stateFile, 'utf8'));
+    if (this.store) {
+      const rows = this.store.db.prepare('SELECT label, at, used, budget, reset_at FROM points ORDER BY label, at').all();
+      if (rows.length) {
+        for (const r of rows) {
+          (this.points[r.label] ?? (this.points[r.label] = []))
+            .push({ at: r.at, used: r.used, budget: r.budget, resetAt: r.reset_at });
+        }
+        this.marks = this.#marksFromStore();
+        return;
+      }
+      // 库里空着而 JSON 还在 = 第一次上库：把旧状态导进去，此后 JSON 不再写。
+      const legacy = this.#loadJson();
+      if (legacy) {
+        this.points = legacy.points ?? {};
+        this.marks = Array.isArray(legacy.marks) ? legacy.marks : [];
+        this.#save();
+      }
+      return;
+    }
+    const p = this.#loadJson();
+    if (p) {
       this.points = p.points ?? {};
       this.marks = Array.isArray(p.marks) ? p.marks : [];
-    } catch { /* 首次运行 */ }
+    }
+  }
+
+  /**
+   * 库里的 marks 是**累计**（`cum` = 那一刻该模型的累计美元），而估算器要的是增量。
+   * 这里换算回增量的形状：`broken` 的那一 tick、以及没有上一 tick 的第一条，都落成 gap——
+   * 「跨它不可比」的语义两边一致。
+   */
+  #marksFromStore() {
+    const rows = this.store.db.prepare('SELECT at, model, cum, broken FROM marks ORDER BY at, model').all();
+    const byAt = new Map();
+    for (const r of rows) {
+      if (!byAt.has(r.at)) byAt.set(r.at, { at: r.at, cum: {}, broken: false });
+      const g = byAt.get(r.at);
+      g.cum[r.model] = r.cum;
+      if (r.broken) g.broken = true;
+    }
+    const out = [];
+    let prev = null;
+    for (const g of [...byAt.values()].sort((a, b) => a.at - b.at)) {
+      if (g.broken || !prev) { out.push({ at: g.at, gap: true }); prev = g.cum; continue; }
+      const d = {};
+      for (const [m, v] of Object.entries(g.cum)) {
+        const delta = v - (prev[m] ?? 0);
+        if (delta !== 0) d[m] = delta;
+      }
+      out.push({ at: g.at, d });
+      prev = g.cum;
+    }
+    return out;
   }
 
   #save() {
+    // 有库时点数/marks 的权威副本在库里，这里只做一次性迁移（把旧 JSON 灌进去）。
+    if (this.store) {
+      const rows = [];
+      for (const [label, list] of Object.entries(this.points)) {
+        for (const s of list) rows.push({ label, at: s.at, used: s.used, budget: s.budget, resetAt: s.resetAt });
+      }
+      if (rows.length) this.store.insertPoints(rows);
+      let prev = null;
+      for (const m of this.marks) {
+        if (m.gap) { this.store.insertMarks(m.at, prev ?? {}, { broken: true }); continue; }
+        prev = { ...(prev ?? {}) };
+        for (const [model, d] of Object.entries(m.d ?? {})) prev[model] = (prev[model] ?? 0) + d;
+        this.store.insertMarks(m.at, prev);
+      }
+      return;
+    }
     try {
       mkdirSync(dirname(this.stateFile), { recursive: true });
       writeFileSync(this.stateFile, JSON.stringify({ points: this.points, marks: this.marks }));
@@ -78,8 +153,12 @@ export class Calibrator {
    *   增量 mark；不给则记一个 gap——没有配对的美元，这一段就不该被倍率测算用上。
    */
   record(windows, capturedSec, byModel = null) {
-    if (!this.#mark(capturedSec, byModel)) return;
+    const mark = this.#mark(capturedSec, byModel);
+    if (!mark) return;
+    // 库里的 marks 存**累计**（`byModel` 就是累计，不用换算）；基准断了就标 broken。
+    if (this.store) this.store.insertMarks(capturedSec, mark.cumulative ?? {}, { broken: mark.broken });
     let dirty = false;
+    const fresh = [];
     for (const w of windows) {
       if (!(w.budget > 0)) continue;
       const list = this.points[w.label] ?? (this.points[w.label] = []);
@@ -88,23 +167,34 @@ export class Calibrator {
         if (capturedSec - last.at < POINT_MIN_INTERVAL) continue;
         if (last.used === w.used && last.budget === w.budget && last.resetAt === w.resetAt) continue;
       }
-      list.push({ at: capturedSec, used: w.used, budget: w.budget, resetAt: w.resetAt });
+      const row = { at: capturedSec, used: w.used, budget: w.budget, resetAt: w.resetAt };
+      list.push(row);
+      fresh.push({ label: w.label, ...row });
       dirty = true;
     }
-    if (dirty || this.marks.length) { this.#prune(); this.#save(); }
+    if (this.store && fresh.length) this.store.insertPoints(fresh);
+    if (dirty || this.marks.length) { this.#prune(); if (!this.store) this.#save(); }
   }
 
   /**
-   * 记一条与点数读数同瞬的美元增量，返回这一刻是否落了 mark（点数样本跟着它走）。
+   * 记一条与点数读数同瞬的美元增量，返回这一刻落了什么（没落就返回 false，点数样本跟着它走）。
    * 累计值回落（修剪）或基准缺失时落 gap。
+   * @returns {false|{cumulative: object|null, broken: boolean}} 给 store 落库用的那一份
    */
   #mark(capturedSec, byModel) {
     const last = this.marks[this.marks.length - 1];
     if (last && capturedSec - last.at < POINT_MIN_INTERVAL) return false;
-    if (!byModel) { this.lastTotals = null; this.marks.push({ at: capturedSec, gap: true }); return true; }
+    if (!byModel) {
+      this.lastTotals = null;
+      this.marks.push({ at: capturedSec, gap: true });
+      return { cumulative: null, broken: true };
+    }
     const prior = this.lastTotals;
     this.lastTotals = { ...byModel };
-    if (!prior) { this.marks.push({ at: capturedSec, gap: true }); return true; }
+    if (!prior) {
+      this.marks.push({ at: capturedSec, gap: true });
+      return { cumulative: byModel, broken: true };     // 第一条没有可比基准
+    }
     const d = {};
     for (const [model, total] of Object.entries(byModel)) {
       const delta = total - (prior[model] ?? 0);
@@ -113,7 +203,7 @@ export class Calibrator {
     // 少了模型 = 那个模型的桶被修剪掉了，基准不可比，整条标记为 gap
     const shrank = Object.keys(prior).some((m) => byModel[m] == null);
     this.marks.push(shrank ? { at: capturedSec, gap: true } : { at: capturedSec, d });
-    return true;
+    return { cumulative: byModel, broken: shrank };
   }
 
   #prune() {
@@ -124,6 +214,10 @@ export class Calibrator {
       this.points[k] = kept;
     }
     this.marks = this.marks.filter((m) => m.at >= cutoff).slice(-MAX_POINT_SAMPLES);
+    if (this.store) {
+      this.store.db.prepare('DELETE FROM points WHERE at < ?').run(cutoff);
+      this.store.db.prepare('DELETE FROM marks WHERE at < ?').run(cutoff);
+    }
   }
 
   /**

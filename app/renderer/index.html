@@ -297,6 +297,7 @@
       </div>
       <div class="card"><div class="hint" id="specPrice"></div></div>
       <div class="card"><div class="hint" id="specState"></div></div>
+      <div class="card" id="ledgerCard" style="display:none"><div class="hint" id="ledgerReport"></div></div>
       <div class="card"><div class="hint">
         <b>精确</b>（无标记）——点数与百分比来自 <code>/v1/limits</code>，账号级权威；美元主行是本机账本
         token × 官方 API 价，可与 Mirasim「流量监控 → 估算成本」逐笔核对。<br>
@@ -947,6 +948,40 @@
     }
     $('specState').innerHTML = st2.join('<br>');
     renderPointCost(p.pointCost);
+    renderLedger(p.ledger);
+  }
+
+  /**
+   * 账目报表：近 N 天按**任务 / 工作区 / 会话**拆开花了多少。
+   *
+   * 「每个任务花了多少」在旧账本里结构上问不出来（只有「模型 × 分钟」的桶）。现在流水里每笔
+   * 都带会话、轮次表补任务归属，所以能出。两条必须说清的：归不上的部分**如实单列**（轮次只
+   * 覆盖 Mirasim 管起来的会话，摊到别的任务头上就是编数）；这是**本机**账本，账号级点数含他机。
+   */
+  function renderLedger(l) {
+    const card = $('ledgerCard');
+    card.style.display = l ? '' : 'none';
+    if (!l) return;
+    const hhmm = (sec) => (sec ? new Date(sec * 1000).toISOString().slice(5, 16).replace('T', ' ') : '—');
+    const line = (k, v) => `<b>${k}</b> ${v}`;
+    const out = [];
+    const t = l.tasks ?? { total: 0, claimed: 0, unclaimed: 0, rows: [] };
+    const pct = t.total > 0 ? Math.round((t.claimed / t.total) * 100) : 0;
+    out.push(line('账目', `近 ${l.days} 天 <b>${money(t.total)}</b>——能归到任务的 ${money(t.claimed)}（${pct}%），`
+      + `归不上的 ${money(t.unclaimed)}（轮次只覆盖 Mirasim 管起来的会话，不摊派）`));
+    if (t.rows.length) {
+      out.push(line('任务', t.rows.map((r) =>
+        `${esc(r.task ?? '(无任务号)')} <b>${money(r.usd)}</b> · ${r.calls} 笔 · ${hhmm(r.firstAt)}→${hhmm(r.lastAt)}`).join('<br>')));
+    }
+    if (l.workspaces?.length) {
+      out.push(line('工作区', l.workspaces.map((r) =>
+        `${esc(r.ws)} <b>${money(r.usd)}</b> · ${r.sessions} 会话`).join('<br>')));
+    }
+    if (l.sessions?.length) {
+      out.push(line('会话', l.sessions.map((r) =>
+        `<code>${esc((r.sid ?? '').slice(0, 8))}</code> <b>${money(r.usd)}</b> · ${r.calls} 笔 · ${esc(r.models ?? '')}`).join('<br>')));
+    }
+    $('ledgerReport').innerHTML = out.join('<br>');
   }
 
   /**

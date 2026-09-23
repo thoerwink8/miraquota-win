@@ -7,6 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -171,7 +172,14 @@ test('a fully injected engine writes nothing into the default state dir', () => 
   });
 
   assert.ok(existsSync(join(work, 'ledger.db')), '注入的那份流水库要真写出来，否则这条测试是空转');
-  assert.ok(existsSync(join(work, 'calibration.json')), '标定采样同理');
+  // 标定（点数 + marks）现在跟着流水进同一个库，`calibration.json` 不再写——所以正控换成
+  // 「库里真有那几行」，否则这条测试会变成空转（什么都没写也照样绿）。
+  const db = new DatabaseSync(join(work, 'ledger.db'));
+  assert.ok(db.prepare('SELECT COUNT(*) n FROM points').get().n > 0, '标定采样要真的落进库');
+  // marks 这里会是 0：这一轮账本是空的（没有调用）⇒ 累计表是 `{}`，而 marks 是按模型记的，
+  // 没有模型就写不出行。那是「没东西可标」，不是漏写——marks 的落库与还原在 point-cost 那条测。
+  db.close();
+  assert.equal(existsSync(join(work, 'calibration.json')), false, '标定已进库，JSON 不该再写');
   assert.equal(existsSync(join(home, '.miraquota')), false,
     '默认状态目录被碰了——有模块没走路径注入，测试正在改真机状态');
 });

@@ -182,6 +182,41 @@ test('point samples only land on mark ticks, so every segment has dollars at bot
   assert.equal(between.reduce((s, m) => s + (m.d?.['claude-fable-5-1'] ?? 0), 0), 0.5);
 });
 
+test('the calibrator keeps points and marks in the store, and reloads them as deltas', async () => {
+  // 标定从前写 calibration.json（本机 141 KB）。现在跟着流水进同一个库：**落盘换层，内存形状不变**
+  // ——估算器照旧吃 `points[label]` 与增量的 `marks`，所以这条测试盯的是「换层没换语义」：
+  // 库里存的是累计，读回来必须还原成「增量 + gap」，否则倍率会按错的段算。
+  const { Calibrator } = await import('../provider/lib/calibrator.mjs');
+  const { UsageStore } = await import('../provider/lib/store.mjs');
+  const { measureModelRates } = await import('../provider/lib/rate-measure.mjs');
+
+  const store = new UsageStore({ file: join(tmp, 'cal-store.db') });
+  const jsonPath = join(tmp, 'cal-never-written.json');
+  const cal = new Calibrator(jsonPath, { store });
+  const w = (used) => [{ label: '7d_fable', used, budget: 296800, resetAt: now + 86400 }];
+  cal.record(w(1000), now, { 'claude-fable-5-1': 3 });                    // 第一条：没有基准 → gap
+  cal.record(w(1100), now + 60, { 'claude-fable-5-1': 5 });
+  cal.record(w(1300), now + 120, { 'claude-fable-5-1': 9 });
+  cal.record(w(1500), now + 180, { 'claude-fable-5-1': 12 });            // 段数要够 3，估算器才肯给数
+
+  assert.equal(store.db.prepare('SELECT COUNT(*) n FROM points').get().n, 4, '四条点数采样落库');
+  assert.equal(store.db.prepare('SELECT COUNT(*) n FROM marks').get().n, 4, '四条 mark 落库');
+  assert.equal(store.db.prepare('SELECT broken FROM marks WHERE at = ?').get(now).broken, 1, '第一条标 broken');
+  assert.equal(store.db.prepare('SELECT cum FROM marks WHERE at = ?').get(now + 180).cum, 12, '库里存的是累计');
+  assert.equal(existsSync(jsonPath), false, '有库就不该再写 JSON（迁移只在库里空着时读一次）');
+
+  // 重开一个实例 = 重启：从库里读回来
+  const again = new Calibrator(jsonPath, { store });
+  assert.deepEqual(again.points['7d_fable'].map((s) => s.used), [1000, 1100, 1300, 1500]);
+  assert.deepEqual(again.marks.map((m) => (m.gap ? 'gap' : m.d['claude-fable-5-1'])), ['gap', 2, 4, 3],
+    '累计读回来要还原成增量，第一条还原成 gap');
+  // 还原出来的 marks 估算器真能用：段数 > 0 就说明形状对上了（不是「读回来了但配不出段」）
+  const rates = measureModelRates(again.points['7d_fable'], again.marks, { minSegUSD: 0.01 });
+  assert.equal(rates.length, 1);
+  assert.equal(rates[0].segments, 3, 'gap 那条不算，其余三条各成一段');
+  store.close();
+});
+
 test('the config lives on the spec tab, not the first screen', () => {
   const renderer = readFileSync(new URL('../app/renderer/index.html', import.meta.url), 'utf8');
   assert.match(renderer, /<div class="page" id="pageSpec">\s*<div class="card" id="cfgCard"/);

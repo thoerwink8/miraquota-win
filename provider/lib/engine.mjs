@@ -69,6 +69,11 @@ const AUTOJOIN_EVERY = 3600; // 秒；未配置多机同步时，隔多久静默
 const JOURNAL_EVERY = 300;      // 秒；两次推流水之间的最小间隔
 const JOURNAL_BATCH = 2000;     // 每批行数（与 journalSince 的 limit 一致）
 const JOURNAL_MAX_BATCHES = 8;  // 一轮最多推几批，别把一轮 poll 拖长
+// 账目报表（任务/工作区/会话）：payload 每跳都算，而这几条 SQL 要扫明细窗——缓存 60 秒。
+// 报表不需要秒级新鲜，而「每跳扫 8 天明细」会白烧 CPU（这一课在 Phase 2a 上过）。
+const LEDGER_REPORT_DAYS = 7;
+const LEDGER_REPORT_ROWS = 8;
+const LEDGER_REPORT_EVERY = 60;
 /**
  * 秒；hub 通道下「这台机器刚有新动静」时的最短发布间隔。
  *
@@ -191,7 +196,8 @@ export class Engine {
       home: opts.home,
     });
     this.pointsAttrib = new PointsAttributor(opts.attribFile);
-    this.calibrator = new Calibrator(opts.calibratorFile);
+    // 标定的点数采样与 marks 跟着流水进同一个库（`calibration.json` 从此只当迁移源读一次）。
+    this.calibrator = new Calibrator(opts.calibratorFile, { store: this.ledger.store });
     this.anchors = new AnchorStore(opts.anchorFile);
     this.settings = new Settings(opts.settingsFile);
     this.sync = new LedgerSync(opts.syncOpts);
@@ -962,6 +968,43 @@ export class Engine {
     return budget * OFFICIAL_PER_POINT / ratio;
   }
 
+  #ledgerRepAt = 0;
+  #ledgerRepCache = null;
+
+  /**
+   * 账目报表：近 7 天按**任务 / 工作区 / 会话**拆开花了多少。
+   *
+   * 这是「分析每一个任务到底花费多少」那条需求的落地。旧账本只有「模型 × 分钟」的桶，
+   * 结构上问不出来；流水里每笔都带会话，`turns` 表补上任务归属，于是能出。
+   *
+   * 两条自律：
+   *  - **归不上的如实给**（`tasks.unclaimed`）。轮次只覆盖 Mirasim 管起来的会话，
+   *    把归不上的摊到别的任务头上就是编数；
+   *  - 缓存 60 秒。payload 每跳都算一次，而这几条 SQL 要扫明细窗——报表不需要秒级新鲜。
+   */
+  #ledgerReport(now) {
+    const store = this.ledger?.store;
+    if (!store) return null;
+    if (this.#ledgerRepAt && now - this.#ledgerRepAt < LEDGER_REPORT_EVERY) return this.#ledgerRepCache;
+    const from = now - LEDGER_REPORT_DAYS * 86400;
+    const t = store.byTask(from, now);
+    const out = {
+      days: LEDGER_REPORT_DAYS,
+      tasks: {
+        total: t.total, claimed: t.claimed, unclaimed: t.unclaimed,
+        rows: t.rows.slice(0, LEDGER_REPORT_ROWS)
+          .map((r) => ({ task: r.task, sid: r.sid, usd: r.usd, calls: r.n, firstAt: r.first_at, lastAt: r.last_at })),
+      },
+      workspaces: store.byWorkspace(from, now).slice(0, LEDGER_REPORT_ROWS)
+        .map((r) => ({ ws: r.ws, usd: r.usd, calls: r.n, sessions: r.sessions })),
+      sessions: store.bySession(from, now).slice(0, LEDGER_REPORT_ROWS)
+        .map((r) => ({ sid: r.sid, usd: r.usd, calls: r.n, models: r.models, firstAt: r.first_at, lastAt: r.last_at })),
+    };
+    this.#ledgerRepAt = now;
+    this.#ledgerRepCache = out;
+    return out;
+  }
+
   #fullOf(label, budget, group, ratioFull) {
     const est = this.calibrator.estimate(label, this.ledger, budget, group, this.settings.groupPointCost);
     const dropped = est?.foreignDropped ?? 0;
@@ -999,6 +1042,9 @@ export class Engine {
       ...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX, hub: DEFAULT_HUB } } : {}),
       ...(this.#roster() ?? {}),
       ...this.#priceTrust(),
+      // 账目报表（任务/工作区/会话）：三条 payload 路径都给——它是本机账本的事实，
+      // 不是「连上 Mirasim 才有」的东西。
+      ...((r) => (r ? { ledger: r } : {}))(this.#ledgerReport(Date.now() / 1000)),
     };
   }
 

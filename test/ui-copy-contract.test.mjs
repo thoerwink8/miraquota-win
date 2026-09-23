@@ -107,6 +107,23 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /lastShardSec/);
 });
 
+test('the ledger report splits task/workspace/session and admits the unattributed part', () => {
+  // 「分析每一个任务到底花费多少」是用户 2026-09-23 明确要的。旧账本只有「模型 × 分钟」的桶，
+  // 结构上问不出来；现在流水每笔带会话、turns 表补任务归属，所以能出。两条必须钉住：
+  // 报表真的画出来，以及**归不上的部分如实单列**——轮次只覆盖 Mirasim 管起来的会话
+  // （实测 1201 轮里 1068 轮有 taskId），摊到别的任务头上就是编数。
+  assert.match(renderer, /renderLedger\(p\.ledger\)/);
+  assert.match(renderer, /id="ledgerReport"/);
+  assert.match(renderer, /归不上的/);
+  assert.match(renderer, /不摊派/);
+  assert.match(renderer, /能归到任务的/);
+  // 引擎侧要真的产出这个块（三条 payload 路径都给），否则界面那段永远不触发
+  assert.match(engine, /ledger: r/);
+  assert.match(engine, /#ledgerReport\(/);
+  assert.match(engine, /store\.byTask\(/);
+  assert.match(engine, /LEDGER_REPORT_EVERY/, '报表要缓存——payload 每跳都算，扫 8 天明细会白烧 CPU');
+});
+
 test('the three dollar-trust alarms name the culprit and say what to do about it', () => {
   // 2026-09-22：这三条都是「静默成功」型的偏差——价目兜底猜、transcript 漏账、外机分片旧
   // 口径。每一条的表现都只是一个偏了的美元数，用户无从解释，所以必须点名 + 给动作；
