@@ -17,16 +17,19 @@
  *   POST /register {account, passphrase, invite}   → 201 / 403 邀请码错 / 409 名字已占
  *   POST /login    {account, passphrase}           → 204 / 401
  *   PUT  /shard    头 x-account / x-passphrase，体分片 JSON（≤3MB） → 204 / 401 / 400 / 429
- *   GET  /shards                                   → 全部分片数组
+ *   GET  /shards                                   → 全部分片数组（跨账号，只读无鉴权）
+ *   PUT  /journal  头同上，体 {installId, rows}    → 204 / 401 / 400 / 429
+ *   GET  /journals 头同上                          → **本账号**各机的流水明细（要口令）
  *   GET  /lite.bat  GET /lite.ps1                  → 双击即用的轻客户端及其脚本
  *   GET  /health
- * 环境：INVITE_CODE（秘密）、ACCOUNTS（KV：账号 + 分片）。
- * KV 键：acct:<名字> → 口令哈希；shard:<名字>--<installId 前 12 位> → 分片 JSON；last:… → 限频。
+ * 环境：INVITE_CODE（秘密）、ACCOUNTS（KV：账号 + 分片 + 流水）。
+ * KV 键：acct:<名字> → 口令哈希；shard:<名字>--<installId 前 12 位> → 分片 JSON；
+ *        journal:<名字>--<installId 前 12 位> → 流水明细；last:/lastj: → 限频。
  */
 import LITE_PS1 from './lite.ps1';
 import LITE_BAT from './lite.bat';
 
-import { ACCOUNT_RE, hashPassphrase, verifyPassphrase, validateShard, branchFor } from './shared.mjs';
+import { ACCOUNT_RE, hashPassphrase, verifyPassphrase, validateShard, validateJournal, branchFor } from './shared.mjs';
 
 const MAX_BODY = 3 << 20;
 const MIN_UPLOAD_GAP_MS = 45_000;
@@ -41,6 +44,8 @@ const text = (body) => new Response(body, {
 
 /** 分片的 KV 键与仓库分支名同构：machine/<名字>--<installId12> → shard:<名字>--<installId12>。 */
 const shardKey = (account, installId) => 'shard:' + branchFor(account, installId).slice('machine/'.length);
+/** 流水明细同一套键形状，换前缀（前缀里带账号，于是 GET 能只回本账号的）。 */
+const journalKey = (account, installId) => 'journal:' + branchFor(account, installId).slice('machine/'.length);
 
 async function readJSON(req) {
   const len = Number(req.headers.get('content-length') || 0);
@@ -67,6 +72,26 @@ async function listShards(env) {
         const s = await env.ACCOUNTS.get(k.name, 'json');
         if (s && s.machineId) out.push(s);
       } catch { /* 单个分片坏不影响其余 */ }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return out;
+}
+
+/**
+ * 本账号各机的流水明细。**只回同一个账号的**：明细里有会话 id 与工作区路径，比聚合分片敏感
+ * 得多——`/shards` 那种「跨账号可读」的规则不能照搬过来（分片是几分钟一个数，流水是逐笔）。
+ */
+async function listJournals(env, account) {
+  const out = [];
+  let cursor;
+  do {
+    const page = await env.ACCOUNTS.list({ prefix: `journal:${account}--`, cursor });
+    for (const k of page.keys) {
+      try {
+        const j = await env.ACCOUNTS.get(k.name, 'json');
+        if (j && Array.isArray(j.rows)) out.push(j);
+      } catch { /* 单个坏不影响其余 */ }
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
@@ -121,6 +146,25 @@ export default {
         return new Response(null, { status: 204 });
       }
       if (req.method === 'GET' && path === '/shards') return json(200, await listShards(env));
+      // 流水明细：与分片同一套鉴权，但**限频键分开**——不然每 5 分钟一推的流水会把分片挤掉。
+      if (req.method === 'PUT' && path === '/journal') {
+        const account = req.headers.get('x-account') ?? '';
+        if (!(await authenticate(env, account, req.headers.get('x-passphrase')))) return json(401, { error: '名字或口令不对' });
+        const { body, raw, err } = await readJSON(req); if (err) return err;
+        const why = validateJournal(body);
+        if (why) return json(400, { error: why });
+        const gapKey = `lastj:${account}:${body.installId}`;
+        const last = Number(await env.ACCOUNTS.get(gapKey)) || 0;
+        if (Date.now() - last < MIN_UPLOAD_GAP_MS) return json(429, { error: '上传太频繁，稍后再试' });
+        await env.ACCOUNTS.put(journalKey(account, body.installId), raw, { expirationTtl: SHARD_TTL_SEC });
+        await env.ACCOUNTS.put(gapKey, String(Date.now()), { expirationTtl: 3600 });
+        return new Response(null, { status: 204 });
+      }
+      if (req.method === 'GET' && path === '/journals') {
+        const account = req.headers.get('x-account') ?? '';
+        if (!(await authenticate(env, account, req.headers.get('x-passphrase')))) return json(401, { error: '名字或口令不对' });
+        return json(200, await listJournals(env, account));
+      }
       return json(404, { error: 'no such endpoint' });
     } catch (e) {
       return json(502, { error: String(e?.message ?? e).slice(0, 300) });

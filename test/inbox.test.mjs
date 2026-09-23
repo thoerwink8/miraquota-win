@@ -10,7 +10,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { validateShard, branchFor, hashPassphrase, verifyPassphrase, ACCOUNT_RE } from '../inbox/shared.mjs';
+import { validateShard, validateJournal, branchFor, hashPassphrase, verifyPassphrase, ACCOUNT_RE } from '../inbox/shared.mjs';
 import { LedgerSync, DEFAULT_INBOX, readInstallId } from '../provider/lib/ledger-sync.mjs';
 import { CostLedger, STATE_SCHEMA } from '../provider/lib/ledger.mjs';
 import { Pricing } from '../provider/lib/pricing.mjs';
@@ -46,10 +46,11 @@ test('install id is generated once and reused', () => {
   assert.notEqual(readInstallId(f), a, '文件坏了就重生成，不承载账目所以无妨');
 });
 
-/** 冒充 Worker：内存账号表、内存分片表，语义与 inbox/worker.mjs 一致。 */
+/** 冒充 Worker：内存账号表、内存分片表、内存流水表，语义与 inbox/worker.mjs 一致。 */
 function fakeInbox({ invite = 'code' } = {}) {
   const accounts = new Map();
   const shards = new Map();
+  const journals = new Map();
   const log = [];
   const server = createServer(async (req, res) => {
     const chunks = [];
@@ -76,10 +77,24 @@ function fakeInbox({ invite = 'code' } = {}) {
       return send(204);
     }
     if (req.method === 'GET' && req.url === '/shards') return send(200, [...shards.values()]);
+    // 流水明细：同一套鉴权；GET 只回**本账号**的（明细里有会话 id 与工作区路径）
+    if (req.method === 'PUT' && req.url === '/journal') {
+      const acct = req.headers['x-account'];
+      if (accounts.get(acct) !== req.headers['x-passphrase']) return send(401, { error: '名字或口令不对' });
+      const why = validateJournal(body);
+      if (why) return send(400, { error: why });
+      journals.set(`${acct}--${body.installId.slice(0, 12)}`, { ...body, account: acct });
+      return send(204);
+    }
+    if (req.method === 'GET' && req.url === '/journals') {
+      const acct = req.headers['x-account'];
+      if (accounts.get(acct) !== req.headers['x-passphrase']) return send(401, { error: '名字或口令不对' });
+      return send(200, [...journals.values()].filter((j) => j.account === acct));
+    }
     send(404, { error: 'no such endpoint' });
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
-    resolve({ url: `http://127.0.0.1:${server.address().port}`, accounts, shards, log, close: () => server.close() });
+    resolve({ url: `http://127.0.0.1:${server.address().port}`, accounts, shards, journals, log, close: () => server.close() });
   }));
 }
 
@@ -224,8 +239,54 @@ test('an inbox machine reads its own cache on cold start, and a dead inbox costs
   } finally { box.close(); }
 });
 
-test('the friend-facing BAT is a real file with the real address baked in, and stays in step', () => {
-  // 用户 2026-09-03：BAT 要放仓库里能直接复制给朋友——朋友拿到的是文件，不一定从 Worker 下，
+/**
+ * 收件口也收流水明细（用户 2026-09-23：「收件口…我觉得也要流水」）。
+ *
+ * KV 没有能查询的存储，所以设计与 hub 不同：**推的机器把明细块放上去，读的机器把它写进自己的库**
+ * （hub 是服务端落库、大家读服务端）。两条硬边界：只回本账号的（明细里有会话 id 与工作区路径，
+ * 不能像聚合分片那样跨账号可读），以及行格式与 hub 是同一套判据。
+ */
+test('inbox carries journal blocks: pushed by one machine, ingested by the reader', async () => {
+  const box = await fakeInbox();
+  try {
+    const mk = (name, installId) => new LedgerSync({
+      configFile: (() => {
+        const f = join(tmp, `${name}-jsync.json`);
+        writeFileSync(f, JSON.stringify({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', intervalSec: 600 }));
+        return f;
+      })(),
+      machineId: name, installId, cacheFile: join(tmp, `${name}-jcache.json`),
+    });
+    const a = mk('laptop', 'aaaa0000aaaa0000');
+    const b = mk('desk', 'bbbb0000bbbb0000');
+    await a.login({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', invite: 'code' });
+
+    const rows = [{ kh: '111', ts: 1_790_000_000, src: 'g', side: 'g', model: 'claude-opus-5', usd: 1.5, i: 10, o: 0, cr: 0, cw: 0, priced: 1, billable: 1 }];
+    assert.equal(await a.pushJournal(rows), 1, '推上去了');
+
+    // 读的一方：run() 把明细带回来（剔掉自己那份）
+    const r = await b.run(pricedLedger('desk-j'), 1_790_000_100);
+    assert.equal(r.journals.length, 1);
+    assert.equal(r.journals[0].installId, 'aaaa0000aaaa0000');
+    assert.equal(r.journals[0].rows[0].kh, '111');
+
+    // 自己那份不该回来（本机流水本来就在自己的库里）
+    const ra = await a.run(pricedLedger('laptop-j'), 1_790_000_100);
+    assert.deepEqual(ra.journals, []);
+
+    // 鉴权：口令不对拿不到明细（与分片那条「只读无鉴权」不同，这里是刻意的）
+    const bad = await fetch(`${box.url}/journals`, { headers: { 'x-account': 'fxc', 'x-passphrase': 'wrong' } });
+    assert.equal(bad.status, 401);
+
+    // 行形状与 hub 同一套判据
+    assert.match(validateJournal({ installId: 'zz', rows }), /installId/);
+    assert.match(validateJournal({ installId: 'aaaa0000aaaa0000', rows: [] }), /非空数组/);
+    assert.match(validateJournal({ installId: 'aaaa0000aaaa0000', rows: [{ ts: 1 }] }), /第 1 行不完整/);
+    assert.equal(validateJournal({ installId: 'aaaa0000aaaa0000', rows }), null);
+  } finally { box.close(); }
+});
+
+test('the friend-facing BAT is a real file with the real address baked in, and stays in step', () => {  // 用户 2026-09-03：BAT 要放仓库里能直接复制给朋友——朋友拿到的是文件，不一定从 Worker 下，
   // 所以地址必须烤在文件里，不能留占位符；根目录那份与 inbox/lite.bat 只能是同一份（CRLF 归一后）。
   const root = readFileSync(new URL('../MiraQuota-Lite.bat', import.meta.url), 'utf8');
   const src = readFileSync(new URL('../inbox/lite.bat', import.meta.url), 'utf8');

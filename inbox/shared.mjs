@@ -60,3 +60,17 @@ export function validateShard(shard, account) {
 export function branchFor(account, installId) {
   return `machine/${account}--${installId.slice(0, 12)}`;
 }
+
+/**
+ * 流水明细块校验。行形状与 hub 的 `PUT /journal` 是**同一套**（`kh`/`ts`/`model` 必需）：
+ * 两边收的是同一种东西，判据不该有两份。
+ * @returns null 表示通过，否则一句人话原因
+ */
+export function validateJournal({ installId, rows } = {}) {
+  if (typeof installId !== 'string' || !/^[a-f0-9]{8,32}$/.test(installId)) return 'installId 要是 8–32 位十六进制';
+  if (!Array.isArray(rows) || !rows.length) return 'rows 要是非空数组';
+  if (rows.length > MAX_ROWS) return `rows 超过 ${MAX_ROWS} 行`;
+  const bad = rows.findIndex((r) => !r || typeof r.ts !== 'number' || typeof r.model !== 'string' || !r.model || r.kh == null);
+  if (bad >= 0) return `第 ${bad + 1} 行不完整（要 ts/model/kh）`;
+  return null;
+}

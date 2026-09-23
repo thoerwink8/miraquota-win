@@ -316,16 +316,45 @@ export class LedgerSync {
    * 与分片分开：分片是聚合（三张卡够用），流水是明细——hub 手里有了明细，才谈得上「后端管理
    * 对账」（全账号逐点对账）与「每个任务花了多少」。两者都是幂等 PUT，谁失败都不连带另一个。
    *
-   * 只走 hub 通道：收件口（Cloudflare KV）那条路按同一套行格式收流水块是后面的事。
+   * 两条 HTTP 通道都收：hub 走 `PUT /journal`（共享 token），收件口走 `PUT /journal`（账号口令，
+   * 行格式同一套——`inbox/shared.mjs` 的 `validateJournal` 与 hub 的判据是一份）。
    * @returns {number} 服务端采纳（新插入）的行数；没配/失败一律 0，调用方据此决定要不要退水位
    */
   async pushJournal(rows, { machineId = null } = {}) {
-    if (this.config?.mode !== 'hub' || !Array.isArray(rows) || !rows.length) return 0;
-    const r = await http(`${this.config.hub}/journal`, {
-      method: 'PUT', headers: this.#hubAuth(),
-      body: JSON.stringify({ machineId: machineId ?? this.machineId, installId: this.installId, rows }),
-    });
-    return Number(r?.accepted) || 0;
+    if (!Array.isArray(rows) || !rows.length) return 0;
+    if (this.config?.mode === 'hub') {
+      const r = await http(`${this.config.hub}/journal`, {
+        method: 'PUT', headers: this.#hubAuth(),
+        body: JSON.stringify({ machineId: machineId ?? this.machineId, installId: this.installId, rows }),
+      });
+      return Number(r?.accepted) || 0;
+    }
+    if (this.config?.mode === 'inbox') {
+      await http(`${this.config.inbox}/journal`, {
+        method: 'PUT', headers: this.#inboxAuth(),
+        body: JSON.stringify({ installId: this.installId, rows }),
+      });
+      return rows.length;
+    }
+    return 0;
+  }
+
+  #inboxAuth() {
+    return { 'x-account': this.config.account, 'x-passphrase': this.config.passphrase };
+  }
+
+  /**
+   * 收件口：取回**本账号**各机的流水明细（要口令；Worker 只回同一个账号的——明细里有会话 id
+   * 与工作区路径，不能像聚合分片那样跨账号可读）。
+   *
+   * 剔掉自己那份：本机流水本来就在自己的库里。失败一律回空——它不该让分片同步跟着变红。
+   */
+  async #fetchJournals() {
+    try {
+      const all = await http(`${this.config.inbox}/journals`, { headers: this.#inboxAuth() });
+      return (Array.isArray(all) ? all : [])
+        .filter((j) => j && j.installId !== this.installId && Array.isArray(j.rows) && j.rows.length);
+    } catch { return []; }
   }
 
   /**
@@ -414,15 +443,19 @@ export class LedgerSync {
       this.pushOk = true;
     } catch (e) { this.pushOk = false; err = firstLine(e); }
     // 发布都推不上去时同一端点的读取几无成功可能，省一次网络往返直接跳过。
+    let journals = [];
     if (this.pushOk) {
       try {
         this.shards = await retryOnce(() => this.#fetchAll(), this.retryDelayMs);
         this.lastSyncSec = nowSec;
+        // 收件口那条路顺带取回他机的流水明细：**读的一方负责落库**（KV 只是中转，
+        // 没有能查询的存储），所以这里只取回来，由调用方（Engine）写进自己的库。
+        if (this.mode === 'inbox') journals = await this.#fetchJournals();
       } catch (e) { err = firstLine(e); }
     }
     this.lastError = err;
     this.failStreak = err ? this.failStreak + 1 : 0;
-    return { ...this.status(nowSec), shards: this.shards };
+    return { ...this.status(nowSec), shards: this.shards, journals };
   }
 
   /**

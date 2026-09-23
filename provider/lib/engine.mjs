@@ -300,9 +300,29 @@ export class Engine {
     // 与分片分开发——一台机器账本推失败不该连带把全账号的额度也丢了。
     if (limits) this.sync.pushLimits(limits).catch(() => { /* pushLimits 自吞错误 */ });
     this.sync.run(this.ledger, now, (speed || limits) ? { ...(speed ? { speed } : {}), ...(limits ? { limits } : {}) } : null)
-      .then((r) => { if (r) this.#adoptShards(r.shards); })
+      .then((r) => {
+        if (!r) return;
+        this.#adoptShards(r.shards);
+        // 收件口通道把**他机的流水明细**也带回来了（KV 只是中转，没有能查询的存储）：
+        // 读的一方负责落进自己的库——落完这一台的账目报表就覆盖全账号了。
+        if (r.journals?.length) this.#ingestJournals(r.journals);
+      })
       .catch(() => { /* run 自吞错误，这里兜底防未处理拒绝 */ })
       .finally(() => { this.#syncBusy = false; });
+  }
+
+  /**
+   * 把他机流水明细写进本机库。行的 `kh` 是主键，重推/重读幂等（收件口是整份覆盖，
+   * 所以下一轮会把上一轮的行再给一遍——靠主键去重，不靠调用方记水位）。
+   */
+  #ingestJournals(journals) {
+    let n = 0;
+    for (const j of journals) {
+      const machine = j.machineId ?? j.installId;
+      if (!machine || !Array.isArray(j.rows)) continue;
+      try { n += this.ledger.store.insertCalls(j.rows.map((r) => ({ ...r, machine }))); } catch { /* 单份坏不影响其余 */ }
+    }
+    if (n) this.ledger.invalidate();   // 新行进来了，合并索引作废
   }
 
   /**
