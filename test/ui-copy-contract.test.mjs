@@ -107,6 +107,15 @@ test('sync state copy keeps red for real trouble and shows the raw reason next t
   assert.doesNotMatch(widget, /lastShardSec/);
 });
 
+test('未计价的调用在账目里单列，不静默成 0', () => {
+  // 「用了什么就记什么」：没价目的模型美元是 0（不猜价），但 token 是实打实花掉的。
+  // 报表里不写出来，那一列就是静默的 0——用户看到的会是「这笔没记账」。
+  assert.match(renderer, /l\.unpriced/);
+  assert.match(renderer, /未计价/);
+  assert.match(renderer, /--reprice/, '要给出「补了价目怎么修历史」的那条命令');
+  assert.match(engine, /store\.unpriced\(from, now\)/, '引擎侧要真的产出这个块');
+});
+
 test('the ledger report splits task/workspace/session and admits the unattributed part', () => {
   // 「分析每一个任务到底花费多少」是用户 2026-09-23 明确要的。旧账本只有「模型 × 分钟」的桶，
   // 结构上问不出来；现在流水每笔带会话、turns 表补任务归属，所以能出。两条必须钉住：
