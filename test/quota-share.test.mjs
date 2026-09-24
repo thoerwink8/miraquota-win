@@ -8,6 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
@@ -207,6 +208,34 @@ test('two Mirasim pools stand in for nothing, and fleet off changes nothing', as
   await off.poll();
   assert.deepEqual(off.payload().fleet, { state: 'off' }, '没配 fleet-dao：只给一个 off，界面据此给「接上」那张卡');
   assert.equal(off.payload().state, 'local');
+});
+
+test('a known-good local route is read once per poll, without rediscovering Mirasim', async (t) => {
+  // 从前每一轮都先起一次 PowerShell 枚举全部进程（实测 1.4 秒）、再把缓存的路由读两遍。
+  // 这里给一个认准了的路由（本地假 /v1/limits）：三轮 poll 只该有三次读取；读不通才清掉缓存。
+  const hits = [];
+  const reset = Math.floor(Date.now() / 1000) + 3600;
+  const srv = createServer((req, res) => {
+    hits.push(`${req.method} ${req.url} ${req.headers['x-api-key'] ?? ''}`);
+    if (req.url !== '/v1/limits') { res.writeHead(404); return res.end(); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ windows: [{ name: '5h', used: 10, budget: 100, reset_at: reset }] }));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => srv.close());
+  const engine = new Engine({
+    home: join(tmp, 'route-home'),
+    ledgerFile: join(tmp, 'route-ledger.json'), anchorFile: join(tmp, 'route-anchor.json'),
+    settingsFile: join(tmp, 'route-settings.json'), attribFile: join(tmp, 'route-attrib.json'),
+    calibratorFile: join(tmp, 'route-calibration.json'),
+    fleetOpts: { configFile: join(tmp, 'route-no-fleet.json') },
+    syncOpts: { configFile: join(tmp, 'none.json'), installId: '8f8f8f8f8f8f8f8f' },
+  });
+  engine.cachedRouter = { port: srv.address().port, path: null, token: 'tok' };
+  for (let i = 0; i < 3; i++) assert.equal(await engine.poll(), true);
+  assert.deepEqual(hits, Array(3).fill('GET /v1/limits tok'), '一轮一次，不重读、不去探别的端口');
+  assert.equal(engine.payload().state, 'exact');
+  assert.equal(engine.payload().windows[0].points.used, 10);
 });
 
 test('a fully injected engine writes nothing into the default state dir', () => {

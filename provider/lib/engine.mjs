@@ -378,15 +378,29 @@ export class Engine {
     return { port: Number(m[1]), path: m[2]?.replace(/\/+$/, '') || null, token: process.env.ANTHROPIC_AUTH_TOKEN || null };
   }
 
-  /** 路由端口与令牌：显式参数 → 本进程环境 → PEB 自动发现 → 免认证（旧版）。 */
+  /**
+   * 读一次本机 /v1/limits。快路：上一轮认准的路由还通就直接读，读不通（Mirasim 重启、换了令牌）
+   * 才走完整发现。从前每一轮（15 秒）都先起一次 PowerShell 枚举全部进程（实测 1.4 秒）、探一遍
+   * 通道端口，再把缓存的路由读两遍——托盘常驻一天要起五千多次 PowerShell。
+   */
+  async #readLimits() {
+    if (this.cachedRouter) {
+      const limits = await this.#fetchLimits(this.cachedRouter);
+      if (limits) return limits;
+      this.cachedRouter = null;
+    }
+    const processes = await mirasimProcesses();
+    const channelPort = await this.#discoverChannelPort(processes);
+    return this.#discoverRouter(processes, channelPort);
+  }
+
+  /**
+   * 路由端口与令牌：显式参数 → 本进程环境 → PEB 自动发现 → 免认证（旧版）。
+   * 认准的那一对记进 cachedRouter，返回它读到的那份额度（不再让调用方重读一遍）。
+   */
   async #discoverRouter(processes, channelPort) {
     const explicitPort = Number(this.opts.routerPort ?? 0);
     const explicitToken = this.opts.routerToken ?? null;
-
-    if (this.cachedRouter) {
-      if (await this.#fetchLimits(this.cachedRouter)) return this.cachedRouter;
-      this.cachedRouter = null;
-    }
 
     const pairs = [];
     if (explicitPort) pairs.push({ port: explicitPort, token: explicitToken });
@@ -409,9 +423,10 @@ export class Engine {
     for (const d of discovered) if (!pairs.some((x) => x.port === d.port && (x.path ?? null) === (d.path ?? null))) pairs.push(d);
 
     for (const pair of pairs) {
-      if (await this.#fetchLimits(pair)) {
+      const limits = await this.#fetchLimits(pair);
+      if (limits) {
         this.cachedRouter = pair;
-        return pair;
+        return limits;
       }
     }
     return null;
@@ -509,10 +524,7 @@ export class Engine {
     this.#pollBusy = true;
     try {
       if (!this.opts.forceOffline) {
-        const processes = await mirasimProcesses();
-        const channelPort = await this.#discoverChannelPort(processes);
-        const router = await this.#discoverRouter(processes, channelPort);
-        const limits = router ? await this.#fetchLimits(router) : null;
+        const limits = await this.#readLimits();
         if (limits) this.ingestLimits(limits, Date.now() / 1000);
       }
       // fleet-dao 到点才读、不等它：它慢或挂了都不该拖住本机这一轮（读完经 onUpdate 叫面板重画）
