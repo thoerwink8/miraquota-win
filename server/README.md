@@ -1,4 +1,9 @@
-# MiraQuota Hub：账本与账号额度的唯一真相
+# MiraQuota Hub（客户端已下线，服务端待停）
+
+> **2026-09-24：客户端那一路已下线**——账号额度改由 fleet-dao 统一读，新版 MiraQuota 不再认
+> `{ "hub": … }` 配置（当未配置处理，日志与多机页说清怎么换）。这台服务先不动，接住停服前还没升级的
+> 老客户端；切换完成后停服，并把本目录、`scripts/deploy-hub.mjs`、`test/hub.test.mjs` 一起删。
+> 下面是它在役时的说明，留作停服前排查用。
 
 一台各机都连得上的服务器，收下每台机器推来的账本分片与账号额度，合并、算好整份 payload。
 面板填一个地址就能看，不区分机器。
@@ -60,14 +65,12 @@ node scripts/deploy-hub.mjs --host <ssh 别名>
 
 拆掉：`node scripts/deploy-hub.mjs --host <别名> --uninstall`（数据目录保留）。
 
-## 客户端怎么接
+## 客户端怎么接（仅老版本）
 
-`~/.miraquota/sync.json`：
+老版本客户端的 `~/.miraquota/sync.json`：
 
 ```json
 { "hub": "https://<地址>/mq", "token": "<装的时候打印的>", "intervalSec": 600 }
 ```
 
-配了 `hub` 就走 hub，不再碰 git 仓与收件口 —— 那两条是「没有服务器时的替代品」。
-`quotaIntervalSec`（默认 `min(intervalSec, 120)`）管账号额度那几轮的快节奏，
-详见 `docs/MULTI-MACHINE.md`。
+新版不再认这份配置（见文首）。

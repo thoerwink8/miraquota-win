@@ -309,26 +309,19 @@
         <b>分家族</b>——美元是账本实测；点数按同期各家族账本占比归因，同期无本机支出的记「未归因」（他机用量）。归因自本版部署起累积。<br>
         <b>今天</b>——自然日 0 点起。点数含其他设备，美元只算本机，两者不能互相换算。<br>
         <b>多机</b>——他机用量只进点数、不进本机账本；标定会整段剔除他机活跃期。<br>
-        <b>推算</b>——本机 Mirasim 没在跑时：另一台还连着的机器会把它读到的账号额度随分片送来，
-        满额与他人占用都用那份（额度点是账号级的，谁读到都一样），顶栏写明是哪台、多久前读的；
-        一台都没有时才退回本机窗口锚点滚动推算，那时他人占用确实看不见。
+        <b>fleet 实读</b>——本机 Mirasim 没在跑时，额度用 fleet-dao 读到的那份（额度点是账号级的，
+        谁读到都一样，他人占用已计入），顶栏写明多久前读的；超过它的有效期就不再当现值。<br>
+        <b>推算</b>（数字带 ≈）——本机与 fleet-dao 都给不出新鲜读数时，按最近那次读数当锚点滚动推算：
+        锚点之后只加得上本机账本，他人的新占用看不见，所以是下界。
       </div></div>
     </div>
     <div class="page" id="pageSync">
-      <div class="card" id="syncHubCard" style="display:none">
-        <div class="head"><span class="label">连自建服务器</span></div>
-        <div class="hint">推荐这条：账本与账号额度都汇总在自己的服务器上，各机秒级同步，
-        口径只算一遍。地址已预填，只要粘一个 token（在服务器的
-        <code>/var/lib/miraquota-hub/config.json</code> 里）。<br>
-        接上之后就不再走 GitHub 仓与收件口——那两条是没有服务器时的替代品。</div>
-        <div class="cfg"><span class="k">地址</span><input id="hubUrl" class="wide" autocomplete="off"></div>
-        <div class="cfg"><span class="k">token</span><input id="hubToken" type="password" class="wide" autocomplete="off"></div>
-        <div class="cfg"><span class="k"></span><button id="btnHub">连上并开始上传</button></div>
-        <div class="cfg-note" id="hubNote"></div>
-      </div>
       <div class="card" id="syncLoginCard" style="display:none">
-        <div class="head"><span class="label">加入多机统计（没有服务器时）</span></div>
-        <div class="hint">共用这份额度的人各自登录后，这里就能看到「谁花了多少」。没有 GitHub 也行：
+        <div class="head"><span class="label">加入多机统计</span></div>
+        <!-- sync.json 还配着已下线的通道时说一句，别让人以为是这台机器坏了 -->
+        <div class="detail" id="syncRetired" style="display:none;margin:8px 0 0"></div>
+        <div class="hint">共用这份额度的人各自登录后，这里就能看到「谁花了多少」。只合并账本、速度与明细——
+        账号额度不走这里，它由本机 Mirasim 与 fleet-dao（「账号池」页）读。没有 GitHub 也行：
         名字自己起、口令自己定，第一次要一个邀请码（找额度的主人要）。只上传每次调用的时间、模型、token 数。<br>
         <b>国内网络需开代理</b>：收件口在 workers.dev，实测直连被 DNS 投毒（2026-09-03 用户拍板暂不绑自有域名）。</div>
         <div class="cfg"><span class="k">名字</span><input id="loginAccount" placeholder="fxc" maxlength="24" autocomplete="off"></div>
@@ -355,8 +348,8 @@
           <b>以及各机账本自己的时差漏记</b>（relay 每 3 分钟回填 token，分片最多落后一轮）。独用时残差约 3%，
           明显超出才说明有人在共用。官方接口只给账号级总数，这是能做到的最细粒度。<br>
           <b>「未定价」</b>——经 relay 扣了点、但价目表没有的模型，只能记 token；口径页会提前点名已启用却无价的模型。<br>
-          <b>怎么同步的</b>：每台机器只写自己的 <code>machine/&lt;机器名&gt;</code> 分支，单提交覆盖不留历史；
-          读他机只取远程分支内容，不动本机工作区。
+          <b>怎么同步的</b>：每台机器把自己那份分片推给收件口（一台一份，整份覆盖不留历史）；
+          读他机是一次 GET，不动本机任何文件。
         </div>
       </div>
     </div>
@@ -387,6 +380,11 @@
   paintThemeBtn();
 
   const WINDOW_NAME = { '5h': '5 小时', '7d': '7 天', '7d_fable': '7 天 · Fable' };
+  // sync.json 还配着已下线的通道时，登录卡顶上那句（engine 在 syncLogin.retired 里给通道名）
+  const RETIRED_CHANNEL = {
+    hub: '这台机器原来接的是自建服务器（hub），那条通道已下线：账号额度改由 fleet-dao 统一读（去「账号池」页接上）；要继续合并多机账本，在下面用收件口登录。',
+    git: '这台机器原来走的是 GitHub 仓（git 通道），那条通道已退役；要合并多机账本，在下面用收件口登录。',
+  };
   const CONF = { none: '无样本', low: '标定中', medium: '收敛中', high: '高置信' };
   // 官方基准单价：额度点 ÷ 100 = 美元（560000→5600、156800→1568，官方三个窗口都整除）。
   // 只当对表参照用，实际显示的美元一律由本机账本反推——写死会掩盖账本自己的漏计。
@@ -708,11 +706,7 @@
     const st = $('state');
     st.textContent = p.stateLabel ?? '—';
     st.className = 'badge ' + (p.state ?? '');
-    // 数据来自服务器时说一句：本机 Mirasim 没开却显示精确值，不说明来源会被当成出错了
-    const via = p.fromHub
-      ? `服务器汇总 · ${p.fromHub.machines} 台机器${p.fromHub.ageSeconds > 90 ? ` · ${Math.round(p.fromHub.ageSeconds)} 秒前` : ''}`
-      : '';
-    $('detail').textContent = [p.detail, via].filter(Boolean).join('　·　');
+    $('detail').textContent = p.detail ?? '';
 
     const ws = p.windows ?? [];
     $('cards').innerHTML = ws.length
@@ -729,16 +723,10 @@
 
     // 速度视角：本机 + 每台随分片上报了速度的外机（v0.9.27）。
     // 只有这张卡跟着切——额度点是账号级的，那三张卡在哪台机器看都是同一个数；
-    // 机器级的问题只有一个：那台机器在跑什么模型、多快。
-    // 他机那份优先取**服务器**的（p.hub，随 SSE 实时推过来）；没有服务器时才退回本机
-    // 缓存的分片（p.sync，每 intervalSec 才拉一次，两层滞后叠起来能到二十分钟）。
-    // 服务器不认得「哪台是我」——它只收分片，自己那台靠本机 sync 里的 installId 认出来。
-    const selfKey = (p.sync?.machines ?? []).find((m) => m.self)?.key ?? null;
-    const foreign = p.hub?.machines?.length
-      ? p.hub.machines.filter((m) => m.key !== selfKey && m.speed?.rows?.length)
-        .map((m) => ({ key: m.key, label: m.id, speed: m.speed, at: m.generatedAt }))
-      : (p.sync?.machines ?? []).filter((m) => !m.self && m.speed?.rows?.length)
-        .map((m) => ({ key: m.key ?? m.id, label: m.id, speed: m.speed, at: m.lastShardSec }));
+    // 机器级的问题只有一个：那台机器在跑什么模型、多快。他机那份是本机缓存的分片，
+    // 每 intervalSec 才拉一次，所以卡头写明「N 分钟前的快照」。
+    const foreign = (p.sync?.machines ?? []).filter((m) => !m.self && m.speed?.rows?.length)
+      .map((m) => ({ key: m.key ?? m.id, label: m.id, speed: m.speed, at: m.lastShardSec }));
     const speedSources = [{ key: '', label: '本机', speed: p.speed, at: null }, ...foreign];
     // 那台机器离场了就回本机，不留一张永远不再更新的空卡
     if (!speedSources.some((s) => s.key === speedView)) speedView = '';
@@ -811,13 +799,14 @@
     if (!sy && !canLogin && $('pageSync').classList.contains('on')) switchTab('main');
     // 没同步 ⇒ 只给登录卡；有同步 ⇒ 状态卡 + 说明卡
     $('syncLoginCard').style.display = canLogin ? '' : 'none';
-    $('syncHubCard').style.display = canLogin ? '' : 'none';
     $('syncStatusCard').style.display = sy ? '' : 'none';
     $('syncBasisCard').style.display = sy ? '' : 'none';
     if (canLogin) {
       restoreTab(); tabRestored = true;
       if (!$('loginInbox').value) $('loginInbox').value = p.syncLogin.inbox ?? '';
-      if (!$('hubUrl').value) $('hubUrl').value = p.syncLogin.hub ?? '';
+      const retired = RETIRED_CHANNEL[p.syncLogin.retired] ?? '';
+      $('syncRetired').style.display = retired ? '' : 'none';
+      $('syncRetired').textContent = retired;
     }
     if (sy) {
       restoreTab();       // 上次停在多机页：这一刻才知道它可用，补一次恢复
@@ -825,7 +814,7 @@
       const stEl = $('syncState');
       stEl.className = 'sync-state ' + sy.state;
       stEl.innerHTML = '● ' + (
-        sy.state === 'ok' ? (sy.mode === 'inbox' ? `收件口已接入 · ${esc(sy.account ?? '')}` : 'GitHub 已接入')
+        sy.state === 'ok' ? `收件口已接入 · ${esc(sy.account ?? '')}`
           : sy.state === 'error' ? '同步失败：' + esc(sy.errorHint ?? sy.error ?? '')
           : sy.state === 'warn' ? (sy.pushOk ? '本机已上传，读取他机失败' : '同步重试中')
           : '连接中…');
@@ -866,7 +855,7 @@
       $('syncMachines').innerHTML = [...groups.entries()].map(([g, ms]) => {
         const sum = ms.reduce((a, m) => { const u = useOf(m.key ?? m.id); return u ? { p: a.p + u.points, u: a.u + u.usd } : a; }, { p: 0, u: 0 });
         const head = hasAccounts
-          ? `<div class="sync-group">${g ? esc(g) : '额度主人（GitHub 直连）'}${sum.p > 0 ? `<span class="use">${amount(sum.p, sum.u)}</span>` : ''}</div>`
+          ? `<div class="sync-group">${g ? esc(g) : '没报名字的机器'}${sum.p > 0 ? `<span class="use">${amount(sum.p, sum.u)}</span>` : ''}</div>`
           : '';
         return head + ms.map((m) => machineRow(m, hasAccounts)).join('');
       }).join('')
@@ -882,10 +871,8 @@
       const basis = [`每 ${Math.round((sy.intervalSec ?? 600) / 60)} 分钟同步一轮`,
         `他机时间取自本机最近一轮读到的分片，最多落后一轮（${Math.round((sy.intervalSec ?? 600) / 60)} 分钟）`];
       if (sy.lastSyncSec) basis.push(`上次完整成功 ${ago(sy.lastSyncSec)}`);
-      // 收件口登录的机器要把「怎么接上的」和「怎么关掉」一起说清楚。
-      basis.push(sy.mode === 'inbox'
-        ? `以「${esc(sy.account ?? '')}」登录收件口 <code>${esc(sy.inbox ?? '')}</code> · 配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即退出）`
-        : '配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即完全关闭）');
+      // 要把「怎么接上的」和「怎么关掉」一起说清楚。
+      basis.push(`以「${esc(sy.account ?? '')}」登录收件口 <code>${esc(sy.inbox ?? '')}</code> · 配置在 <code>~/.miraquota/sync.json</code>（删掉该文件即退出）`);
       $('syncBasis').innerHTML = basis.join(' · ');
     }
 
@@ -1081,16 +1068,6 @@
     tip.textContent = ok ? '已保存' : '没存上（值要在 0.1–10 之间）';
     $('fableMeasured').replaceChildren(tip);
     if (ok) cfgReady = false;   // 下一帧用落盘后的真值回填，确保显示的就是生效的
-  };
-
-  // 连自建服务器：探通 /health 再验 token，都过了才写配置（错在哪一步说哪一步）
-  $('btnHub').onclick = async () => {
-    const note = $('hubNote');
-    note.textContent = '正在连接服务器…';
-    const r = await window.miraquota.syncHub?.({ hub: $('hubUrl').value.trim(), token: $('hubToken').value.trim() })
-      .catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
-    if (r?.ok) { note.textContent = '已接上，开始上传。'; $('hubToken').value = ''; }
-    else note.textContent = r?.error ?? '没成功';
   };
 
   // 多机页登录：先试名字+口令；名字没注册时才要邀请码（第二次点才带上）

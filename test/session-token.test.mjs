@@ -33,8 +33,9 @@ test('尾部斜杠削掉——engine 拼 /v1/limits 时不许出现双斜杠', (
 
 test('不是会话进程：没有 BASE_URL，或指向的不是回环', () => {
   assert.equal(parseSessionEnv(`PATH=/usr/bin${NUL}HOME=/root`), null);
-  // 服务器上真实存在这样一个进程（reclaude 直连 hub 域名），不该被当成会话进程
-  assert.equal(parseSessionEnv('ANTHROPIC_BASE_URL=https://156.224.28.95.sslip.io'), null);
+  // 服务器上真实存在这样一个进程（reclaude 直连一个公网域名），不该被当成会话进程。
+  // 样本用文档保留地址（203.0.113.0/24）：公开仓不放真实服务器 IP。
+  assert.equal(parseSessionEnv('ANTHROPIC_BASE_URL=https://203.0.113.10.sslip.io'), null);
 });
 
 test('回环但既没路径也没头令牌：拿不到令牌等于没发现', () => {

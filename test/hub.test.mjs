@@ -1,6 +1,9 @@
 /**
- * Hub：账本与账号额度的唯一真相。测的是「服务端算出来的和本机算出来的是同一个数」，
+ * Hub 服务端（server/）。测的是「服务端算出来的和本机算出来的是同一个数」，
  * 以及三条硬边界——token 挡得住写、IP 不当身份、旧额度不覆盖新额度。
+ *
+ * 客户端那一路 2026-09-24 已下线（多机额度改由 fleet-dao 统一读）；服务端还在跑，接着停服前
+ * 没升级的老版本客户端。停服那一步把 server/、scripts/deploy-hub.mjs 与这个文件一起删。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -161,48 +164,6 @@ test('the store forgets machines that stopped reporting', () => {
   store.putShard(shardV1('here', 'eeeeeeeeeeeeeeee', 1));
   const rows = store.shards(NOW);
   assert.deepEqual(rows.map((r) => r.shard.machineId), ['here'], '超过保留期的分片读时即清');
-});
-
-test('a real client pushes over HTTP and reads the others back', async () => {
-  const { CostLedger, STATE_SCHEMA } = await import('../provider/lib/ledger.mjs');
-  const { LedgerSync } = await import('../provider/lib/ledger-sync.mjs');
-  const { writeFileSync } = await import('node:fs');
-
-  const hub = new Hub({ dataDir: join(tmp, 'rt'), token: 'sekrit' });
-  const srv = await hub.listen(0);
-  const base = `http://127.0.0.1:${srv.address().port}`;
-
-  const client = (name, installId, usd) => {
-    const cfg = join(tmp, `${name}-sync.json`);
-    writeFileSync(cfg, JSON.stringify({ hub: base, token: 'sekrit', intervalSec: 600 }));
-    const led = join(tmp, `${name}-led.json`);
-    writeFileSync(led, JSON.stringify({ schemaVersion: STATE_SCHEMA, buckets: { [MIN]: usd } }));
-    return {
-      sync: new LedgerSync({ configFile: cfg, repoDir: join(tmp, `${name}-repo`), machineId: name, installId, cacheFile: join(tmp, `${name}-cache.json`) }),
-      ledger: new CostLedger({}, led),
-    };
-  };
-
-  const a = client('win-box', 'aaaaaaaaaaaaaaaa', 4);
-  const b = client('mac-box', 'bbbbbbbbbbbbbbbb', 6);
-  assert.equal(a.sync.mode, 'hub', '配了 hub 就走 hub，不再碰 git 仓');
-
-  await b.sync.run(b.ledger, NOW);
-  const ra = await a.sync.run(a.ledger, NOW + 1);
-  assert.equal(ra.state, 'ok');
-  assert.equal(ra.hub, base);
-  assert.deepEqual(ra.shards.map((s) => s.machineId), ['mac-box'], '读回他机、剔掉自己');
-
-  // 跑着 Mirasim 的那台把账号额度也送上去
-  assert.equal(await a.sync.pushLimits(LIMITS), true);
-  const p = await (await fetch(`${base}/payload`)).json();
-  assert.equal(p.windows.find((x) => x.label === '7d').points.used, 100_000);
-  assert.ok(Math.abs(p.windows.find((x) => x.label === '7d').spentUSD - 10) < 1e-9, '4 + 6 两台合并');
-  assert.equal(p.hub.limitsFrom, 'win-box');
-
-  // git 通道那两个目录一个都不该建出来——hub 模式零本地仓
-  assert.equal(existsSync(join(tmp, 'win-box-repo')), false);
-  await hub.close();
 });
 
 test('a restarted hub answers from disk before anyone pushes again', async () => {

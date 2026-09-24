@@ -5,11 +5,11 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { fakeInbox } from './helpers/inbox-fixture.mjs';
 import { validateShard, validateJournal, branchFor, hashPassphrase, verifyPassphrase, ACCOUNT_RE } from '../inbox/shared.mjs';
 import { LedgerSync, DEFAULT_INBOX, readInstallId } from '../provider/lib/ledger-sync.mjs';
 import { Engine } from '../provider/lib/engine.mjs';
@@ -46,58 +46,6 @@ test('install id is generated once and reused', () => {
   writeFileSync(f, 'garbage');
   assert.notEqual(readInstallId(f), a, '文件坏了就重生成，不承载账目所以无妨');
 });
-
-/** 冒充 Worker：内存账号表、内存分片表、内存流水表，语义与 inbox/worker.mjs 一致。 */
-function fakeInbox({ invite = 'code' } = {}) {
-  const accounts = new Map();
-  const shards = new Map();
-  const journals = new Map();
-  const log = [];
-  const server = createServer(async (req, res) => {
-    const chunks = [];
-    for await (const c of req) chunks.push(c);
-    const text = Buffer.concat(chunks).toString('utf8');
-    const body = text ? JSON.parse(text) : null;
-    const send = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(obj == null ? '' : JSON.stringify(obj)); };
-    log.push(`${req.method} ${req.url}`);
-    if (req.method === 'POST' && req.url === '/register') {
-      if (body.invite !== invite) return send(403, { error: '邀请码不对' });
-      if (accounts.has(body.account)) return send(409, { error: '这个名字已经有人用了，换一个' });
-      accounts.set(body.account, body.passphrase);
-      return send(201, { ok: true });
-    }
-    if (req.method === 'POST' && req.url === '/login') {
-      return accounts.get(body.account) === body.passphrase ? send(204) : send(401, { error: '名字或口令不对' });
-    }
-    if (req.method === 'PUT' && req.url === '/shard') {
-      const acct = req.headers['x-account'];
-      if (accounts.get(acct) !== req.headers['x-passphrase']) return send(401, { error: '名字或口令不对' });
-      const why = validateShard(body, acct);
-      if (why) return send(400, { error: why });
-      shards.set(branchFor(acct, body.installId), body);
-      return send(204);
-    }
-    if (req.method === 'GET' && req.url === '/shards') return send(200, [...shards.values()]);
-    // 流水明细：同一套鉴权；GET 只回**本账号**的（明细里有会话 id 与工作区路径）
-    if (req.method === 'PUT' && req.url === '/journal') {
-      const acct = req.headers['x-account'];
-      if (accounts.get(acct) !== req.headers['x-passphrase']) return send(401, { error: '名字或口令不对' });
-      const why = validateJournal(body);
-      if (why) return send(400, { error: why });
-      journals.set(`${acct}--${body.installId.slice(0, 12)}`, { ...body, account: acct });
-      return send(204);
-    }
-    if (req.method === 'GET' && req.url === '/journals') {
-      const acct = req.headers['x-account'];
-      if (accounts.get(acct) !== req.headers['x-passphrase']) return send(401, { error: '名字或口令不对' });
-      return send(200, [...journals.values()].filter((j) => j.account === acct));
-    }
-    send(404, { error: 'no such endpoint' });
-  });
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
-    resolve({ url: `http://127.0.0.1:${server.address().port}`, accounts, shards, journals, log, close: () => server.close() });
-  }));
-}
 
 const pricedLedger = (name, data = {}) => {
   const file = join(tmp, `${name}-ledger.json`);
@@ -202,14 +150,14 @@ test('the default inbox is a real https url and the login card only shows when s
   assert.ok(renderer.includes("$('syncLoginCard').style.display = canLogin ? '' : 'none';"));
   assert.match(renderer, /window\.miraquota\.syncLogin\?\./);
   const engine = readFileSync(new URL('../provider/lib/engine.mjs', import.meta.url), 'utf8');
-  // 同一张卡上还有自建服务器那条（推荐路径），两个地址一起预填
-  assert.ok(engine.includes("...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX, hub: DEFAULT_HUB } } : {}),"));
+  assert.match(engine, /syncLogin: \{ inbox: DEFAULT_INBOX,/);
   const preload = readFileSync(new URL('../app/preload.cjs', import.meta.url), 'utf8');
   assert.match(preload, /syncLogin: \(opts\) => ipcRenderer\.invoke\('sync:login', opts\)/);
-  assert.match(preload, /syncHub: \(opts\) => ipcRenderer\.invoke\('sync:hub', opts\)/);
-  assert.match(renderer, /id="syncHubCard"/);
-  assert.match(renderer, /id="btnHub"/);
-  assert.ok(renderer.includes("$('syncHubCard').style.display = canLogin ? '' : 'none';"));
+  // hub 通道 2026-09-24 下线：「连自建服务器」那张卡、它的桥和预填地址一个都不许留
+  // （留着卡，用户照着填了只会得到一个永远连不上的通道）。
+  assert.doesNotMatch(preload, /sync:hub|syncHub/);
+  assert.doesNotMatch(renderer, /syncHubCard|btnHub|hubUrl/);
+  assert.doesNotMatch(engine, /DEFAULT_HUB/);
 });
 
 test('an inbox machine reads its own cache on cold start, and a dead inbox costs it nothing', async () => {
@@ -228,14 +176,14 @@ test('an inbox machine reads its own cache on cold start, and a dead inbox costs
     writeFileSync(join(tmp, 'owner-cache.json'), JSON.stringify([...box.shards.values()]));
     // 配置文件要在构造**之前**写好：构造时就 #loadConfig 定模式，晚写等于没配
     writeFileSync(join(tmp, 'owner-sync.json'), JSON.stringify({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', intervalSec: 600 }));
-    const owner = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache.json'), inboxUrl: box.url });
+    const owner = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache.json') });
     assert.equal(owner.mode, 'inbox');
     const got = await owner.loadCachedShards();
     assert.deepEqual(got.map((s) => [s.machineId, s.account]), [['laptop', 'fxc']]);
     // 本机那行也带 account：收件口模式下身份就是「登录的那个名字」（git 通道下它是 null）
     assert.deepEqual(owner.status().machines.map((m) => [m.id, m.account, m.self]), [['desk', 'fxc', true], ['laptop', 'fxc', false]]);
     // 收件口挂了：冷启动只读缓存，不抛；没缓存就是空
-    const dead = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache2.json'), inboxUrl: 'http://127.0.0.1:9' });
+    const dead = new LedgerSync({ configFile: join(tmp, 'owner-sync.json'), machineId: 'desk', installId: 'eeee0000eeee0000', cacheFile: join(tmp, 'owner-cache2.json') });
     assert.deepEqual(await dead.loadCachedShards(), []);
   } finally { box.close(); }
 });
@@ -302,7 +250,7 @@ test('an inbox-mode engine actually pushes its journal on poll', async () => {
     writeFileSync(led, JSON.stringify({ schemaVersion: STATE_SCHEMA }));
     const s = new LedgerSync({
       configFile: cfg, machineId: 'laptop', installId: 'cccc0000cccc0000',
-      cacheFile: join(tmp, 'eng-inbox-cache.json'), inboxUrl: box.url,
+      cacheFile: join(tmp, 'eng-inbox-cache.json'),
     });
     assert.equal((await s.login({ inbox: box.url, account: 'fxc', passphrase: 'pass-fxc', invite: 'code' })).ok, true);
 
@@ -316,7 +264,7 @@ test('an inbox-mode engine actually pushes its journal on poll', async () => {
       calibratorFile: join(tmp, 'eng-inbox-cal.json'),
       syncOpts: {
         configFile: cfg, machineId: 'laptop', installId: 'cccc0000cccc0000',
-        cacheFile: join(tmp, 'eng-inbox-cache.json'), inboxUrl: box.url,
+        cacheFile: join(tmp, 'eng-inbox-cache.json'),
       },
     });
     assert.equal(engine.sync.mode, 'inbox');

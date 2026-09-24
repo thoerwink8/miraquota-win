@@ -11,8 +11,8 @@
  * 而收件口只要「名字 + 口令 + 一次性邀请码」（见 inbox/README.md）。口令是脚本随机生成的，
  * 落在那台机器的 ~/.miraquota/sync.json 里，本机不留副本——要用时去那台机器看。
  *
- * 幂等：重复跑只更新代码并重启服务；已有的 sync.json 一律不动（不会把机器改名、换口令，
- * 也不会把它从 hub 通道换成 git 通道——要换得显式给 --reset-sync）。
+ * 幂等：重复跑只更新代码并重启服务；已有的 sync.json 一律不动（不会把机器改名、换口令——
+ * 要换得显式给 --reset-sync）。账号额度不归这台机器管：它由 fleet-dao 统一读。
  */
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -34,15 +34,13 @@ if (flag('help') || !opt('host')) {
 
   --host <目标>       必填。要能免密 ssh 上去（~/.ssh/config 里的别名最省事）
   --dir <路径>        代码落点，默认 /opt/miraquota
-  --hub <地址>        走自建服务器通道（**推荐**）：配 ${'`'}{"hub":…,"token":…}${'`'} 写进那台机器的 sync.json
-  --token <令牌>      --hub 用的共享令牌（去 hub 那台机器的 <data>/config.json 里看）
-  --via-inbox         走收件口通道（没有自建服务器时用）：--account <名字> / --invite <码> / --inbox <地址>
+  --via-inbox         走收件口通道：--account <名字> / --invite <码> / --inbox <地址>
   --reset-sync        已有 sync.json 时也覆盖。默认**不动**它——盖掉会把那台机器从现有面板上踢下来
   --uninstall         停掉并删除那台机器上的服务与代码（sync.json 保留）
 
-不带通道参数时：已有 sync.json 就原样保留；没有的话只装服务并提示你选一条通道
-（不猜）。收件口通道要求**看面板的那台机器**能连上
-workers.dev，国内直连不通（见 docs/MULTI-MACHINE.md），所以自建 hub 才是首选。`);
+不带通道参数时：已有 sync.json 就原样保留；没有的话只装服务并提示（不猜）。
+收件口通道要求**看面板的那台机器**能连上 workers.dev，国内直连不通（见 docs/MULTI-MACHINE.md）。
+hub 通道 2026-09-24 下线：还配着 hub 的机器用 --reset-sync --via-inbox 换过来。`);
   process.exit(opt('host') ? 0 : 1);
 }
 
@@ -50,12 +48,6 @@ const HOST = opt('host');
 const DIR = opt('dir', '/opt/miraquota');
 const SSH = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=25'];
 const say = (m) => console.log(m);
-
-/** 本机命令（gh 等）。 */
-const run = (cmd, args) => new Promise((resolve, reject) => {
-  execFile(cmd, args, { maxBuffer: 16 << 20, windowsHide: true },
-    (err, stdout, stderr) => err ? reject(new Error(String(stderr || err).trim())) : resolve(String(stdout)));
-});
 
 /** 远端执行一段 sh：脚本走 stdin，省掉一层引号转义。 */
 function remote(script) {
@@ -117,30 +109,17 @@ await new Promise((resolve, reject) => {
 say(`代码已同步到 ${HOST}:${DIR}/provider`);
 
 /* ---------------- 3. 同步通道 ----------------
- * 优先级：已有 sync.json 不动 → --hub（推荐）→ --via-inbox。
- * git 通道 2026-09-23 退役并删掉了（用户：「不要存 Github，占项目大小和烧 cpu」——实测每台机器
- * 每 10 分钟要提交 333 KB ≈ 47 MB/天，还要一把 gh 装的部署密钥）。没有通道参数时只装服务并提示。
+ * 优先级：已有 sync.json 不动 → --via-inbox。没有通道参数时只装服务并提示。
+ * 退役的两条：git 通道 2026-09-23（用户：「不要存 Github，占项目大小和烧 cpu」——实测每台机器
+ * 每 10 分钟要提交 333 KB ≈ 47 MB/天）；hub 通道 2026-09-24（多机额度改由 fleet-dao 统一读）。
+ * --reset-sync 必须能把已有配置换掉：从前 via-inbox 还挂着 `!hasSync`，于是
+ * `--reset-sync --via-inbox` 落到「未配置」那条、什么都没换——从 hub 换过来的机器正要走这条。
  */
 const keepSync = hasSync && !flag('reset-sync');
-const wantHub = !!opt('hub');
 
 if (keepSync) {
-  say(`同步配置已有（保持不动）：${HOST}:~/.miraquota/sync.json。要换通道加 --reset-sync 并给出 --hub / --via-inbox`);
-} else if (wantHub) {
-  const hub = String(opt('hub')).replace(/\/+$/, '');
-  const token = opt('token');
-  if (!token) { console.error('--hub 要配 --token（去 hub 那台机器的 <data>/config.json 里看）'); process.exit(1); }
-  await remote(`set -e
-mkdir -p "$HOME/.miraquota"
-cat > "$HOME/.miraquota/sync.json" <<JSON
-{
-  "hub": "${hub}",
-  "token": "${token}",
-  "intervalSec": 600
-}
-JSON`);
-  say(`同步配置：自建服务器 → ${hub}`);
-} else if (flag('via-inbox') && !hasSync) {
+  say(`同步配置已有（保持不动）：${HOST}:~/.miraquota/sync.json。要换通道加 --reset-sync --via-inbox`);
+} else if (flag('via-inbox')) {
   let admin = {};
   try { admin = JSON.parse(readFileSync(ADMIN_FILE, 'utf8')); } catch { /* 下面统一报错 */ }
   const inbox = opt('inbox', admin.inbox);
@@ -176,10 +155,11 @@ console.log(how);
 '`);
   say(`收件口${out.includes('REGISTER') ? '已注册' : '已登录'}：${account} · 口令在 ${HOST}:~/.miraquota/sync.json`);
 } else {
-  // 没给通道参数、那台机器也没有 sync.json：只装服务，不猜也不去 GitHub 装密钥。
-  say(`同步通道未配置：${HOST} 上还没有 ~/.miraquota/sync.json。`);
-  say(`  推荐：node scripts/deploy-linux.mjs --host ${HOST} --hub <地址> --token <令牌>`);
-  say('  没有自建服务器就用 --via-inbox（需要看面板的机器能连 workers.dev）。');
+  // 没给通道参数：只装服务，不猜也不去 GitHub 装密钥。
+  say(hasSync
+    ? `--reset-sync 要配 --via-inbox 才知道换成什么；${HOST}:~/.miraquota/sync.json 没动。`
+    : `同步通道未配置：${HOST} 上还没有 ~/.miraquota/sync.json。`);
+  say(`  用收件口：node scripts/deploy-linux.mjs --host ${HOST} --via-inbox（需要看面板的机器能连 workers.dev）`);
   say('  服务照常起来，只是不上报；补上 sync.json 后下一轮就会开始发。');
 }
 

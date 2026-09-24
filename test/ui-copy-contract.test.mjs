@@ -89,7 +89,8 @@ test('multi-machine detail lives in its own tab, never in the overview cards', (
 test('sync state copy keeps red for real trouble and shows the raw reason next to the plain one', () => {
   // 四态四色：绿=已接入、黄=中间态（本机已上传 / 抖动重试）、红=要处置、灰=连接中
   assert.match(renderer, /\.sync-state\.warn \{ color: var\(--warn\); \}/);
-  assert.match(renderer, /'GitHub 已接入'/);
+  assert.match(renderer, /`收件口已接入 · \$\{esc\(sy\.account \?\? ''\)\}`/);
+  assert.doesNotMatch(renderer, /GitHub 已接入|GitHub 直连/, 'git 通道早退役了，别再拿它当状态名');
   assert.match(renderer, /'同步失败：' \+ esc\(sy\.errorHint \?\? sy\.error \?\? ''\)/);
   assert.match(renderer, /'本机已上传，读取他机失败' : '同步重试中'/);
   assert.match(renderer, /'连接中…'/);

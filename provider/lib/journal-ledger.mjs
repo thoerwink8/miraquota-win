@@ -113,10 +113,10 @@ export class JournalLedger {
     this.store.prune({ keepDetailDays: RETENTION_DAYS });
   }
 
-  // MARK: 流水增量（hub 通道：账号级对账与任务报表要明细，不能只有聚合分片）
+  // MARK: 流水增量（推给收件口：账号级对账与任务报表要明细，不能只有聚合分片）
 
   /**
-   * 推给 hub 用的水位：本机已经推上去的最大 ts。缺省（新库）返回 null，调用方从保留窗起点开始。
+   * 推流水用的水位：本机已经推上去的最大 ts。缺省（新库）返回 null，调用方从保留窗起点开始。
    * 存 meta 里，重启不丢——否则每次重启都把 8 天流水重推一遍（幂等，但白费带宽）。
    */
   journalWatermark() {
@@ -133,7 +133,7 @@ export class JournalLedger {
   /**
    * 取 `sinceSec` 之后的流水行，按 ts 升序、一批 `limit` 行。
    *
-   * 推的是**行**不是聚合：hub 那边因此能出全账号的任务级报表与逐点对账，而不只是三张卡的汇总数。
+   * 推的是**行**不是聚合：读的一方因此能出全账号的任务级报表与逐点对账，而不只是三张卡的汇总数。
    * 行里带 `kh`（账目键哈希的字符串形式）当去重身份——**必须 setReadBigInts**：63 位整数按
    * Number 读会抛 ERR_OUT_OF_RANGE（2026-09-23 实测）。
    */

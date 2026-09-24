@@ -125,7 +125,7 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
   读原始记录这条路没坏。
 - 快照的 `user_version` 比程序新时**拒绝打开**（`UsageStore` 构造时抛错），不猜、不降级读。
 
-## 传输：只留 hub
+## 传输：只留收件口
 
 `git 通道`（把分片提交进一个私有 GitHub 仓）**2026-09-23 已退役并删掉代码**，理由是可量化的：
 
@@ -133,9 +133,9 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
 - 它还要 `gh` 凭据（本机 `gh` 登录态失效时整条路就断了）；
 - 流水明细比聚合分片大得多，走 git 只会更糟。
 
-保留两条：**hub（HTTP，主力）** 与 **收件口（没有服务器的场景）**。hub 的 `PUT /journal`
-收流水明细，此后 hub 手里就是全账号的流水，任务级报表与逐点对账都在它上面出。
-配着老 git 配置的机器当「未配置」处理，启动日志说清怎么换（不静默失联）。
+**hub 通道客户端 2026-09-24 下线**：账号额度改由 fleet-dao 统一读（见 `docs/MULTI-MACHINE.md` 文末），
+服务端 `server/` 留到停服那一步再删。于是只剩**收件口**：`PUT /journal` 收流水明细，读的机器写进自己的库。
+配着老 git / hub 配置的机器当「未配置」处理，启动日志与多机页说清怎么换（不静默失联）。
 
 ## 契约（改动时按这张表自查）
 
@@ -177,7 +177,8 @@ node scripts/store-migrate.mjs --inspect /tmp/store.db     # ③ 校验快照（
   部署那条命令要人跑一次：`npx wrangler login` 之后 `node scripts/inbox-deploy.mjs`。
 
 **Phase 1–3 到此全部落地**：四个曾经各写一个 JSON 的状态（账本 / 标定 / 归因 / 锚点）都在
-`store.db` 里；两条 HTTP 通道都带明细；git 通道与 `gh` 依赖清零。
+`store.db` 里；两条 HTTP 通道都带明细；git 通道与 `gh` 依赖清零。2026-09-24 hub 客户端下线后，
+明细只走收件口；多机测试的夹具随之从 hub 换成假收件口（`test/helpers/inbox-fixture.mjs`）。
 
 ### 2026-09-23 上线时实咬的三处（都已修 + 都有测试）
 
