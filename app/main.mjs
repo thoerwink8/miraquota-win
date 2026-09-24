@@ -99,7 +99,8 @@ if (!app.requestSingleInstanceLock()) {
   function trayTooltip(p) {
     const parts = (p.windows ?? []).slice(0, 3).map((w) => {
       const mark = w.inferred ? '≈' : '';
-      const usd = w.scaledSpentUSD != null ? ` $${w.scaledSpentUSD.toFixed(1)}` : '';
+      // 推算档的美元也是推出来的：与百分比同挂 ≈（面板主行同一条规矩）
+      const usd = w.scaledSpentUSD != null ? ` ${mark}$${w.scaledSpentUSD.toFixed(1)}` : '';
       return `${w.label} ${mark}${w.usedPercent.toFixed(1)}%${usd}`;
     });
     return ['MiraQuota · ' + (p.stateLabel ?? ''), ...parts].join('\n');

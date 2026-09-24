@@ -429,7 +429,7 @@
   window.miraquota.getTheme?.().then((v) => { if (v) { theme = v; paintThemeBtn(); } }).catch(() => {});
   paintThemeBtn();
 
-  const WINDOW_NAME = { '5h': '5 小时', '7d': '7 天', '7d_fable': '7 天 · Fable' };
+  const WINDOW_NAME = { '5h': '5 小时', '7d': '7 天', '7d_fable': '7 天 · Fable', '7d_claude': '7 天 · Claude' };
   // sync.json 还配着已下线的通道时，登录卡顶上那句（engine 在 syncLogin.retired 里给通道名）
   const RETIRED_CHANNEL = {
     hub: '这台机器原来接的是自建服务器（hub），那条通道已下线：账号额度改由 fleet-dao 统一读（去「账号池」页接上）；要继续合并多机账本，在下面用收件口登录。',
@@ -597,10 +597,16 @@
       // 官方点数 × 汇率（= scaledSpentUSD），四个数从此是同一件事的四个面；
       // 账本那个数不丢，退到副行并**标明口径不同**（它是本机真实花费，不含账号级用量）。
       const officialUsed = w.scaledSpentUSD;
-      mainText = money(officialUsed ?? w.spentUSD ?? 0);
-      mainTitle = officialUsed != null
-        ? '账号级已用：官方额度点 × 汇率（÷100），与进度条、百分比、满额、余同一个来源'
-        : '本机账本实际花费：token × API 价直接求和（这一帧没有官方点数，只能给这个）';
+      // 推算档（w.inferred）的「账号级已用」是锚点加本机账本推出来的：主行挂 ≈，与百分比胶囊同一个标记。
+      // 不挂的话本机 Mirasim 一关，推算值就顶着「账号级已用」的名义冒充实读（2026-09-24 截图查到）。
+      // 退到本机账本那一支是实花的钱，不挂。
+      const approx = w.inferred && officialUsed != null ? '≈' : '';
+      mainText = approx + money(officialUsed ?? w.spentUSD ?? 0);
+      mainTitle = approx
+        ? '推算的账号级已用：最近一次读数（锚点）+ 此后的本机账本；锚点之后别人的占用看不见，是下界'
+        : officialUsed != null
+          ? '账号级已用：官方额度点 × 汇率（÷100），与进度条、百分比、满额、余同一个来源'
+          : '本机账本实际花费：token × API 价直接求和（这一帧没有官方点数，只能给这个）';
       fullText = w.fullUSD != null ? ` / <span class="tag">满额</span><b>${money(w.fullUSD, 0)}</b>` : ' / 满额标定中';
       const infer = [];
       if (w.remainingUSD != null) infer.push(`余 <b>${money(w.remainingUSD, 0)}</b>`);
@@ -617,7 +623,7 @@
       if (w.weightedSpentUSD != null && officialUsed == null) {
         subBits.push(`<span title="账本 ${money(w.spentUSD ?? 0)} 按档位倍率折算后的点数口径花费，与满额同口径">折算 <b>${money(w.weightedSpentUSD)}</b></span>`);
       }
-      if (elapsedDays >= 0.5) subBits.push(`日均 ${money((officialUsed ?? w.spentUSD ?? 0) / elapsedDays)}`);
+      if (elapsedDays >= 0.5) subBits.push(`日均 ${approx}${money((officialUsed ?? w.spentUSD ?? 0) / elapsedDays)}`);
     }
 
     return `<div class="card">

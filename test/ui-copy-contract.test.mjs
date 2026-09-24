@@ -123,13 +123,23 @@ test('速度卡每一行要带 5h 窗花费，且窗口口径只能有一个含�
   assert.match(widget, /row\.usd > 0 \? usd\(row\.usd\)/);
 });
 
+test('推算出来的美元也挂 ≈：本机 Mirasim 一关，推算值不许冒充实读', () => {
+  // 2026-09-24：推算档的百分比胶囊挂了 ≈，而主行美元（由同一个推算百分比乘出来）与日均没挂——
+  // 截图上一眼看去就是一个「账号级已用 $2855」的实数。桌面面板与托盘提示都要挂。
+  assert.match(renderer, /const approx = w\.inferred && officialUsed != null \? '≈' : '';/);
+  assert.match(renderer, /mainText = approx \+ money\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+  assert.match(renderer, /日均 \$\{approx\}/);
+  const main = readFileSync(new URL('../app/main.mjs', import.meta.url), 'utf8');
+  assert.match(main, /` \$\{mark\}\$\$\{w\.scaledSpentUSD\.toFixed\(1\)\}`/);
+});
+
 test('美元主行必须与进度条同源，账本数退到副行并标注', () => {
   // 2026-09-23 用户：「$256，但进度条和实际这么多」。根子是两个来源并排摆：
   // 进度条/百分比/满额/余都是**官方点数**算的，而主行是**本机账本**——用户只会读成「算错了」。
   // 钉住：主行 = 官方点数 × 汇率（scaledSpentUSD），账本数降到副行且写明口径不同。
   // 两个显示面（桌面面板 + 内嵌 widget）必须一致，不许一个讲一套。
   assert.match(renderer, /const officialUsed = w\.scaledSpentUSD;/);
-  assert.match(renderer, /mainText = money\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+  assert.match(renderer, /mainText = (?:approx \+ )?money\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
   assert.match(renderer, /本机账本 <b>/);
   assert.match(widget, /const officialUsed = w\.scaledSpentUSD;/);
   assert.match(widget, /usd\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
