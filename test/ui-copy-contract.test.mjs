@@ -193,3 +193,27 @@ test('the three dollar-trust alarms name the culprit and say what to do about it
   assert.match(engine, /sourceGaps: gaps\.slice/);
   assert.match(engine, /staleShards: stale/);
 });
+
+test('账号池页把 fleet-dao 的每个池 × 窗口都画出来，不是现值的都挂标记，令牌不进页面', () => {
+  // 2026-09-24：fleet-dao 的额度表成为唯一来源，MiraQuota 变成它的桌面窗口。
+  assert.match(renderer, /<button id="tabPools">账号池<\/button>/);
+  assert.match(renderer, /pools: \['tabPools', 'pagePools'\]/);
+  assert.match(renderer, /renderPools\(p\.fleet\)/);
+  assert.match(engine, /fleet: this\.fleet\.status\(\)/, '引擎每条 payload 路径都要给这一块');
+  // 三种「不是现值」各有一枚标记：估算、上游这次没报、过了有效期
+  assert.match(renderer, /chip est[^>]*>估算</);
+  assert.match(renderer, />上游这次没报</);
+  assert.match(renderer, /读数超过有效期/);
+  assert.match(renderer, /w\.resetsAt != null \? fmtReset\(w\.resetsAt\)/, '清零倒计时');
+  // 没读成要说原因，不许装成「没有池」；「上游明说 0 个池」另有一句
+  assert.match(renderer, /这次没读成：/);
+  assert.match(renderer, /这次没读到 fleet-dao：/);
+  assert.match(renderer, /fleet-dao 说它没有配置任何账号池/);
+  // 设置：地址 + 只读令牌（密码框）；令牌不回显、不进浏览器存储
+  assert.match(renderer, /id="fleetToken" type="password"/);
+  assert.match(renderer, /\$\('fleetToken'\)\.value = '';/);
+  assert.doesNotMatch(renderer, /localStorage\.setItem\([^)]*[Tt]oken/);
+  const preload = readFileSync(new URL('../app/preload.cjs', import.meta.url), 'utf8');
+  assert.match(preload, /fleetConnect: \(opts\) => ipcRenderer\.invoke\('fleet:connect', opts\)/);
+  assert.match(preload, /fleetDisconnect: \(\) => ipcRenderer\.invoke\('fleet:disconnect'\)/);
+});

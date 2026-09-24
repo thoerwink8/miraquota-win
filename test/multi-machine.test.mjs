@@ -40,6 +40,7 @@ const isolated = (name) => ({
   settingsFile: join(tmp, `${name}-settings.json`),
   attribFile: join(tmp, `${name}-attrib.json`),
   calibratorFile: join(tmp, `${name}-calibration.json`),
+  fleetOpts: { configFile: join(tmp, `${name}-no-fleet.json`) },   // 不读真机的 fleet.json，更不联网
 });
 
 /** 预置当前格式的聚合态账本；旧 schema 会被当成「双计过的旧账」清空重建，别拿它当预置。 */

@@ -262,6 +262,7 @@ test('an inbox-mode engine actually pushes its journal on poll', async () => {
       settingsFile: join(tmp, 'eng-inbox-set.json'),
       attribFile: join(tmp, 'eng-inbox-attrib.json'),
       calibratorFile: join(tmp, 'eng-inbox-cal.json'),
+      fleetOpts: { configFile: join(tmp, 'eng-inbox-no-fleet.json') },
       syncOpts: {
         configFile: cfg, machineId: 'laptop', installId: 'cccc0000cccc0000',
         cacheFile: join(tmp, 'eng-inbox-cache.json'),

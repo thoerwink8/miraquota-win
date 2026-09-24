@@ -140,7 +140,11 @@ if (!app.requestSingleInstanceLock()) {
   }
 
   app.whenReady().then(async () => {
-    engine = new Engine({ forceOffline: process.argv.includes('--offline') });
+    engine = new Engine({
+      forceOffline: process.argv.includes('--offline'),
+      // fleet-dao 一读完（成败都算）就重画，不等 5 秒心跳：接上、断网、恢复都立刻看得见
+      fleetOpts: { onUpdate: () => { try { pushFrame(); } catch { /* 窗口还没建好 */ } } },
+    });
     await engine.loadSpeed();
     applyTheme(readUI().theme);   // 建窗前定主题，避免首帧闪一下另一套配色
     createWindow();
@@ -158,6 +162,14 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.handle('sync:login', async (_e, opts) => {
       const r = await engine.loginSync(opts ?? {});
       if (r?.ok) await tick().catch(() => {});
+      return r;
+    });
+    // 接 fleet-dao：先按填的地址与只读令牌真读一次 /api/quota，读成了才写 ~/.miraquota/fleet.json。
+    // 返回值与 payload 里都没有令牌——它只进那个文件和请求头。
+    ipcMain.handle('fleet:connect', (_e, opts) => engine.fleet.connect(opts ?? {}));
+    ipcMain.handle('fleet:disconnect', () => {
+      const r = engine.fleet.disconnect();
+      try { pushFrame(); } catch { /* 窗口还没建好 */ }
       return r;
     });
     ipcMain.handle('theme:get', () => applyTheme(readUI().theme));

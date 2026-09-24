@@ -59,6 +59,7 @@
     background: var(--okbg); color: var(--ok);
   }
   .badge.stale, .badge.reckoned { background: var(--warnbg); color: var(--warn); }
+  .badge.fleet { background: var(--accentbg); color: var(--accent); }
   .badge.local, .badge.connecting { background: var(--badbg); color: var(--bad); }
   .titlebar .sp { flex: 1; }
   .tbtn {
@@ -100,6 +101,34 @@
   }
 
   .detail:empty { display: none; }
+  .detail.bad { color: var(--bad); background: var(--badbg); }
+
+  /* ---- 账号池页（fleet-dao）：一池一卡、一窗两行。池多时这一页可滚（滚动条藏起来，
+     其余页照旧「不出现滚动条」）——裁掉哪个池都是静默丢数，比多一条滚动轴糟得多。 ---- */
+  #pagePools.on { height: 100%; overflow-y: auto; scrollbar-width: none; }
+  #pagePools::-webkit-scrollbar { display: none; }
+  .pool-state { margin-left: auto; font-size: 10.5px; font-weight: 600; color: var(--ink3); white-space: nowrap; }
+  .pool-state.ok { color: var(--ok); }
+  .pool-state.warn { color: var(--warn); }
+  .pool-state.bad { color: var(--bad); }
+  .pw { margin-top: 7px; }
+  .pw-top { display: flex; align-items: baseline; gap: 6px; font-size: 11.5px; }
+  .pw-name { font-weight: 600; color: var(--ink); white-space: nowrap; }
+  .pw-val { margin-left: auto; color: var(--ink2); white-space: nowrap; }
+  .pw-pct { font-weight: 700; color: var(--accent); min-width: 46px; text-align: right; white-space: nowrap; }
+  .pw-bar { display: flex; align-items: center; gap: 8px; }
+  .pw-bar .bar { flex: 1; height: 4px; margin: 5px 0 2px; }
+  .pw-bar .r { font-size: 10.5px; color: var(--ink3); white-space: nowrap; }
+  .chip { font-size: 10px; font-weight: 600; padding: 0 6px; border-radius: 99px; white-space: nowrap;
+    background: var(--track); color: var(--ink2); }
+  .chip.est, .chip.stale, .chip.warn { background: var(--warnbg); color: var(--warn); }
+  .chip.bad { background: var(--badbg); color: var(--bad); }
+  .pool-why { font-size: 10.5px; color: var(--bad); margin-top: 4px; line-height: 1.5; }
+  .pool-note { font-size: 10.5px; color: var(--ink3); margin-top: 4px; line-height: 1.5; }
+  #fleetConnectCard .cfg { margin-top: 6px; }
+  #fleetConnectCard .cfg .k { flex: none; min-width: 56px; }
+  #fleetConnectCard input.wide { flex: 1; width: auto; min-width: 0; text-align: left; }
+  #fleetInfoCard .cfg .k { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .card {
     background: var(--card); border: .5px solid var(--cardbd); border-radius: 12px;
@@ -223,6 +252,7 @@
   .cfg button { flex: none; -webkit-app-region: no-drag; cursor: pointer; border: 0; border-radius: 6px;
     padding: 4px 10px; font: inherit; font-size: 11px; font-weight: 600;
     background: var(--accent); color: var(--bg); white-space: nowrap; }
+  .cfg button.ghost { background: var(--track); color: var(--ink2); }
   .cfg-note { font-size: 10.5px; color: var(--ink3); margin-top: 6px; line-height: 1.5; }
   .cfg-note .saved { color: var(--ok); font-weight: 600; }
 </style>
@@ -242,6 +272,7 @@
   <div class="bars">
     <div class="tabs" style="flex:1;margin:0 0 8px">
       <button id="tabMain" class="on">总览</button>
+      <button id="tabPools">账号池</button>
       <button id="tabSim">耗尽预演</button>
       <button id="tabSpec">口径说明</button>
       <!-- 多机页是运维态信息：payload 无 sync 字段（未配置）时连页签都不出现，界面零变化 -->
@@ -264,6 +295,25 @@
         <div class="inflight" id="inflight" style="display:none"></div>
       </div>
       <div class="foot" id="foot"></div>
+    </div>
+    <div class="page" id="pagePools">
+      <div class="card" id="fleetConnectCard" style="display:none">
+        <div class="head"><span class="label">接上 fleet-dao</span></div>
+        <div class="hint">fleet-dao 在服务器上统一读所有账号池（两个 Claude 组织、Mirasim、Cursor、Grok、Jev……），
+        这一页就是它的桌面窗口；本机 Mirasim 关着时，总览的额度卡也用它读到的那份。<br>
+        要一把<b>只读令牌</b>（只能读额度，别的都读不了）。地址和令牌存在本机
+        <code>~/.miraquota/fleet.json</code>，不进仓库、不上传。</div>
+        <div class="cfg"><span class="k">地址</span><input id="fleetUrl" class="wide" placeholder="https://…" autocomplete="off" spellcheck="false"></div>
+        <div class="cfg"><span class="k">只读令牌</span><input id="fleetToken" type="password" class="wide" autocomplete="off" spellcheck="false"></div>
+        <div class="cfg"><span class="k"></span><button id="btnFleet">连上</button></div>
+        <div class="cfg-note" id="fleetNote"></div>
+      </div>
+      <div class="detail" id="fleetProblem" style="display:none"></div>
+      <div id="pools"></div>
+      <div class="card" id="fleetInfoCard" style="display:none">
+        <div class="cfg"><span class="k" id="fleetInfo"></span><button id="btnFleetEdit" class="ghost">改</button><button id="btnFleetOff" class="ghost">断开</button></div>
+        <div class="cfg-note" id="fleetBasis"></div>
+      </div>
     </div>
     <div class="page" id="pageSim">
       <div class="card">
@@ -395,7 +445,7 @@
   // ---- 页签 ----
   const TAB_KEY = 'miraquota.tab';
   const TABS = {
-    main: ['tabMain', 'pageMain'], sim: ['tabSim', 'pageSim'],
+    main: ['tabMain', 'pageMain'], pools: ['tabPools', 'pagePools'], sim: ['tabSim', 'pageSim'],
     spec: ['tabSpec', 'pageSpec'], sync: ['tabSync', 'pageSync'],
   };
   // 多机页只在 payload 带 sync 字段时存在：页签隐藏之外，激活也要挡（记住的页签、页脚跳转都走这里）。
@@ -421,9 +471,10 @@
     } catch {}
   }
   for (const [k, [btn]] of Object.entries(TABS)) $(btn).onclick = () => { tabRestored = true; switchTab(k); };
-  // 页脚那行多机摘要点一下跳过去；foot 每秒重绘，所以挂委托而不是逐次挂 onclick。
+  // 页脚那行多机 / 账号池摘要点一下跳过去；foot 每秒重绘，所以挂委托而不是逐次挂 onclick。
   $('foot').onclick = (e) => {
     if (e.target.closest('#footSync')) { tabRestored = true; switchTab('sync'); }
+    if (e.target.closest('#footPools')) { tabRestored = true; switchTab('pools'); }
   };
   // 多机页那行的「速度 →」：切到那台机器的视角并回总览。同样挂委托——机器行每轮重绘。
   $('syncMachines').onclick = (e) => {
@@ -533,7 +584,9 @@
       mainText = Math.round(w.points.used).toLocaleString();
       fullText = ` / ${fmtK(w.points.budget)} 点`;
       remainText = `余 ${Math.round(w.points.budget - w.points.used).toLocaleString()} 点`;
-      mainTitle = '原始额度点，来自 Mirasim /v1/limits，账号级权威口径';
+      mainTitle = latest?.limitsFrom?.source === 'fleet'
+        ? `原始额度点，fleet-dao ${ago(latest.limitsFrom.readAt)}读到的（与本机 /v1/limits 同一个账号级计数器）`
+        : '原始额度点，来自 Mirasim /v1/limits，账号级权威口径';
       subBits = [`本机合计 ${money(w.spentUSD ?? 0)}`];
       if (elapsedDays >= 0.5) subBits.push(`日均 ${fmtK(w.points.used / elapsedDays)} 点`);
       if (w.scaledSpentUSD != null) subBits.push(`账号折算 ≈${money(w.scaledSpentUSD)}`);
@@ -876,8 +929,18 @@
       $('syncBasis').innerHTML = basis.join(' · ');
     }
 
+    renderPools(p.fleet);
+
     // 总览页脚只留一行现状；公式与免责全文在「口径说明」页，多机明细在「多机」页。
     const foot = [];
+    // 账号池一行摘要：有池没读成就红，点一下去「账号池」页看是哪个、为什么
+    const fl = p.fleet;
+    if (fl && fl.state !== 'off') {
+      const bad = (fl.pools ?? []).filter((x) => x.problem || x.lastAttempt?.ok === false).length;
+      const txt = !fl.pools ? (fl.state === 'error' ? 'fleet-dao 没读到' : 'fleet-dao 读取中')
+        : `账号池 ×${fl.pools.length}${bad ? ` · ${bad} 个没读成` : ''}${fl.state === 'error' ? ' · 这次没读到' : ''}`;
+      foot.push(`<span class="go${bad || fl.state === 'error' ? ' bad' : ''}" id="footPools">${txt} →</span>`);
+    }
     if (p.unitPriceUSD != null) foot.push(`单价 ${p.unitPriceUSD.toFixed(4)} $/点`);
     if (p.calibDropped > 0) foot.push(`已剔除他机观测 ${p.calibDropped} 段`);
     if (p.accountNotice) foot.push(p.accountNotice);
@@ -1068,6 +1131,142 @@
     tip.textContent = ok ? '已保存' : '没存上（值要在 0.1–10 之间）';
     $('fableMeasured').replaceChildren(tip);
     if (ok) cfgReady = false;   // 下一帧用落盘后的真值回填，确保显示的就是生效的
+  };
+
+  // ---- 账号池（fleet-dao 的桌面窗口）----
+  // 窗口名按归类（window + scope）给中文，认不出的类（other）照原名——上游新出的窗口也不丢。
+  const POOL_KIND = { '5h': '5 小时', '7d': '7 天', month_usd: '本月', period_usd: '本账期', points: '点数' };
+  function poolWindowName(w) {
+    if (w.window === '7d_model') return `7 天 · ${w.scope ?? w.label}`;
+    const base = POOL_KIND[w.window];
+    if (!base) return w.label;
+    return w.window === '5h' || w.window === '7d' ? base : `${base} · ${w.label}`;
+  }
+  const fmtUsd = (v) => (v >= 100 ? v.toFixed(0) : v >= 1 ? v.toFixed(2) : v.toFixed(3));
+  function poolValue(w) {
+    if (w.used == null) return '';
+    if (w.unit === 'usd') return `$${fmtUsd(w.used)}${w.limit != null ? ` / $${fmtUsd(w.limit)}` : ''}`;
+    if (w.unit === 'points') return `${fmtK(w.used)}${w.limit != null ? ` / ${fmtK(w.limit)}` : ''} 点`;
+    return '';   // percent：右边那个百分比就是它
+  }
+  const poolPct = (w) => (w.utilization != null ? w.utilization * 100
+    : w.used != null && w.limit > 0 ? w.used / w.limit * 100 : null);
+
+  /**
+   * 一个窗口两行：名字 + 标记 + 数 + 百分比；进度条 + 清零倒计时。
+   * 三种要看得出来的「不是现值」：估算（≈）、上游这次没报、读数过了有效期——各有一枚标记。
+   */
+  function poolWindowRow(w, staleAfter) {
+    const pct = poolPct(w);
+    const est = w.reading === 'estimated';
+    const chips = [];
+    if (est) chips.push('<span class="chip est" title="按用量记录估算，不是上游报的数">估算</span>');
+    if (!w.inLatestRead) {
+      chips.push(`<span class="chip stale" title="最近一次读取里上游没报这个窗口；数字是 ${ago(w.readAt)}那次的">上游这次没报</span>`);
+    } else if (staleAfter && Date.now() / 1000 - w.readAt > staleAfter) {
+      chips.push(`<span class="chip stale" title="读数超过有效期，不能当现值用">${ago(w.readAt)}读的</span>`);
+    }
+    if (w.upstreamStatus === 'limit_reached') chips.push('<span class="chip bad">已打满</span>');
+    else if (w.upstreamStatus === 'warning') chips.push('<span class="chip warn">告警</span>');
+    const hot = w.upstreamStatus === 'limit_reached' || w.upstreamStatus === 'warning' || (pct ?? 0) >= 80;
+    const mark = est ? '≈' : '';
+    const val = poolValue(w);
+    const title = [w.label, w.source, w.statusRaw].filter(Boolean).map(esc).join(' · ');
+    return `<div class="pw" title="${title}">
+      <div class="pw-top"><span class="pw-name">${esc(poolWindowName(w))}</span>${chips.join('')}
+        <span class="pw-val">${val ? mark + esc(val) : ''}</span>
+        <span class="pw-pct">${pct != null ? mark + pct.toFixed(1) + '%' : '—'}</span></div>
+      <div class="pw-bar"><div class="bar"><div class="fill${hot ? ' hot' : ''}" style="width:${Math.min(100, Math.max(0, pct ?? 0))}%"></div></div>
+        <span class="r">${w.resetsAt != null ? fmtReset(w.resetsAt) : ''}</span></div>
+    </div>`;
+  }
+
+  /** 一个池一张卡：头上一行「实读/估算 · 多久前」或「没读成」，失败原因原样写出来，不藏。 */
+  function poolCard(p, staleAfter) {
+    if (p.problem) {
+      return `<div class="card pool"><div class="head"><span class="label">${esc(p.name)}</span>
+        <span class="pool-state bad">格式认不出</span></div>
+        <div class="pool-why">回包里这个池认不出：${esc(p.problem)}</div></div>`;
+    }
+    const la = p.lastAttempt;
+    let state = '还没读过', cls = '';
+    if (la && !la.ok) {
+      state = p.lastSuccessAt != null ? `没读成 · ${ago(la.at)}` : '从没读到过';
+      cls = 'bad';
+    } else if (la || p.lastSuccessAt != null) {
+      const at = p.lastSuccessAt ?? la.at;
+      const allEst = p.windows.length > 0 && p.windows.every((w) => w.reading === 'estimated');
+      state = `${allEst ? '估算' : '实读'} · ${ago(at)}`;
+      cls = staleAfter && Date.now() / 1000 - at > staleAfter ? 'warn' : 'ok';
+    }
+    const why = la && !la.ok
+      ? `<div class="pool-why">这次没读成：${esc(la.error?.message ?? '')}${p.lastSuccessAt != null && p.windows.length
+        ? `；下面是 ${ago(p.lastSuccessAt)}那次的读数` : ''}</div>` : '';
+    const rows = p.windows.length ? p.windows.map((w) => poolWindowRow(w, staleAfter)).join('')
+      : (la?.ok ? '<div class="pool-note">上游说这个池没有额度窗口</div>' : '');
+    const extra = [
+      ...(p.problems ?? []).map((x) => `<div class="pool-why">回包里有一格认不出：${esc(x)}</div>`),
+      ...(p.notes ?? []).map((x) => `<div class="pool-note">${esc(x)}</div>`),
+      ...(p.subscription?.expiresAt != null
+        ? [`<div class="pool-note">${esc(p.subscription.plan ?? '套餐')} 付到 ${new Date(p.subscription.expiresAt * 1000).toLocaleDateString()}</div>`] : []),
+    ];
+    return `<div class="card pool"><div class="head"><span class="label">${esc(p.name)}</span>
+      <span class="pool-state ${cls}">${state}</span></div>${why}${rows}${extra.join('')}</div>`;
+  }
+
+  let fleetEditing = false;
+  function renderPools(f) {
+    const off = !f || f.state === 'off';
+    // 从没读成过（令牌不对、地址不对……）就直接把「接上」那张卡摆出来：这时要做的只有改设置
+    const neverRead = !off && f.state === 'error' && !f.pools;
+    $('fleetConnectCard').style.display = off || fleetEditing || neverRead ? '' : 'none';
+    if (neverRead && !$('fleetUrl').value) $('fleetUrl').value = f.url ?? '';
+    $('fleetInfoCard').style.display = off ? 'none' : '';
+    const prob = $('fleetProblem');
+    if (off) { $('pools').innerHTML = ''; prob.style.display = 'none'; return; }
+    // 这次没读到：有旧的就说「下面是多久前那份」，没有就只给原因——都不许装成「没有池」
+    prob.style.display = f.state === 'error' ? '' : 'none';
+    if (f.state === 'error') {
+      prob.className = 'detail bad';
+      prob.textContent = `这次没读到 fleet-dao：${f.error?.message ?? '原因不明'}`
+        + (f.fetchedAt ? `；下面是 ${ago(f.fetchedAt)}读到的那份` : '');
+    }
+    $('pools').innerHTML = !f.pools
+      ? (f.state === 'connecting' ? '<div class="empty">正在读 fleet-dao……</div>' : '')
+      : f.pools.length ? f.pools.map((x) => poolCard(x, f.staleAfterSec)).join('')
+        : '<div class="empty">fleet-dao 说它没有配置任何账号池</div>';
+    $('fleetInfo').innerHTML = `fleet-dao · <code>${esc(f.url ?? '')}</code>`;
+    const bits = [`每 ${Math.round(f.intervalSec ?? 60)} 秒读一次`];
+    if (f.fetchedAt) bits.push(`上次读到 ${ago(f.fetchedAt)}`);
+    if (f.mirasim?.name) bits.push(`本机 Mirasim 关着时，总览的额度卡用「${esc(f.mirasim.name)}」的读数`);
+    else if (f.mirasim?.skipped) bits.push(`${esc(f.mirasim.skipped)}；本机 Mirasim 关着时额度卡退回锚点推算`);
+    $('fleetBasis').innerHTML = bits.join(' · ');
+  }
+
+  // 接上：主进程先真读一次，读成了才写配置；令牌框用完就清，不留在页面里
+  $('btnFleet').onclick = async () => {
+    const note = $('fleetNote');
+    note.textContent = '正在连 fleet-dao…';
+    const r = await window.miraquota.fleetConnect?.({ url: $('fleetUrl').value.trim(), token: $('fleetToken').value })
+      .catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+    if (r?.ok) {
+      note.textContent = `已接上，读到 ${r.pools} 个账号池。`;
+      $('fleetToken').value = '';
+      fleetEditing = false;
+      if (latest) render(latest);
+    } else note.textContent = r?.error ?? '没成功';
+  };
+  $('btnFleetEdit').onclick = () => {
+    fleetEditing = !fleetEditing;
+    if (fleetEditing && latest?.fleet?.url) $('fleetUrl').value = latest.fleet.url;
+    $('fleetNote').textContent = fleetEditing ? '改地址或换令牌：令牌要重新粘一次（旧的不回显）。' : '';
+    if (latest) render(latest);
+  };
+  $('btnFleetOff').onclick = async () => {
+    if (!confirm('断开 fleet-dao？本机存的令牌会删掉，之后要重新粘。')) return;
+    const r = await window.miraquota.fleetDisconnect?.().catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+    fleetEditing = false;
+    $('fleetNote').textContent = r?.ok ? '已断开，~/.miraquota/fleet.json 已删。' : (r?.error ?? '没断开');
   };
 
   // 多机页登录：先试名字+口令；名字没注册时才要邀请码（第二次点才带上）

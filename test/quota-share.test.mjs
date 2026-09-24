@@ -18,8 +18,45 @@ import { LedgerSync } from '../provider/lib/ledger-sync.mjs';
 import { Engine } from '../provider/lib/engine.mjs';
 import { anchorsFrom } from '../provider/lib/anchors.mjs';
 import { fakeInbox, inboxConfig } from './helpers/inbox-fixture.mjs';
+import { startFakeFleet, sampleQuota } from '../scripts/fake-fleet.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mq-quota-'));
+
+/**
+ * 全注入的离线 Engine（本机 Mirasim「没开」）：状态都在临时目录，fleet 指向给定的 fleet.json。
+ * 不注入 fleetOpts 就会去读真机的 ~/.miraquota/fleet.json，配过的机器上测试会真的联网。
+ */
+function offlineEngine(name, fleetFile = join(tmp, `${name}-no-fleet.json`)) {
+  return new Engine({
+    forceOffline: true,
+    home: join(tmp, `${name}-home`),
+    ledgerFile: join(tmp, `${name}-ledger.json`), anchorFile: join(tmp, `${name}-anchor.json`),
+    settingsFile: join(tmp, `${name}-settings.json`), attribFile: join(tmp, `${name}-attrib.json`),
+    calibratorFile: join(tmp, `${name}-calibration.json`),
+    fleetOpts: { configFile: fleetFile },
+    syncOpts: { configFile: join(tmp, 'none.json'), installId: '9e9e9e9e9e9e9e9e' },
+  });
+}
+
+/** 起一个假 fleet-dao（回包里的读数都是 ageSec 秒前读的），写好 fleet.json，返回 { fake, file }。 */
+async function fleetAged(t, ageSec, mutate = (b) => b) {
+  const fake = await startFakeFleet({
+    t,
+    body: (now) => {
+      const b = sampleQuota(now);
+      const at = new Date((now - ageSec) * 1000).toISOString();
+      for (const p of b.pools) {
+        p.lastSuccessAt = at;
+        p.lastAttempt = { ...p.lastAttempt, at };
+        for (const w of p.windows) w.readAt = at;
+      }
+      return mutate(b);
+    },
+  });
+  const file = join(tmp, `fleet-${ageSec}-${Math.random().toString(16).slice(2)}.json`);
+  writeFileSync(file, JSON.stringify({ url: fake.url, token: fake.token }));
+  return { fake, file };
+}
 
 function emptyLedger(name) {
   const file = join(tmp, `${name}-ledger.json`);
@@ -58,6 +95,7 @@ test('a shard no longer carries the account quota, and the engine ships none', a
     ledgerFile: join(tmp, 'ship-ledger.json'), anchorFile: join(tmp, 'ship-anchor.json'),
     settingsFile: join(tmp, 'ship-settings.json'), attribFile: join(tmp, 'ship-attrib.json'),
     calibratorFile: join(tmp, 'ship-calibration.json'),
+    fleetOpts: { configFile: join(tmp, 'ship-no-fleet.json') },
     syncOpts: {
       configFile: inboxConfig(box, 'ship', { extra: { intervalSec: 600 } }),
       machineId: 'ship', installId: '5b5b5b5b5b5b5b5b', cacheFile: join(tmp, 'ship-cache.json'),
@@ -83,16 +121,92 @@ test('a shard no longer carries the account quota, and the engine ships none', a
   });
   const r = await reader.run(emptyLedger('reader'), NOW + 5);
   assert.ok(r.shards.some((s) => s.machineId === 'old-box'), '老分片照样读得到（账本还要合并）');
-  const e2 = new Engine({
-    forceOffline: true,
-    home: join(tmp, 'read-home'),
-    ledgerFile: join(tmp, 'read-ledger.json'), anchorFile: join(tmp, 'read-anchor.json'),
-    settingsFile: join(tmp, 'read-settings.json'), attribFile: join(tmp, 'read-attrib.json'),
-    calibratorFile: join(tmp, 'read-calibration.json'),
-    syncOpts: { configFile: join(tmp, 'none.json'), installId: '7d7d7d7d7d7d7d7d' },
-  });
+  const e2 = offlineEngine('read');
   e2.ledger.adoptForeignShards(r.shards);
   assert.equal(e2.payload().state, 'local', '别人分片里的额度不当锚点：本机没实读、没锚点，就是无数据');
+});
+
+test('with local Mirasim off, the account quota is fleet-dao\'s real reading, not a reckoning', async (t) => {
+  const { fake, file } = await fleetAged(t, 180);
+  const engine = offlineEngine('fl-real', file);
+  await engine.fleet.refresh();
+  const p = engine.payload();
+  assert.equal(p.state, 'fleet');
+  assert.equal(p.stateLabel, 'fleet 实读');
+  assert.equal(p.measured, false, '本机 Mirasim 没实测——口径页据此说「实测倍率暂不可给」');
+  assert.deepEqual(p.windows.map((w) => w.label), ['5h', '7d', '7d_claude', '7d_fable']);
+  assert.ok(p.windows.every((w) => w.inferred === false), '实读不挂 ≈');
+  const w7 = p.windows.find((w) => w.label === '7d');
+  assert.deepEqual(w7.points, { used: 285_511, budget: 512_600 });
+  assert.equal(w7.fullUSD, 512_600 * 0.01, '满额是官方除法，跟本机实测同一条路');
+  assert.ok(Math.abs(w7.usedPercent - 285_511 / 512_600 * 100) < 1e-9);
+  assert.equal(w7.modelGroup, undefined);
+  assert.equal(p.windows.find((w) => w.label === '7d_fable').modelGroup, 'fable');
+  assert.ok(p.windows.every((w) => w.etaSeconds === undefined), '打满钟点靠本机轨迹，不拿它套 fleet 的数');
+  assert.match(p.detail, /本机 Mirasim 未运行：额度用 fleet-dao 3 分钟前读到的「Mirasim 中转」/);
+  assert.match(p.detail, /他人占用已计入/);
+  assert.equal(p.limitsFrom.source, 'fleet');
+  assert.ok(Math.abs(p.limitsFrom.ageSeconds - 180) < 5);
+  assert.equal(p.fleet.pools.length, 6, '账号池页要的整张表也在');
+  assert.ok(!JSON.stringify(p).includes(fake.token), 'payload 里不许有令牌（feed 与 IPC 都会把它送出去）');
+});
+
+test('a live local reading beats fleet-dao, and so does a fresher stale one', async (t) => {
+  const { file } = await fleetAged(t, 600);
+  const engine = offlineEngine('fl-local', file);
+  await engine.fleet.refresh();
+  const now = Date.now() / 1000;
+  engine.ingestLimits({ windows: LIMITS.windows }, now);
+  assert.equal(engine.payload().state, 'exact', '本机实时来源在就用本机');
+  assert.equal(engine.payload().windows.find((w) => w.label === '7d').points.budget, 613_800);
+
+  engine.ingestLimits({ windows: LIMITS.windows }, now - 300);     // 本机 5 分钟前，fleet 10 分钟前
+  engine.last = { at: now - 300, limits: { windows: LIMITS.windows } };
+  assert.equal(engine.payload().state, 'stale', '谁更新用谁：本机那份更近');
+
+  engine.last = { at: now - 900, limits: { windows: LIMITS.windows } };   // 本机 15 分钟前，比 fleet 旧
+  assert.equal(engine.payload().state, 'fleet');
+});
+
+test('past its shelf life a fleet reading only anchors a reckoning, and it wears the ≈', async (t) => {
+  const { file } = await fleetAged(t, 3600);                        // 60 分钟前 > 有效期 30 分钟
+  const engine = offlineEngine('fl-old', file);
+  await engine.fleet.refresh();
+  const p = engine.payload();
+  assert.equal(p.state, 'reckoned');
+  assert.ok(p.windows.every((w) => w.inferred === true));
+  assert.ok(p.windows.every((w) => w.points === undefined), '推算值不许印在「原始额度点」那一行');
+  assert.equal(p.reckonFrom.source, 'fleet');
+  assert.equal(p.reckonFrom.poolId, 'mirasim');
+  assert.match(p.detail, /fleet-dao 的读数也已过期：按它 1(\.0)? 小时前读到的账号额度推算；他人占用已计到那一刻/);
+  const w7 = p.windows.find((w) => w.label === '7d');
+  assert.ok(w7.usedPercent >= 285_511 / 512_600 * 100 - 1e-9, '基线是它读到的账号百分比，只增不减');
+
+  // 本机锚点更近时用本机的（判据只有谁更近）
+  const now = Date.now() / 1000;
+  engine.ingestLimits({ windows: LIMITS.windows }, now - 1200);
+  const q = engine.payload();
+  assert.equal(q.state, 'reckoned');
+  assert.equal(q.reckonFrom, undefined);
+  assert.match(q.detail, /他人占用不可见/);
+});
+
+test('two Mirasim pools stand in for nothing, and fleet off changes nothing', async (t) => {
+  const { file } = await fleetAged(t, 60, (b) => {
+    b.pools.push({ ...b.pools.find((p) => p.poolId === 'mirasim'), poolId: 'mirasim-2', name: '另一个 Mirasim' });
+    return b;
+  });
+  const engine = offlineEngine('fl-two', file);
+  await engine.fleet.refresh();
+  const p = engine.payload();
+  assert.equal(p.state, 'local', '认不出哪个是本机这个账号：宁可无数据，也不挑一个');
+  assert.match(p.fleet.mirasim.skipped, /2 个 Mirasim 池/);
+  assert.equal(p.fleet.pools.length, 7, '账号池页照样全列');
+
+  const off = offlineEngine('fl-off');
+  await off.poll();
+  assert.deepEqual(off.payload().fleet, { state: 'off' }, '没配 fleet-dao：只给一个 off，界面据此给「接上」那张卡');
+  assert.equal(off.payload().state, 'local');
 });
 
 test('a fully injected engine writes nothing into the default state dir', () => {
@@ -121,6 +235,7 @@ test('a fully injected engine writes nothing into the default state dir', () => 
       ledgerFile: join(w, 'ledger.json'), anchorFile: join(w, 'anchor.json'),
       settingsFile: join(w, 'settings.json'), attribFile: join(w, 'attrib.json'),
       calibratorFile: join(w, 'calibration.json'),
+      fleetOpts: { configFile: join(w, 'no-fleet.json') },
       // installFile 也得给：LedgerSync 构造函数里就会读/生成安装 id 并落盘，
       // 漏了它这条测试第一次跑就是这么红起来的（假 HOME 里冒出 .miraquota/install.json）。
       syncOpts: { configFile: join(w, 'none.json'), installFile: join(w, 'install.json') },

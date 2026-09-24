@@ -4,8 +4,9 @@
  *
  * 降级阶梯（Mirasim 关闭时仍有可读输出）：
  *   exact  /v1/limits 可读，原始额度点
+ *   fleet  本机没有新鲜实读，用 fleet-dao 读到的同一个账号的额度（实读，不标 ≈；比本机最后一次实测新才用）
  *   stale  接口刚断，显示最后一次实测（内存）
- *   reckoned  Mirasim 不可达，按落盘锚点滚动窗口 + 本机账本推算（下界，标 ≈）
+ *   reckoned  都没有新鲜的：按最近那次读数（本机锚点或 fleet-dao 的，谁新用谁）滚动窗口 + 本机账本推算（下界，标 ≈）
  *   local  连锚点都没有，按滚动窗口报本机支出
  */
 import { execFile } from 'node:child_process';
@@ -58,7 +59,8 @@ export function readEnabledModels(pricing, file = MIRASIM_SETTING) {
 import { Settings } from './settings.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
 import { windowDuration, modelGroup } from './windows.mjs';
-import { AnchorStore } from './anchors.mjs';
+import { AnchorStore, anchorsFrom, ANCHOR_MAX_AGE } from './anchors.mjs';
+import { FleetSource } from './fleet-source.mjs';
 
 const CHANNEL_DEFAULT = 4970;
 const STALE_AFTER = 90;      // 秒；超过转 stale
@@ -74,7 +76,7 @@ const LEDGER_REPORT_DAYS = 7;
 const LEDGER_REPORT_ROWS = 8;
 const LEDGER_REPORT_EVERY = 60;
 export const LEVELS = {
-  exact: '精确', stale: '已过期', reckoned: '推算', local: '无数据', connecting: '连接中',
+  exact: '精确', fleet: 'fleet 实读', stale: '已过期', reckoned: '推算', local: '无数据', connecting: '连接中',
 };
 
 const run = (cmd, args) => new Promise((resolve) => {
@@ -169,6 +171,7 @@ export class Engine {
    *   没有任何人的会话记录，账本全部来自各机推上来的分片，扫本地只是白跑一趟。
    * @param opts.storeFile  流水库落点（默认 ~/.miraquota/store.db；给了 ledgerFile 就跟着它
    *   换个扩展名，测试注入的老参数照旧管用）
+   * @param opts.fleetOpts  fleet-dao 额度表的注入（配置路径、fetch、读完回调；默认读 ~/.miraquota/fleet.json）
    *
    * **路径注入要覆盖每一个会落盘的模块。** 少一个，测试就会去改真机的状态：2026-09-23
    * 实咬过一次——quota-share 那条测试用默认路径跑 poll()，而账本正好在这一版升级 schema，
@@ -191,6 +194,8 @@ export class Engine {
     this.calibrator = new Calibrator(opts.calibratorFile, { store: this.ledger.store });
     this.anchors = new AnchorStore(opts.anchorFile, { store: this.ledger.store });
     this.settings = new Settings(opts.settingsFile);
+    // 所有账号池 × 窗口的唯一来源；本机 Mirasim 关着时，额度卡也用它读到的那份（见 payload()）
+    this.fleet = new FleetSource(opts.fleetOpts);
     this.sync = new LedgerSync(opts.syncOpts);
     // 同步启用时放宽归因静置：外机支出要等它下一轮发布分片才可见（见 points-attrib.mjs）。
     if (this.sync.enabled) this.pointsAttrib.relaxSettle(this.sync.intervalSec);
@@ -510,6 +515,8 @@ export class Engine {
         const limits = router ? await this.#fetchLimits(router) : null;
         if (limits) this.ingestLimits(limits, Date.now() / 1000);
       }
+      // fleet-dao 到点才读、不等它：它慢或挂了都不该拖住本机这一轮（读完经 onUpdate 叫面板重画）
+      this.fleet.maybeRefresh(Date.now() / 1000);
       if (!this.opts.noLocal) this.ledger.refresh();
       this.#speedRefresh();   // 必须在 #maybeSync 之前：分片要带这一轮的速度，否则首轮发出去的是空速度
       await this.#warmShards();
@@ -555,20 +562,67 @@ export class Engine {
     } finally { this.#journalBusy = false; }
   }
 
-  /** 契约 A 的 quota.json。只填有据可查的字段，控件对缺字段是容忍的。 */
+  /**
+   * 契约 A 的 quota.json。只填有据可查的字段，控件对缺字段是容忍的。
+   *
+   * 额度只有两个来源：本机 /v1/limits（本机实时来源）与 fleet-dao（同一个账号，谁读到都一样）。
+   * 判据只有一条——**谁更新用谁**，然后看它还算不算现值：本机 90 秒内算精确；fleet-dao 在它自己
+   * 声明的有效期（staleAfterMinutes）内算实读；都不新鲜才推算，推算一律标 ≈。
+   */
   payload() {
     const now = Date.now() / 1000;
     const age = this.last ? now - this.last.at : Infinity;
 
-    if (this.last && age <= RECKON_AFTER) return this.#measuredPayload(now, age);
+    if (age <= STALE_AFTER) return this.#measuredPayload(now, this.last, 'exact');
+    const fleet = this.fleet.mirasimSnapshot();
+    if (fleet && now - fleet.at <= fleet.staleAfterSec && !(this.last?.at >= fleet.at)) {
+      return this.#fleetPayload(now, fleet);
+    }
+    if (age <= RECKON_AFTER) return this.#measuredPayload(now, this.last, 'stale');
+    const remote = this.#fleetAnchors(now, fleet);
+    if (remote) return this.#reckonedPayload(now, remote);
     if (this.anchors.usable) return this.#reckonedPayload(now);
     return this.#localPayload(now);
   }
 
-  #measuredPayload(now, age) {
-    const stale = age > STALE_AFTER;
-    const level = stale ? 'stale' : 'exact';
-    const limits = this.last.limits;
+  /**
+   * fleet-dao 读到的账号额度当现值：本机 Mirasim 没开，而它在自己声明的有效期内读过。
+   * 这是实读（不标 ≈），但要说清是谁、多久前读的——本机 Mirasim 没开却显示实数，不说来源会被当成出错。
+   */
+  #fleetPayload(now, fleet) {
+    const out = this.#measuredPayload(now, { at: fleet.at, limits: fleet.limits }, 'fleet');
+    const ageMin = Math.round((now - fleet.at) / 60);
+    out.detail = `本机 Mirasim 未运行：额度用 fleet-dao ${ageMin < 1 ? '刚刚' : `${ageMin} 分钟前`}读到的「${fleet.name}」`
+      + '（账号级，他人占用已计入）';
+    out.limitsFrom = { source: 'fleet', poolId: fleet.poolId, name: fleet.name, readAt: fleet.at, ageSeconds: now - fleet.at };
+    return out;
+  }
+
+  /**
+   * fleet-dao 的读数过了有效期、但比本机锚点新：拿它当锚点推算（标 ≈）。
+   * 两份锚点是同一个东西的两次读数，判据只有谁更近；两边都超过 30 天就都不采信。
+   */
+  #fleetAnchors(now, fleet) {
+    if (!fleet || now - fleet.at >= ANCHOR_MAX_AGE) return null;
+    if (this.anchors.usable && this.anchors.capturedAt >= fleet.at) return null;
+    const anchors = anchorsFrom(fleet.limits.windows, fleet.at);
+    if (!anchors.length) return null;
+    return {
+      anchors, capturedAt: fleet.at,
+      detail: (ageText) => `本机 Mirasim 未运行，fleet-dao 的读数也已过期：按它 ${ageText}前读到的账号额度推算；他人占用已计到那一刻`,
+      reckonFrom: { source: 'fleet', poolId: fleet.poolId, name: fleet.name },
+    };
+  }
+
+  /**
+   * 实测（或 fleet-dao 实读）那份额度的整份 payload。
+   * @param snap  { at, limits }——本机的 this.last，或 fleet-dao 替补的那份
+   * @param level 'exact' | 'stale' | 'fleet'
+   */
+  #measuredPayload(now, snap, level) {
+    const age = now - snap.at;
+    const stale = level === 'stale';
+    const limits = snap.limits;
     const coherence = evaluateCoherence(limits.windows, this.ledger, now, this.settings.groupPointCost);
     const rate = coherence.perPoint;
 
@@ -596,7 +650,8 @@ export class Engine {
         this.#fullOf(w.label, w.budget, group, this.#officialFull(w.budget, groupRatio));
       calibDropped += dropped;
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
-      const eta = this.#eta(w, now);
+      // 打满时刻靠本机近 1 小时的点数轨迹外推；fleet-dao 那份不进轨迹，拿本机旧轨迹套它的数会编出一个钟点
+      const eta = level === 'fleet' ? null : this.#eta(w, now);
       const exhaust = this.#exhaust(w, start, now, group);
       const breakdown = this.#familyBreakdown(start, now, group);
       return {
@@ -629,7 +684,7 @@ export class Engine {
       : limits.unmetered ? '账号不计量，额度上限不适用'
       : limits.degraded ? '上游降级运行中' : null;
 
-    const out = this.#base(level, this.last.at, windows);
+    const out = this.#base(level, snap.at, windows);
     out.unitPriceUSD = OFFICIAL_PER_POINT;
     if (rate != null) {
       out.ledgerPerPoint = rate;
@@ -983,6 +1038,9 @@ export class Engine {
       } : {}),
       ...(this.#roster() ?? {}),
       ...this.#priceTrust(),
+      // fleet-dao 的账号池 × 窗口（「账号池」页画它）。每条 payload 路径都给、未配置也给
+      // { state: 'off' }：那一页要据此给「接上」那张卡。里面没有令牌。
+      fleet: this.fleet.status(),
       // 账目报表（任务/工作区/会话）：三条 payload 路径都给——它是本机账本的事实，
       // 不是「连上 Mirasim 才有」的东西。
       ...((r) => (r ? { ledger: r } : {}))(this.#ledgerReport(Date.now() / 1000)),

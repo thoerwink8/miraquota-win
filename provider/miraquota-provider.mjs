@@ -105,12 +105,37 @@ function printSnapshot(p) {
     console.log(`速度 ${r.model}  ${ttft} · ${rate} · 端到端 ${r.endToEnd.toFixed(0)} tok/s · 最近 ${r.samples} 次${drift}`);
   }
   if (p.speed?.inflightSince?.length) console.log(`速度 ▶ 生成中 ${p.speed.inflightSince.length} 条`);
+  printFleet(p.fleet);
+}
+
+/** fleet-dao 的账号池 × 窗口（面板「账号池」页的同一份）。没读成的池与窗口照样列出来并说原因。 */
+function printFleet(f) {
+  if (!f || f.state === 'off') return;
+  const ago = (t) => `${Math.round((Date.now() / 1000 - t) / 60)} 分钟前`;
+  console.log(`fleet-dao ${f.url} · ${f.state}${f.error ? ` · 这次没读到：${f.error.message}` : ''}`
+    + (f.fetchedAt ? ` · 上次读到 ${ago(f.fetchedAt)}` : ''));
+  for (const pool of f.pools ?? []) {
+    const la = pool.lastAttempt;
+    const st = pool.problem ? `格式认不出：${pool.problem}`
+      : la && !la.ok ? `没读成：${la.error?.message ?? ''}` : pool.lastSuccessAt ? `读于 ${ago(pool.lastSuccessAt)}` : '还没读过';
+    console.log(`  ${pool.name}  ${st}`);
+    for (const w of pool.windows ?? []) {
+      const pct = w.utilization != null ? w.utilization * 100 : (w.used != null && w.limit > 0 ? w.used / w.limit * 100 : null);
+      const val = w.used == null || w.unit === 'percent' ? '' : ` ${w.unit === 'usd' ? '$' : ''}${w.used}/${w.limit ?? '?'}${w.unit === 'points' ? ' 点' : ''}`;
+      const marks = [w.reading === 'estimated' ? '估算' : null, w.inLatestRead ? null : '上游这次没报',
+        w.upstreamStatus && w.upstreamStatus !== 'allowed' ? w.upstreamStatus : null].filter(Boolean).join(' · ');
+      console.log(`    ${w.label.padEnd(18)} ${pct != null ? (w.reading === 'estimated' ? '≈' : ' ') + pct.toFixed(1).padStart(5) + '%' : '     —'}${val}  ${fmtReset(w.resetsAt ?? null)}${marks ? '  ' + marks : ''}`);
+    }
+    for (const x of pool.problems ?? []) console.log(`    认不出：${x}`);
+  }
+  if (f.mirasim?.skipped) console.log(`  ${f.mirasim.skipped}`);
 }
 
 if (flag('once')) {
   await engine.poll();
+  await engine.fleet.refresh();   // poll 里只是到点发起；--once 活不到下一跳，这里等它读完
   printSnapshot(engine.payload());
-  process.exit(engine.last || engine.anchors.usable ? 0 : 1);
+  process.exit(engine.last || engine.anchors.usable || engine.fleet.report ? 0 : 1);
 }
 
 /**
