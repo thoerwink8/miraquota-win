@@ -1,7 +1,8 @@
 /**
  * fleet-dao 额度表：所有账号池 × 窗口的唯一来源，MiraQuota 是它的桌面窗口（2026-09-24）。
  *
- * 接口约定（全文在引入本模块的 PR 正文里，后端照它实现）：
+ * 接口约定（全文与语义见 https://github.com/thoerwink8/miraquota-win/pull/3 正文，后端照它实现；
+ * 后端落地后以 fleet-dao 仓 packages/shared 的 schema 为准，两边不一致就回来改这里）：
  *   GET <地址>/api/quota
  *   Authorization: Bearer <只读令牌>        ← 只能读额度，别的接口一律不认它
  *   200 → { schema: 1, asOf, staleAfterMinutes, pools: [...] }（逐字段见 parseQuotaReport）
