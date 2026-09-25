@@ -143,13 +143,14 @@ function parseWindow(w, skew) {
  */
 function parsePool(p, skew, index, sameChannel) {
   const fallback = `第 ${index + 1} 个池`;
-  if (!isObj(p)) return { poolId: `#${index + 1}`, name: fallback, problem: '池不是对象', windows: [], notes: [] };
+  const channelId = isObj(p) && typeof p.channelId === 'string' ? p.channelId : '';
+  if (!isObj(p)) return { poolId: `#${index + 1}`, channelId, name: fallback, problem: '池不是对象', windows: [], notes: [] };
   const poolId = typeof p.poolId === 'string' && p.poolId ? p.poolId : null;
   const channelName = typeof p.channelName === 'string' && p.channelName.trim() ? clip(p.channelName) : '';
   const name = typeof p.name === 'string' && p.name.trim() ? clip(p.name)
     : channelName ? (sameChannel(p.channelId) > 1 && poolId ? `${channelName} · ${poolId}` : channelName)
       : (poolId ?? fallback);
-  const shell = { poolId: poolId ?? `#${index + 1}`, name, windows: [], notes: [] };
+  const shell = { poolId: poolId ?? `#${index + 1}`, channelId, name, windows: [], notes: [] };
   if (!poolId) return { ...shell, problem: '池缺 poolId' };
   if (!Array.isArray(p.windows)) return { ...shell, problem: 'windows 不是数组' };
   if (typeof p.neverRead !== 'boolean') return { ...shell, problem: '缺 neverRead（从没读成过要明说，不能用空窗口冒充）' };
@@ -182,7 +183,7 @@ function parsePool(p, skew, index, sameChannel) {
   const expiresAt = given(p.expiresAt) ? isoSec(p.expiresAt) : null;
   return {
     poolId, name,
-    channelId: typeof p.channelId === 'string' ? p.channelId : '',
+    channelId,
     neverRead: p.neverRead,
     readOverdue: p.readOverdue === true,
     lastReadOkAt,
@@ -392,26 +393,42 @@ export class FleetSource {
   }
 
   /**
-   * 哪个池替补本机 Mirasim：窗口由 mirasim-relay 读出来的池**恰好一个**才用（回包里没有「读法」
-   * 这一列，窗口的 source 就是读法）。额度点是账号级的，同一个账号谁读到都一样；有两个就认不出
-   * 哪个是本机这个账号，宁可不用。
+   * 哪个池替补本机 Mirasim。
+   *
+   * 按**渠道**数：有池读出过 mirasim-relay 窗口的渠道就是 Mirasim 渠道，这个渠道下的池全都算——
+   * 包括从没读成、没有窗口、甚至认不出的池。只数「有 mirasim-relay 窗口的池」会漏掉没读成的那个，
+   * 于是把另一个池（可能是别的账号）当成本机的。恰好一个才用；一个以上认不出哪个是本机这个账号，宁可不用。
    */
   #mirasimPick() {
-    const pools = (this.report?.pools ?? [])
-      .filter((p) => !p.problem && p.windows.some((w) => w.source === 'mirasim-relay'));
-    if (pools.length === 1) return { pool: pools[0] };
+    const all = this.report?.pools ?? [];
+    const channels = new Set(all
+      .filter((p) => !p.problem && p.windows.some((w) => w.source === 'mirasim-relay'))
+      .map((p) => p.channelId));
+    const same = all.filter((p) => channels.has(p.channelId));
+    if (same.length === 1) return { pool: same[0] };
     return {
-      skipped: pools.length
-        ? `fleet-dao 里有 ${pools.length} 个 Mirasim 池，认不出哪个是本机这个账号，不拿来替补`
+      skipped: same.length
+        ? `fleet-dao 里有 ${same.length} 个 Mirasim 池（没读成的也算），认不出哪个是本机这个账号，不拿来替补`
         : 'fleet-dao 里没有读成过的 Mirasim 池',
     };
   }
 
+  /** fleet-dao 自己判这个池没读成（neverRead）或读数过期（readOverdue）时的原因；都不是给 null。 */
+  static #doubtOf(pool) {
+    if (pool.neverRead) return `fleet-dao 还没完整读成过「${pool.name}」`;
+    if (pool.readOverdue) return `fleet-dao 判「${pool.name}」读数过期`;
+    return null;
+  }
+
   /**
    * 替补本机 Mirasim 的那份账号额度，形状与本机 /v1/limits 解析后一致（Engine 走同一条路算）。
-   * 只收：上游这次报了的（没有 staleSince）、实读的、点数单位、数字齐全的窗口。
+   * 收：上游这次报了的（没有 staleSince）、实读的、点数单位、数字齐全的窗口；清零时刻已过的也收——
+   * 它当不了现值，但能当推算的锚点（锚点库会把它滚到新窗口），丢不丢由调用方按现在的时刻定。
    * at 取这些窗口里最早的 readAt——龄期按最旧的那格算，不替它说新。
-   * @returns { at, poolId, name, staleAfterSec, limits: { windows } } | null
+   *
+   * doubt 有值时窗口再新也不能当现值，只能当锚点推算（挂 ≈）：fleet-dao 自己都说没读成 / 过期，
+   * 总览再写「fleet 实读」就和账号池页的「从没读成过」互相打架。
+   * @returns { at, poolId, name, staleAfterSec, doubt?, limits } | null
    */
   mirasimSnapshot() {
     const { pool } = this.#mirasimPick();
@@ -419,10 +436,12 @@ export class FleetSource {
     const wins = pool.windows.filter((w) => w.staleSince == null && w.reading === 'measured' && w.unit === 'points'
       && finite(w.used) && finite(w.limit) && w.limit > 0 && w.resetsAt != null);
     if (!wins.length) return null;
+    const doubt = FleetSource.#doubtOf(pool);
     return {
       at: Math.min(...wins.map((w) => w.readAt)),
       poolId: pool.poolId, name: pool.name,
       staleAfterSec: this.report.staleAfterSec,
+      ...(doubt ? { doubt } : {}),
       limits: {
         windows: wins.map((w) => ({
           label: w.label, used: w.used, budget: w.limit, resetAt: w.resetsAt,
@@ -442,6 +461,7 @@ export class FleetSource {
       };
     }
     const pick = this.report ? this.#mirasimPick() : null;
+    const doubt = pick?.pool ? FleetSource.#doubtOf(pick.pool) : null;
     return {
       state: this.lastError ? 'error' : this.report ? 'ok' : 'connecting',
       url: this.#config.url,
@@ -453,7 +473,9 @@ export class FleetSource {
         asOf: this.report.asOf,
         staleAfterSec: this.report.staleAfterSec,
         pools: this.report.pools,
-        mirasim: pick.pool ? { poolId: pick.pool.poolId, name: pick.pool.name } : { skipped: pick.skipped },
+        mirasim: pick.pool
+          ? { poolId: pick.pool.poolId, name: pick.pool.name, ...(doubt ? { doubt } : {}) }
+          : { skipped: pick.skipped },
       } : {}),
     };
   }

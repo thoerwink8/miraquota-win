@@ -620,7 +620,8 @@ export class Engine {
    *
    * 额度只有两个来源：本机 /v1/limits（本机实时来源）与 fleet-dao（同一个账号，谁读到都一样）。
    * 判据只有一条——**谁更新用谁**，然后看它还算不算现值：本机 90 秒内算精确；fleet-dao 在它自己
-   * 声明的有效期（staleAfterMinutes）内算实读；都不新鲜才推算，推算一律标 ≈。
+   * 声明的有效期（staleAfterMinutes）内、它自己没存疑、窗口没过清零时刻才算实读（见 #fleetLive）；
+   * 都算不上现值才推算，推算一律标 ≈。
    */
   payload() {
     const now = Date.now() / 1000;
@@ -628,9 +629,8 @@ export class Engine {
 
     if (age <= STALE_AFTER) return this.#measuredPayload(now, this.last, 'exact');
     const fleet = this.fleet.mirasimSnapshot();
-    if (fleet && now - fleet.at <= fleet.staleAfterSec && !(this.last?.at >= fleet.at)) {
-      return this.#fleetPayload(now, fleet);
-    }
+    const live = this.#fleetLive(now, fleet);
+    if (live && !(this.last?.at >= fleet.at)) return this.#fleetPayload(now, fleet, live);
     if (age <= RECKON_AFTER) return this.#measuredPayload(now, this.last, 'stale');
     const remote = this.#fleetAnchors(now, fleet);
     if (remote) return this.#reckonedPayload(now, remote);
@@ -639,20 +639,39 @@ export class Engine {
   }
 
   /**
-   * fleet-dao 读到的账号额度当现值：本机 Mirasim 没开，而它在自己声明的有效期内读过。
-   * 这是实读（不标 ≈），但要说清是谁、多久前读的——本机 Mirasim 没开却显示实数，不说来源会被当成出错。
+   * fleet-dao 那份能不能当现值，能就给出可当现值的窗口：
+   *  - fleet-dao 自己没判这个池没读成 / 过期（doubt）——它都不信的数，这边不许写成「fleet 实读」；
+   *  - 在它自己声明的有效期（staleAfterMinutes）内；
+   *  - 清零时刻已过的窗口丢掉：那格读数是清零前的（fleet-dao 的 windowState 同判 reset），
+   *    当现值会把清零前的 95% 印在一个刚清零的窗上。丢完一格不剩就不是现值。
+   * 判据用本机钟（resetAt 已校过钟差），缓存着的旧回包过了清零时刻也照样丢。
+   * @returns { windows, dropped: [label] } | null
    */
-  #fleetPayload(now, fleet) {
-    const out = this.#measuredPayload(now, { at: fleet.at, limits: fleet.limits }, 'fleet');
+  #fleetLive(now, fleet) {
+    if (!fleet || fleet.doubt || now - fleet.at > fleet.staleAfterSec) return null;
+    const windows = fleet.limits.windows.filter((w) => w.resetAt > now);
+    if (!windows.length) return null;
+    return { windows, dropped: fleet.limits.windows.filter((w) => w.resetAt <= now).map((w) => w.label) };
+  }
+
+  /**
+   * fleet-dao 读到的账号额度当现值：本机 Mirasim 没开，而 #fleetLive 判它还算现值。
+   * 这是实读（不标 ≈），但要说清是谁、多久前读的——本机 Mirasim 没开却显示实数，不说来源会被当成出错；
+   * 少了清零的那几格也要说，否则一张卡凭空消失。
+   */
+  #fleetPayload(now, fleet, live) {
+    const out = this.#measuredPayload(now, { at: fleet.at, limits: { ...fleet.limits, windows: live.windows } }, 'fleet');
     const ageMin = Math.round((now - fleet.at) / 60);
     out.detail = `本机 Mirasim 未运行：额度用 fleet-dao ${ageMin < 1 ? '刚刚' : `${ageMin} 分钟前`}读到的「${fleet.name}」`
-      + '（账号级，他人占用已计入）';
+      + '（账号级，他人占用已计入）'
+      + (live.dropped.length ? `；${live.dropped.join('、')} 窗读到之后已清零，等 fleet-dao 下一次读数` : '');
     out.limitsFrom = { source: 'fleet', poolId: fleet.poolId, name: fleet.name, readAt: fleet.at, ageSeconds: now - fleet.at };
     return out;
   }
 
   /**
-   * fleet-dao 的读数过了有效期、但比本机锚点新：拿它当锚点推算（标 ≈）。
+   * fleet-dao 那份当不了现值（过了有效期、fleet-dao 自己存疑、或窗口全过了清零时刻），但比本机锚点新：
+   * 拿它当锚点推算（标 ≈；锚点库把过了清零时刻的窗滚到新窗口，从本机账本起算）。
    * 两份锚点是同一个东西的两次读数，判据只有谁更近；两边都超过 30 天就都不采信。
    */
   #fleetAnchors(now, fleet) {
@@ -660,9 +679,12 @@ export class Engine {
     if (this.anchors.usable && this.anchors.capturedAt >= fleet.at) return null;
     const anchors = anchorsFrom(fleet.limits.windows, fleet.at);
     if (!anchors.length) return null;
+    const why = fleet.doubt
+      ?? (now - fleet.at <= fleet.staleAfterSec && fleet.limits.windows.every((w) => w.resetAt <= now)
+        ? 'fleet-dao 读到之后窗口已清零' : 'fleet-dao 的读数也已过期');
     return {
       anchors, capturedAt: fleet.at,
-      detail: (ageText) => `本机 Mirasim 未运行，fleet-dao 的读数也已过期：按它 ${ageText}前读到的账号额度推算；他人占用已计到那一刻`,
+      detail: (ageText) => `本机 Mirasim 未运行，${why}：按它 ${ageText}前读到的账号额度推算；他人占用已计到那一刻`,
       reckonFrom: { source: 'fleet', poolId: fleet.poolId, name: fleet.name },
     };
   }

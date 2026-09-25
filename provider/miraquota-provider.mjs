@@ -121,15 +121,20 @@ function printFleet(f) {
       : pool.neverRead ? '从没读成过' : `${pool.readOverdue ? '读数过期 · ' : ''}读成于 ${ago(pool.lastReadOkAt)}`;
     console.log(`  ${pool.name}  ${st}${err}`);
     for (const w of pool.windows ?? []) {
-      const pct = w.utilization != null ? w.utilization * 100 : (w.used != null && w.limit > 0 ? w.used / w.limit * 100 : null);
-      const val = w.used == null || w.unit === 'percent' ? ''
+      // 清零时刻已过：那次读数是清零前的，作废——不印旧百分比与旧数（与账号池页同判）
+      const reset = w.resetsAt != null && w.resetsAt <= Date.now() / 1000;
+      const pct = reset ? null
+        : w.utilization != null ? w.utilization * 100 : (w.used != null && w.limit > 0 ? w.used / w.limit * 100 : null);
+      const val = reset || w.used == null || w.unit === 'percent' ? ''
         : ` ${w.unit === 'usd' ? '$' : ''}${w.used}/${w.limit ?? '?'}${w.unit === 'points' ? ' 点' : w.unit === 'tokens' ? ' tokens' : ''}`;
-      const marks = [w.reading === 'estimated' ? '估算' : null, w.staleSince != null ? '上游这次没报' : null,
-        w.upstreamStatus && w.upstreamStatus !== 'allowed' ? w.upstreamStatus : null].filter(Boolean).join(' · ');
-      console.log(`    ${w.label.padEnd(18)} ${pct != null ? (w.reading === 'estimated' ? '≈' : ' ') + pct.toFixed(1).padStart(5) + '%' : '     —'}${val}  ${fmtReset(w.resetsAt ?? null)}${marks ? '  ' + marks : ''}`);
+      const marks = [w.reading === 'estimated' ? '估算' : null,
+        reset ? '已清零，等下一次读数' : w.staleSince != null ? '上游这次没报' : null,
+        !reset && w.upstreamStatus && w.upstreamStatus !== 'allowed' ? w.upstreamStatus : null].filter(Boolean).join(' · ');
+      console.log(`    ${w.label.padEnd(18)} ${pct != null ? (w.reading === 'estimated' ? '≈' : ' ') + pct.toFixed(1).padStart(5) + '%' : '     —'}${val}  ${reset ? '' : fmtReset(w.resetsAt ?? null)}${marks ? '  ' + marks : ''}`);
     }
     for (const x of pool.notes ?? []) console.log(`    注意：${x}`);
   }
+  if (f.mirasim?.doubt) console.log(`  ${f.mirasim.doubt}：本机 Mirasim 关着时只拿它推算（≈）`);
   if (f.mirasim?.skipped) console.log(`  ${f.mirasim.skipped}`);
 }
 

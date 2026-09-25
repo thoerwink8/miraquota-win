@@ -1170,30 +1170,34 @@
 
   /**
    * 一个窗口两行：名字 + 标记 + 数 + 百分比；进度条 + 清零倒计时。
-   * 三种要看得出来的「不是现值」：估算（≈）、上游这次没报、读数过了有效期——各有一枚标记。
+   * 四种要看得出来的「不是现值」：估算（≈）、上游这次没报、读数过了有效期、读到之后已清零——各有一枚标记。
+   * 已清零的格子（清零时刻已过，fleet-dao 判 reset）读数是清零前的，作废：不印旧百分比、旧数、旧的打满标记。
    */
   function poolWindowRow(w, staleAfter) {
-    const pct = poolPct(w);
+    const reset = w.resetsAt != null && w.resetsAt <= Date.now() / 1000;
+    const pct = reset ? null : poolPct(w);
     const est = w.reading === 'estimated';
     const chips = [];
     if (est) chips.push('<span class="chip est" title="按用量记录估算，不是上游报的数">估算</span>');
-    if (w.staleSince != null) {
+    if (reset) {
+      chips.push(`<span class="chip stale" title="${ago(w.readAt)}读到之后这个窗口已清零，那次的读数作废；等 fleet-dao 下一次读数">已清零</span>`);
+    } else if (w.staleSince != null) {
       chips.push(`<span class="chip stale" title="上游从 ${ago(w.staleSince)}起没再报这个窗口；数字是 ${ago(w.readAt)}那次的">上游这次没报</span>`);
     } else if (staleAfter && Date.now() / 1000 - w.readAt > staleAfter) {
       chips.push(`<span class="chip stale" title="读数超过有效期，不能当现值用">${ago(w.readAt)}读的</span>`);
     }
-    if (w.upstreamStatus === 'limit_reached') chips.push('<span class="chip bad">已打满</span>');
-    else if (w.upstreamStatus === 'warning') chips.push('<span class="chip warn">告警</span>');
-    const hot = w.upstreamStatus === 'limit_reached' || w.upstreamStatus === 'warning' || (pct ?? 0) >= 80;
+    if (!reset && w.upstreamStatus === 'limit_reached') chips.push('<span class="chip bad">已打满</span>');
+    else if (!reset && w.upstreamStatus === 'warning') chips.push('<span class="chip warn">告警</span>');
+    const hot = !reset && (w.upstreamStatus === 'limit_reached' || w.upstreamStatus === 'warning' || (pct ?? 0) >= 80);
     const mark = est ? '≈' : '';
-    const val = poolValue(w);
+    const val = reset ? '' : poolValue(w);
     const title = [w.label, w.source, w.statusRaw].filter(Boolean).map(esc).join(' · ');
     return `<div class="pw" title="${title}">
       <div class="pw-top"><span class="pw-name">${esc(poolWindowName(w))}</span>${chips.join('')}
         <span class="pw-val">${val ? mark + esc(val) : ''}</span>
         <span class="pw-pct">${pct != null ? mark + pct.toFixed(1) + '%' : '—'}</span></div>
       <div class="pw-bar"><div class="bar"><div class="fill${hot ? ' hot' : ''}" style="width:${Math.min(100, Math.max(0, pct ?? 0))}%"></div></div>
-        <span class="r">${w.resetsAt != null ? fmtReset(w.resetsAt) : ''}</span></div>
+        <span class="r">${reset ? '等下一次读数' : w.resetsAt != null ? fmtReset(w.resetsAt) : ''}</span></div>
     </div>`;
   }
 
@@ -1257,7 +1261,8 @@
     $('fleetInfo').innerHTML = `fleet-dao · <code>${esc(f.url ?? '')}</code>`;
     const bits = [`每 ${Math.round(f.intervalSec ?? 60)} 秒读一次`];
     if (f.fetchedAt) bits.push(`上次读到 ${ago(f.fetchedAt)}`);
-    if (f.mirasim?.name) bits.push(`本机 Mirasim 关着时，总览的额度卡用「${esc(f.mirasim.name)}」的读数`);
+    if (f.mirasim?.doubt) bits.push(`${esc(f.mirasim.doubt)}：本机 Mirasim 关着时，它的读数只拿来推算，带 ≈`);
+    else if (f.mirasim?.name) bits.push(`本机 Mirasim 关着时，总览的额度卡用「${esc(f.mirasim.name)}」的读数`);
     else if (f.mirasim?.skipped) bits.push(`${esc(f.mirasim.skipped)}；本机 Mirasim 关着时额度卡退回锚点推算`);
     $('fleetBasis').innerHTML = bits.join(' · ');
   }

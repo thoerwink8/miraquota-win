@@ -300,3 +300,21 @@ test('only the single Mirasim pool stands in for local Mirasim, and only its fre
   assert.equal(src.mirasimSnapshot(), null);
   assert.match(src.status().mirasim.skipped, /2 个 Mirasim 池/);
 });
+
+test('a never-read second Mirasim pool still counts, so the other one is not taken for this account', async (t) => {
+  // 复审 2026-09-25：从没读成的第二个 Mirasim 池没有窗口，只数「有 mirasim-relay 窗口的池」就把它当成
+  // 不存在，结果错拿了另一个池（可能是别的账号）的额度。按渠道数：同渠道的池不管读没读成都算。
+  const body = sampleQuota(NOW);
+  body.pools.push({ ...pool(body, 'mirasim'), poolId: 'mirasim-2', neverRead: true, readOverdue: true,
+    lastReadOkAt: null, dataAt: null, windows: [] });
+  const fake = await startFakeFleet({ t, body });
+  const src = sourceFor(fake);
+  await src.refresh();
+  assert.equal(src.mirasimSnapshot(), null, '同渠道两个池：认不出哪个是本机这个账号，一个都不拿');
+  assert.match(src.status().mirasim.skipped, /2 个 Mirasim 池/);
+
+  // 别的渠道的池不算（两个 Claude 组织在 claude 渠道）：只有一个 Mirasim 池时照常替补
+  fake.set({ body: sampleQuota(NOW) });
+  await src.refresh();
+  assert.equal(src.mirasimSnapshot()?.poolId, 'mirasim');
+});

@@ -191,6 +191,58 @@ test('past its shelf life a fleet reading only anchors a reckoning, and it wears
   assert.match(q.detail, /他人占用不可见/);
 });
 
+test('a Mirasim pool fleet-dao itself calls unread or overdue only anchors a reckoning, even with fresh windows', async (t) => {
+  // 复审 2026-09-25（已渲染实证）：fleet-dao 判这个池没读成，账号池页写「从没读成过」，总览却照写「fleet 实读」。
+  // 池上的 neverRead / readOverdue 是 fleet-dao 的结论——任一为真，窗口再新也只当锚点推算、挂 ≈。
+  const cases = [
+    ['neverRead', { neverRead: true, readOverdue: true, lastReadOkAt: null }, /fleet-dao 还没完整读成过「Mirasim 中转」/],
+    ['readOverdue', { readOverdue: true, lastReadOkAt: new Date(Date.now() - 2 * 3600_000).toISOString() }, /fleet-dao 判「Mirasim 中转」读数过期/],
+  ];
+  for (const [flag, patch, why] of cases) {
+    const { file } = await fleetAged(t, 60, (b) => { Object.assign(b.pools.find((p) => p.poolId === 'mirasim'), patch); return b; });
+    const engine = offlineEngine(`fl-${flag}`, file);
+    await engine.fleet.refresh();
+    const p = engine.payload();
+    assert.equal(p.state, 'reckoned', `${flag}：fleet-dao 自己都说没读成 / 过期，总览不许写「fleet 实读」`);
+    assert.ok(p.windows.length > 0 && p.windows.every((w) => w.inferred === true), `${flag}：推算挂 ≈`);
+    assert.ok(p.windows.every((w) => w.points === undefined), `${flag}：推算值不许印在「原始额度点」那一行`);
+    assert.match(p.detail, why);
+    assert.equal(p.reckonFrom.poolId, 'mirasim');
+    assert.equal(p.fleet.pools.find((x) => x.poolId === 'mirasim')[flag], true, '账号池页那张卡说的是同一件事');
+    assert.match(p.fleet.mirasim.doubt, why, '账号池页那行说明也要讲清只拿来推算');
+  }
+});
+
+test('a window whose reset time has passed is dropped, not shown with its pre-reset reading', async (t) => {
+  // 复审 2026-09-25：5h 窗已清零（fleet-dao 判 state=reset），总览仍印清零前的 95%。
+  // 清零时刻已过的窗旧读数作废（fleet-dao 的 windowState 同判），当现值时丢掉；其余窗照样是实读。
+  const resetAgo = (s) => new Date(Date.now() - s * 1000).toISOString();
+  const { file } = await fleetAged(t, 600, (b) => {
+    const w5 = b.pools.find((p) => p.poolId === 'mirasim').windows.find((w) => w.label === '5h');
+    Object.assign(w5, { used: 136_352, utilization: 0.95, resetsAt: resetAgo(120), state: 'reset' });
+    return b;
+  });
+  const engine = offlineEngine('fl-reset', file);
+  await engine.fleet.refresh();
+  const p = engine.payload();
+  assert.equal(p.state, 'fleet', '其余窗口照样是实读');
+  assert.deepEqual(p.windows.map((w) => w.label), ['7d', '7d_claude', '7d_fable'], '清零时刻已过的 5h 不当现值');
+  assert.ok(!p.windows.some((w) => w.usedPercent >= 90), '不许再印清零前的 95%');
+  assert.match(p.detail, /5h 窗读到之后已清零，等 fleet-dao 下一次读数/, '少了一张卡要说为什么');
+
+  // 窗口全都过了清零时刻：没有现值可给，退到推算（锚点自己滚到新窗口，挂 ≈）
+  const { file: all } = await fleetAged(t, 600, (b) => {
+    for (const w of b.pools.find((p) => p.poolId === 'mirasim').windows) Object.assign(w, { resetsAt: resetAgo(60), state: 'reset' });
+    return b;
+  });
+  const e2 = offlineEngine('fl-reset-all', all);
+  await e2.fleet.refresh();
+  const q = e2.payload();
+  assert.equal(q.state, 'reckoned');
+  assert.ok(q.windows.every((w) => w.inferred === true && w.usedPercent < 90), '滚到新窗口后从本机账本起算，不带旧的 95%');
+  assert.match(q.detail, /fleet-dao 读到之后窗口已清零/);
+});
+
 test('two Mirasim pools stand in for nothing, and fleet off changes nothing', async (t) => {
   const { file } = await fleetAged(t, 60, (b) => {
     b.pools.push({ ...b.pools.find((p) => p.poolId === 'mirasim'), poolId: 'mirasim-2', name: '另一个 Mirasim' });

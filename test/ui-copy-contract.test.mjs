@@ -230,6 +230,18 @@ test('账号池页把 fleet-dao 的每个池 × 窗口都画出来，不是现�
   assert.match(preload, /fleetDisconnect: \(\) => ipcRenderer\.invoke\('fleet:disconnect'\)/);
 });
 
+test('账号池页：读到之后已清零的格子不印清零前的读数；fleet-dao 存疑的池说清只拿来推算', () => {
+  // 清零时刻已过（fleet-dao 判 reset）的读数作废：旧百分比、旧数、旧的「已打满」都不许再印
+  assert.match(renderer, /const reset = w\.resetsAt != null && w\.resetsAt <= Date\.now\(\) \/ 1000;/);
+  assert.match(renderer, /const pct = reset \? null : poolPct\(w\);/);
+  assert.match(renderer, /const val = reset \? '' : poolValue\(w\);/);
+  assert.match(renderer, /!reset && w\.upstreamStatus === 'limit_reached'/);
+  assert.match(renderer, /chip stale[^>]*>已清零</);
+  assert.match(renderer, /reset \? '等下一次读数'/);
+  // 池没读成 / 读数过期时，总览只拿它推算——账号池页那行说明要讲同一件事
+  assert.match(renderer, /if \(f\.mirasim\?\.doubt\) bits\.push\(`\$\{esc\(f\.mirasim\.doubt\)\}：[^`]*只拿来推算，带 ≈`\)/);
+});
+
 test('hub 模式的机器升级后，页脚用红字说「hub 已下线」，口径页说明美元只算本机', () => {
   // 审查 2026-09-25：多机合并停了、美元从全机合计变成只算本机，却一句提示都没有。
   assert.match(renderer, /else if \(p\.syncLogin\?\.retired\) \{/);
