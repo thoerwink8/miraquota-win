@@ -89,7 +89,8 @@ test('multi-machine detail lives in its own tab, never in the overview cards', (
 test('sync state copy keeps red for real trouble and shows the raw reason next to the plain one', () => {
   // 四态四色：绿=已接入、黄=中间态（本机已上传 / 抖动重试）、红=要处置、灰=连接中
   assert.match(renderer, /\.sync-state\.warn \{ color: var\(--warn\); \}/);
-  assert.match(renderer, /'GitHub 已接入'/);
+  assert.match(renderer, /`收件口已接入 · \$\{esc\(sy\.account \?\? ''\)\}`/);
+  assert.doesNotMatch(renderer, /GitHub 已接入|GitHub 直连/, 'git 通道早退役了，别再拿它当状态名');
   assert.match(renderer, /'同步失败：' \+ esc\(sy\.errorHint \?\? sy\.error \?\? ''\)/);
   assert.match(renderer, /'本机已上传，读取他机失败' : '同步重试中'/);
   assert.match(renderer, /'连接中…'/);
@@ -122,13 +123,23 @@ test('速度卡每一行要带 5h 窗花费，且窗口口径只能有一个含�
   assert.match(widget, /row\.usd > 0 \? usd\(row\.usd\)/);
 });
 
+test('推算出来的美元也挂 ≈：本机 Mirasim 一关，推算值不许冒充实读', () => {
+  // 2026-09-24：推算档的百分比胶囊挂了 ≈，而主行美元（由同一个推算百分比乘出来）与日均没挂——
+  // 截图上一眼看去就是一个「账号级已用 $2855」的实数。桌面面板与托盘提示都要挂。
+  assert.match(renderer, /const approx = w\.inferred && officialUsed != null \? '≈' : '';/);
+  assert.match(renderer, /mainText = approx \+ money\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+  assert.match(renderer, /日均 \$\{approx\}/);
+  const main = readFileSync(new URL('../app/main.mjs', import.meta.url), 'utf8');
+  assert.match(main, /` \$\{mark\}\$\$\{w\.scaledSpentUSD\.toFixed\(1\)\}`/);
+});
+
 test('美元主行必须与进度条同源，账本数退到副行并标注', () => {
   // 2026-09-23 用户：「$256，但进度条和实际这么多」。根子是两个来源并排摆：
   // 进度条/百分比/满额/余都是**官方点数**算的，而主行是**本机账本**——用户只会读成「算错了」。
   // 钉住：主行 = 官方点数 × 汇率（scaledSpentUSD），账本数降到副行且写明口径不同。
   // 两个显示面（桌面面板 + 内嵌 widget）必须一致，不许一个讲一套。
   assert.match(renderer, /const officialUsed = w\.scaledSpentUSD;/);
-  assert.match(renderer, /mainText = money\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+  assert.match(renderer, /mainText = (?:approx \+ )?money\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
   assert.match(renderer, /本机账本 <b>/);
   assert.match(widget, /const officialUsed = w\.scaledSpentUSD;/);
   assert.match(widget, /usd\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
@@ -191,4 +202,74 @@ test('the three dollar-trust alarms name the culprit and say what to do about it
   assert.match(engine, /guessedPrices: guessed/);
   assert.match(engine, /sourceGaps: gaps\.slice/);
   assert.match(engine, /staleShards: stale/);
+});
+
+test('账号池页把 fleet-dao 的每个池 × 窗口都画出来，不是现值的都挂标记，令牌不进页面', () => {
+  // 2026-09-24：fleet-dao 的额度表成为唯一来源，MiraQuota 变成它的桌面窗口。
+  assert.match(renderer, /<button id="tabPools">账号池<\/button>/);
+  assert.match(renderer, /pools: \['tabPools', 'pagePools'\]/);
+  assert.match(renderer, /renderPools\(p\.fleet\)/);
+  assert.match(engine, /fleet: this\.fleet\.status\(\)/, '引擎每条 payload 路径都要给这一块');
+  // 三种「不是现值」各有一枚标记：估算、上游这次没报、过了有效期
+  assert.match(renderer, /chip est[^>]*>估算</);
+  assert.match(renderer, />上游这次没报</);
+  assert.match(renderer, /读数超过有效期/);
+  assert.match(renderer, /w\.resetsAt != null \? fmtReset\(w\.resetsAt\)/, '清零倒计时');
+  // 没读成要说原因，不许装成「没有池」；「上游明说 0 个池」另有一句
+  assert.match(renderer, /p\.neverRead \? '没读成' : '这次没读成'/);
+  assert.match(renderer, /不是「没有额度」/, '从没读成过不许画成「没有额度」');
+  assert.match(renderer, /w\.staleSince != null/, '「上游这次没报」照 fleet-dao 的 staleSince');
+  assert.match(renderer, /这次没读到 fleet-dao：/);
+  assert.match(renderer, /fleet-dao 说它没有配置任何账号池/);
+  // 设置：地址 + 只读令牌（密码框）；令牌不回显、不进浏览器存储
+  assert.match(renderer, /id="fleetToken" type="password"/);
+  assert.match(renderer, /\$\('fleetToken'\)\.value = '';/);
+  assert.doesNotMatch(renderer, /localStorage\.setItem\([^)]*[Tt]oken/);
+  const preload = readFileSync(new URL('../app/preload.cjs', import.meta.url), 'utf8');
+  assert.match(preload, /fleetConnect: \(opts\) => ipcRenderer\.invoke\('fleet:connect', opts\)/);
+  assert.match(preload, /fleetDisconnect: \(\) => ipcRenderer\.invoke\('fleet:disconnect'\)/);
+});
+
+test('账号池页：读到之后已清零的格子不印清零前的读数；fleet-dao 存疑的池说清只拿来推算', () => {
+  // 清零时刻已过（fleet-dao 判 reset）的读数作废：旧百分比、旧数、旧的「已打满」都不许再印
+  assert.match(renderer, /const reset = w\.resetsAt != null && w\.resetsAt <= Date\.now\(\) \/ 1000;/);
+  assert.match(renderer, /const pct = reset \? null : poolPct\(w\);/);
+  assert.match(renderer, /const val = reset \? '' : poolValue\(w\);/);
+  assert.match(renderer, /!reset && w\.upstreamStatus === 'limit_reached'/);
+  assert.match(renderer, /chip stale[^>]*>已清零</);
+  assert.match(renderer, /reset \? '等下一次读数'/);
+  // 池没读成 / 读数过期时，总览只拿它推算——账号池页那行说明要讲同一件事
+  assert.match(renderer, /if \(f\.mirasim\?\.doubt\) bits\.push\(`\$\{esc\(f\.mirasim\.doubt\)\}：[^`]*只拿来推算，带 ≈`\)/);
+});
+
+test('hub 模式的机器升级后，页脚用红字说「hub 已下线」，口径页说明美元只算本机', () => {
+  // 审查 2026-09-25：多机合并停了、美元从全机合计变成只算本机，却一句提示都没有。
+  assert.match(renderer, /else if \(p\.syncLogin\?\.retired\) \{/);
+  assert.match(renderer, /class="go bad" id="footSync">\$\{p\.syncLogin\.retired === 'hub' \? 'hub 已下线'/);
+  assert.match(renderer, /美元只算本机 →/);
+  assert.match(renderer, /美元现在只算本机账本/);
+});
+
+test('内嵌控件的推算金额也挂 ≈', () => {
+  assert.match(widget, /const approx = w\.inferred && officialUsed != null \? '≈' : '';/);
+  assert.match(widget, /approx \+ usd\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+});
+
+test('跨域可读的本机 feed 只给控件要的字段：fleet-dao 地址、账号池、账目报表一律不出去', async () => {
+  const { widgetPayload } = await import('../provider/lib/injector.mjs');
+  const full = {
+    state: 'fleet', stateLabel: 'fleet 实读', capturedAt: 1, windows: [{ label: '5h', usedPercent: 3 }], detail: 'd',
+    fleet: { state: 'ok', url: 'https://fleet.example.invalid', pools: [{ poolId: 'x' }] },
+    ledger: { workspaces: [{ ws: 'D:/secret/path' }] }, syncLogin: { inbox: 'https://inbox.example.invalid' },
+    limitsFrom: { source: 'fleet' },
+    sync: { state: 'ok', inbox: 'https://inbox.example.invalid', account: 'someone', machines: [{ id: 'pc', self: true, account: 'someone' }, { id: 'vps', self: false }] },
+  };
+  const out = widgetPayload(full);
+  assert.deepEqual(Object.keys(out).sort(), ['capturedAt', 'detail', 'state', 'stateLabel', 'sync', 'windows']);
+  assert.deepEqual(out.sync, { state: 'ok', machines: [{ self: true }, { self: false }] }, '多机只留控件画「多机 ×N」要的');
+  for (const leak of ['fleet.example.invalid', 'secret/path', 'inbox.example.invalid', 'someone']) {
+    assert.ok(!JSON.stringify(out).includes(leak), leak);
+  }
+  const injector = readFileSync(new URL('../provider/lib/injector.mjs', import.meta.url), 'utf8');
+  assert.match(injector, /res\.end\(JSON\.stringify\(widgetPayload\(payload\(\)\)\)\)/, 'feed 出口只有这一处，必须过白名单');
 });

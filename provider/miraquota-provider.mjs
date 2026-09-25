@@ -105,12 +105,44 @@ function printSnapshot(p) {
     console.log(`速度 ${r.model}  ${ttft} · ${rate} · 端到端 ${r.endToEnd.toFixed(0)} tok/s · 最近 ${r.samples} 次${drift}`);
   }
   if (p.speed?.inflightSince?.length) console.log(`速度 ▶ 生成中 ${p.speed.inflightSince.length} 条`);
+  printFleet(p.fleet);
+}
+
+/** fleet-dao 的账号池 × 窗口（面板「账号池」页的同一份）。没读成的池与窗口照样列出来并说原因。 */
+function printFleet(f) {
+  if (!f || f.state === 'off') return;
+  const ago = (t) => `${Math.round((Date.now() / 1000 - t) / 60)} 分钟前`;
+  console.log(`fleet-dao ${f.url} · ${f.state}${f.error ? ` · 这次没读到：${f.error.message}` : ''}`
+    + (f.fetchedAt ? ` · 上次读到 ${ago(f.fetchedAt)}` : ''));
+  for (const pool of f.pools ?? []) {
+    const err = pool.lastError && (pool.lastReadOkAt == null || pool.lastError.at == null || pool.lastError.at > pool.lastReadOkAt)
+      ? `（没读成：${pool.lastError.message}）` : '';
+    const st = pool.problem ? `格式认不出：${pool.problem}`
+      : pool.neverRead ? '从没读成过' : `${pool.readOverdue ? '读数过期 · ' : ''}读成于 ${ago(pool.lastReadOkAt)}`;
+    console.log(`  ${pool.name}  ${st}${err}`);
+    for (const w of pool.windows ?? []) {
+      // 清零时刻已过：那次读数是清零前的，作废——不印旧百分比与旧数（与账号池页同判）
+      const reset = w.resetsAt != null && w.resetsAt <= Date.now() / 1000;
+      const pct = reset ? null
+        : w.utilization != null ? w.utilization * 100 : (w.used != null && w.limit > 0 ? w.used / w.limit * 100 : null);
+      const val = reset || w.used == null || w.unit === 'percent' ? ''
+        : ` ${w.unit === 'usd' ? '$' : ''}${w.used}/${w.limit ?? '?'}${w.unit === 'points' ? ' 点' : w.unit === 'tokens' ? ' tokens' : ''}`;
+      const marks = [w.reading === 'estimated' ? '估算' : null,
+        reset ? '已清零，等下一次读数' : w.staleSince != null ? '上游这次没报' : null,
+        !reset && w.upstreamStatus && w.upstreamStatus !== 'allowed' ? w.upstreamStatus : null].filter(Boolean).join(' · ');
+      console.log(`    ${w.label.padEnd(18)} ${pct != null ? (w.reading === 'estimated' ? '≈' : ' ') + pct.toFixed(1).padStart(5) + '%' : '     —'}${val}  ${reset ? '' : fmtReset(w.resetsAt ?? null)}${marks ? '  ' + marks : ''}`);
+    }
+    for (const x of pool.notes ?? []) console.log(`    注意：${x}`);
+  }
+  if (f.mirasim?.doubt) console.log(`  ${f.mirasim.doubt}：本机 Mirasim 关着时只拿它推算（≈）`);
+  if (f.mirasim?.skipped) console.log(`  ${f.mirasim.skipped}`);
 }
 
 if (flag('once')) {
   await engine.poll();
+  await engine.fleet.refresh();   // poll 里只是到点发起；--once 活不到下一跳，这里等它读完
   printSnapshot(engine.payload());
-  process.exit(engine.last || engine.anchors.usable ? 0 : 1);
+  process.exit(engine.last || engine.anchors.usable || engine.fleet.report ? 0 : 1);
 }
 
 /**
@@ -139,11 +171,7 @@ if (flag('sync-only')) {
   };
   await engine.poll();
   tick();
-  // hub 通道跟桌面同频（15 秒）：分片要「有新动静就早发」，而早发的机会只在 poll 里，
-  // 60 秒一轮就意味着别人最多晚一分钟才看得到这台机器刚跑完的请求。账本是增量扫的，
-  // 15 秒一次在服务器上不值一提。git / 收件口仍走 60 秒——那两条的发布本身就贵。
-  const pollMs = engine.sync?.mode === 'hub' ? POLL_MS : SYNC_ONLY_POLL_MS;
-  const timer = setInterval(() => engine.poll().then(tick).catch(() => {}), pollMs);
+  const timer = setInterval(() => engine.poll().then(tick).catch(() => {}), SYNC_ONLY_POLL_MS);
   const bye = () => { clearInterval(timer); process.exit(0); };
   process.on('SIGINT', bye);
   process.on('SIGTERM', bye);

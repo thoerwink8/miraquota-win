@@ -69,6 +69,8 @@ const stub = `<script>
     checkUpdate: () => Promise.resolve(),
     setPointCost: () => Promise.resolve(true),
     syncLogin: () => Promise.resolve({ ok: false, error: '预览模式' }),
+    fleetConnect: () => Promise.resolve({ ok: false, error: '预览模式' }),
+    fleetDisconnect: () => Promise.resolve({ ok: false, error: '预览模式' }),
     minimize: () => {}, hide: () => {}, quit: () => {},
   };
 </script>`;

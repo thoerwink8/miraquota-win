@@ -4,8 +4,9 @@
  *
  * 降级阶梯（Mirasim 关闭时仍有可读输出）：
  *   exact  /v1/limits 可读，原始额度点
+ *   fleet  本机没有新鲜实读，用 fleet-dao 读到的同一个账号的额度（实读，不标 ≈；比本机最后一次实测新才用）
  *   stale  接口刚断，显示最后一次实测（内存）
- *   reckoned  Mirasim 不可达，按落盘锚点滚动窗口 + 本机账本推算（下界，标 ≈）
+ *   reckoned  都没有新鲜的：按最近那次读数（本机锚点或 fleet-dao 的，谁新用谁）滚动窗口 + 本机账本推算（下界，标 ≈）
  *   local  连锚点都没有，按滚动窗口报本机支出
  */
 import { execFile } from 'node:child_process';
@@ -15,7 +16,7 @@ import { join } from 'node:path';
 
 import { Pricing } from './pricing.mjs';
 import { JournalLedger } from './journal-ledger.mjs';
-import { LedgerSync, DEFAULT_INBOX, DEFAULT_HUB, cleanMachineId } from './ledger-sync.mjs';
+import { LedgerSync, DEFAULT_INBOX, cleanMachineId } from './ledger-sync.mjs';
 import { PointsAttributor } from './points-attrib.mjs';
 import { familyLabel } from './model-families.mjs';
 import { Calibrator } from './calibrator.mjs';
@@ -59,11 +60,15 @@ import { Settings } from './settings.mjs';
 import { discoverSessionTokens } from './session-token.mjs';
 import { windowDuration, modelGroup } from './windows.mjs';
 import { AnchorStore, anchorsFrom, ANCHOR_MAX_AGE } from './anchors.mjs';
+import { FleetSource } from './fleet-source.mjs';
 
 const CHANNEL_DEFAULT = 4970;
+// 本机 Mirasim 完整发现失败后的退避（秒）：与轮询同频起步、翻倍、封顶 5 分钟（见 #readLimits）
+const DISCOVER_BACKOFF_MIN = 15;
+const DISCOVER_BACKOFF_MAX = 300;
 const STALE_AFTER = 90;      // 秒；超过转 stale
 const RECKON_AFTER = 600;    // 秒；stale 超过此龄期转锚点推算
-// 流水增量推给 hub 的节奏与批量：明细比聚合大得多（一批 2000 行 ≈ 300 KB），所以比同步轮
+// 流水增量推给收件口的节奏与批量：明细比聚合大得多（一批 2000 行 ≈ 300 KB），所以比同步轮
 // （10 分钟）密一档、但一轮最多推几批——推不完下轮接着推，水位保证不重不漏。
 const JOURNAL_EVERY = 300;      // 秒；两次推流水之间的最小间隔
 const JOURNAL_BATCH = 2000;     // 每批行数（与 journalSince 的 limit 一致）
@@ -73,17 +78,8 @@ const JOURNAL_MAX_BATCHES = 8;  // 一轮最多推几批，别把一轮 poll 拖
 const LEDGER_REPORT_DAYS = 7;
 const LEDGER_REPORT_ROWS = 8;
 const LEDGER_REPORT_EVERY = 60;
-/**
- * 秒；hub 通道下「这台机器刚有新动静」时的最短发布间隔。
- *
- * 按固定节奏发有个说不通的地方：别人正盯着这台机器的速度看，而它这一秒刚跑完一个请求，
- * 压着两分钟不发，对面读到的就是两分钟前的数——用户 2026-09-06 问的正是这个。
- * 所以有新样本就早发，只留一个下限防抖（一串连续请求不至于变成一串 PUT）。
- * 只对 hub 生效：收件口那条路是另一回事。
- */
-const FAST_PUSH_FLOOR = 15;
 export const LEVELS = {
-  exact: '精确', stale: '已过期', reckoned: '推算', local: '无数据', connecting: '连接中',
+  exact: '精确', fleet: 'fleet 实读', stale: '已过期', reckoned: '推算', local: '无数据', connecting: '连接中',
 };
 
 const run = (cmd, args) => new Promise((resolve) => {
@@ -178,6 +174,8 @@ export class Engine {
    *   没有任何人的会话记录，账本全部来自各机推上来的分片，扫本地只是白跑一趟。
    * @param opts.storeFile  流水库落点（默认 ~/.miraquota/store.db；给了 ledgerFile 就跟着它
    *   换个扩展名，测试注入的老参数照旧管用）
+   * @param opts.fleetOpts  fleet-dao 额度表的注入（配置路径、fetch、读完回调；默认读 ~/.miraquota/fleet.json）
+   * @param opts.discovery  本机 Mirasim 探测与完整发现的替身 { now, probe, find }（测试用；默认起 PowerShell）
    *
    * **路径注入要覆盖每一个会落盘的模块。** 少一个，测试就会去改真机的状态：2026-09-23
    * 实咬过一次——quota-share 那条测试用默认路径跑 poll()，而账本正好在这一版升级 schema，
@@ -200,14 +198,21 @@ export class Engine {
     this.calibrator = new Calibrator(opts.calibratorFile, { store: this.ledger.store });
     this.anchors = new AnchorStore(opts.anchorFile, { store: this.ledger.store });
     this.settings = new Settings(opts.settingsFile);
+    // 所有账号池 × 窗口的唯一来源；本机 Mirasim 关着时，额度卡也用它读到的那份（见 payload()）
+    this.fleet = new FleetSource(opts.fleetOpts);
     this.sync = new LedgerSync(opts.syncOpts);
     // 同步启用时放宽归因静置：外机支出要等它下一轮发布分片才可见（见 points-attrib.mjs）。
     if (this.sync.enabled) this.pointsAttrib.relaxSettle(this.sync.intervalSec);
     this.speed = null;
     this.cachedRouter = null;
+    // 本机 Mirasim 的探测与完整发现（慢路起两个 PowerShell）。测试注入假的：不起进程、可拨钟、可计数。
+    this.discovery = {
+      now: () => Date.now() / 1000,
+      probe: () => this.#probeDefaultChannel(),
+      find: () => this.#findRouter(),
+      ...(opts.discovery ?? {}),
+    };
     this.last = null;           // { at, limits }
-    // 他机分片带来的账号级额度快照（最新的一份）：本机连不上 Mirasim 时的额度来源
-    this.foreignLimits = null;  // { capturedAt, windows, machineId, account, suspended… }
     this.pointsTrail = {};
     this.everConnected = false;
   }
@@ -215,19 +220,6 @@ export class Engine {
   #syncBusy = false;
   #syncKickedAt = 0;
   #shardsWarmed = false;
-  #quotaPullBusy = false;
-  #quotaPullAt = 0;
-  #lastStamp = null;
-
-  /**
-   * 「这台机器有没有新动静」的指纹：最新一次调用的时刻 + 账本分钟桶数。
-   * 只用来决定要不要早发一轮，不参与任何口径——指纹没变就说明这一轮发出去的东西
-   * 与上一轮逐字相同，那就没必要发。
-   */
-  #activityStamp(speed) {
-    const newest = (speed?.rows ?? []).reduce((a, r) => Math.max(a, r.latestAt ?? 0), 0);
-    return `${Math.round(newest)}|${this.ledger.bucketCount}`;
-  }
 
   /**
    * 冷启动一次性装载上一轮已 fetch 到的分片（只读缓存，不联网，百毫秒级）。
@@ -244,62 +236,25 @@ export class Engine {
     } catch { /* 读缓存失败就等正常那一轮，不影响主流程 */ }
   }
 
-  /** 外机分片到手：账本合并 + 挑出最新的账号额度快照。两处入口共用。 */
+  /** 外机分片到手：账本合并。冷启动缓存与每轮同步两处入口共用。 */
   #adoptShards(shards) {
     this.ledger.adoptForeignShards(shards);
-    this.#adoptForeignLimits(shards);
-  }
-
-  /**
-   * 他机分片里的账号级额度快照，取 capturedAt 最新的一份。
-   * 只进不退：某一轮读不到分片（网络抖动、那台机器暂时离场）时留住上一份，
-   * 否则界面会从「他机 2 分钟前的数」猛地退回本机那份陈旧锚点。龄期由显示面判。
-   */
-  #adoptForeignLimits(shards) {
-    let best = null;
-    for (const s of Array.isArray(shards) ? shards : []) {
-      const l = s?.limits;
-      if (!Array.isArray(l?.windows) || !l.windows.length || !(l.capturedAt > 0)) continue;
-      if (!best || l.capturedAt > best.capturedAt) {
-        best = {
-          capturedAt: l.capturedAt, windows: l.windows,
-          machineId: s.machineId ?? null, account: s.account ?? null,
-          suspended: !!l.suspended, unmetered: !!l.unmetered, degraded: !!l.degraded,
-        };
-      }
-    }
-    if (best && !(this.foreignLimits?.capturedAt > best.capturedAt)) this.foreignLimits = best;
   }
 
   /**
    * 多机账本同步：按节流间隔触发，异步跑完把外机分片交给账本合并。
    * 失败不阻断主流程，只更新 sync 状态（payload 里可见）。
-   *
-   * 手里有账号额度快照（本机连着 Mirasim）时走 quotaIntervalSec 的快节奏：分片里那块
-   * 额度是别的机器唯一的额度来源，压着十分钟不发，对面主行印的就是十分钟前的数。
+   * 分片只带账本与速度——账号额度不走这里（本机实读或 fleet-dao，见 payload()）。
    */
   #maybeSync() {
     if (!this.sync.enabled) return;
     if (this.#syncBusy) return;
     const now = Date.now() / 1000;
-    const limits = this.#shardLimits();
-    const speed = this.#shardSpeed();
-    // hub 通道一律走快节奏：它是自己的服务器，一次小 JSON 的 PUT——600 秒那个默认值
-    // 是给 git force-push 定的价。压着它，别的机器看到的速度/账本就一直是十几分钟前的。
-    const every = (limits || this.sync.mode === 'hub')
-      ? this.sync.quotaIntervalSec : this.sync.intervalSec;
-    const since = now - this.#syncKickedAt;
-    // 刚跑完一个请求就早发一轮（见 FAST_PUSH_FLOOR），别让盯着这台机器看的人读两分钟前的数
-    const stamp = this.#activityStamp(speed);
-    const nudged = this.sync.mode === 'hub' && stamp !== this.#lastStamp && since >= FAST_PUSH_FLOOR;
-    if (since < every && !nudged) return;
-    this.#lastStamp = stamp;
+    if (now - this.#syncKickedAt < this.sync.intervalSec) return;
     this.#syncKickedAt = now;
     this.#syncBusy = true;
-    // hub 通道另发一份账号额度：服务器上没有 Mirasim，这份数据只有跑着它的机器送得上去。
-    // 与分片分开发——一台机器账本推失败不该连带把全账号的额度也丢了。
-    if (limits) this.sync.pushLimits(limits).catch(() => { /* pushLimits 自吞错误 */ });
-    this.sync.run(this.ledger, now, (speed || limits) ? { ...(speed ? { speed } : {}), ...(limits ? { limits } : {}) } : null)
+    const speed = this.#shardSpeed();
+    this.sync.run(this.ledger, now, speed ? { speed } : null)
       .then((r) => {
         if (!r) return;
         this.#adoptShards(r.shards);
@@ -323,25 +278,6 @@ export class Engine {
       try { n += this.ledger.store.insertCalls(j.rows.map((r) => ({ ...r, machine }))); } catch { /* 单份坏不影响其余 */ }
     }
     if (n) this.ledger.invalidate();   // 新行进来了，合并索引作废
-  }
-
-  /**
-   * 本机 Mirasim 没在跑时的额度补给：按 quotaIntervalSec 只读拉一次他机分片。
-   *
-   * 不这么做，额度要等下一轮完整同步（默认 10 分钟）才刷新，而这台机器此刻**只有**
-   * 他机数据可用。只读省掉 push：本机没有 relay 在扣点，账本几乎不动，没什么可发的。
-   * 本机连得上 Mirasim 时一次都不会发生（那时额度是自己实测的）。
-   */
-  #maybeQuotaPull(now) {
-    if (!this.sync.enabled || this.#quotaPullBusy || this.#syncBusy) return;
-    if (this.last && now - this.last.at <= RECKON_AFTER) return;
-    if (now - this.#quotaPullAt < this.sync.quotaIntervalSec) return;
-    this.#quotaPullAt = now;
-    this.#quotaPullBusy = true;
-    this.sync.refreshOnly(now)
-      .then((shards) => { if (shards) this.#adoptShards(shards); })
-      .catch(() => { /* refreshOnly 自吞错误，这里兜底防未处理拒绝 */ })
-      .finally(() => { this.#quotaPullBusy = false; });
   }
 
   /**
@@ -417,30 +353,6 @@ export class Engine {
     return { rows: r.rows, sampleTotal: r.sampleTotal ?? 0 };
   }
 
-  /**
-   * 随分片发出去的账号级额度快照：额度点是账号级的（同一个 userId 的所有设备共用一个池），
-   * 哪台机器读到的都是同一份——所以只要有一台还连着 Mirasim，没连上的机器就不必退回
-   * 自己那份陈旧锚点去猜满额（用户 2026-09-05：另一台在跑，总额度也要随时同步）。
-   *
-   * capturedAt 是**读到那一刻**，不是发分片这一刻：对面据此判龄期、与自己的锚点比新旧，
-   * 差一步就会把陈旧数据当成新鲜的。太老的不发——那时对面自己的锚点多半还更近。
-   */
-  #shardLimits(nowSec = Date.now() / 1000) {
-    if (!this.last?.limits?.windows?.length) return null;
-    if (nowSec - this.last.at > ANCHOR_MAX_AGE) return null;
-    const { windows, suspended, unmetered, degraded } = this.last.limits;
-    return {
-      capturedAt: this.last.at,
-      windows: windows.map((w) => ({
-        label: w.label, used: w.used, budget: w.budget, resetAt: w.resetAt,
-        ...(w.modelScoped ? { modelScoped: true } : {}),
-      })),
-      ...(suspended ? { suspended: true } : {}),
-      ...(unmetered ? { unmetered: true } : {}),
-      ...(degraded ? { degraded: true } : {}),
-    };
-  }
-
   async #discoverChannelPort(processes) {
     const verify = async (p) => {
       const j = await getJSON(`http://127.0.0.1:${p}/api/health`);
@@ -477,15 +389,61 @@ export class Engine {
     return { port: Number(m[1]), path: m[2]?.replace(/\/+$/, '') || null, token: process.env.ANTHROPIC_AUTH_TOKEN || null };
   }
 
-  /** 路由端口与令牌：显式参数 → 本进程环境 → PEB 自动发现 → 免认证（旧版）。 */
+  #discoverAt = 0;                         // 下一次允许完整发现的时刻（秒）
+  #discoverDelay = DISCOVER_BACKOFF_MIN;   // 下一次失败后要等多久
+  #mirasimUp = false;                      // 上一轮探测时默认通道端口上有没有 Mirasim
+
+  /**
+   * 读一次本机 /v1/limits。
+   *
+   * 快路：上一轮认准的路由还通就直接读。读不通才走完整发现——它要起两个 PowerShell（进程枚举 +
+   * PEB 读令牌，本机实测每轮约 4 秒）。**Mirasim 关着时这正是常态**（额度改走 fleet-dao），所以慢路
+   * 失败就退避：15 秒起翻倍、封顶 5 分钟。退避期间只做一件不起进程的事——探一下默认通道端口；
+   * 它从「没人」变「有 Mirasim」（刚开），立刻发现一次，不等退避。端口改过的 Mirasim 最迟 5 分钟被发现。
+   */
+  async #readLimits() {
+    if (this.cachedRouter) {
+      const limits = await this.#fetchLimits(this.cachedRouter);
+      if (limits) return limits;
+      this.cachedRouter = null;
+    }
+    const now = this.discovery.now();
+    const up = await this.discovery.probe();
+    if (up && !this.#mirasimUp) this.#discoverAt = 0;
+    this.#mirasimUp = up;
+    if (now < this.#discoverAt) return null;
+    const found = await this.discovery.find();
+    if (found?.limits) {
+      this.cachedRouter = found.pair;
+      this.#discoverAt = 0;
+      this.#discoverDelay = DISCOVER_BACKOFF_MIN;
+      return found.limits;
+    }
+    this.#discoverAt = now + this.#discoverDelay;
+    this.#discoverDelay = Math.min(this.#discoverDelay * 2, DISCOVER_BACKOFF_MAX);
+    return null;
+  }
+
+  /** 不起进程：默认通道端口上有没有 Mirasim 在听。没人听时连接当场被拒，毫秒级。 */
+  async #probeDefaultChannel() {
+    const j = await getJSON(`http://127.0.0.1:${CHANNEL_DEFAULT}/api/health`, 800);
+    return j?.name === 'mirasim';
+  }
+
+  /** 完整发现（慢路）：进程枚举 → 通道端口 → 路由与令牌。 */
+  async #findRouter() {
+    const processes = await mirasimProcesses();
+    const channelPort = await this.#discoverChannelPort(processes);
+    return this.#discoverRouter(processes, channelPort);
+  }
+
+  /**
+   * 路由端口与令牌：显式参数 → 本进程环境 → PEB 自动发现 → 免认证（旧版）。
+   * 返回认准的那一对与它读到的那份额度（{ pair, limits }），调用方不必再读一遍。
+   */
   async #discoverRouter(processes, channelPort) {
     const explicitPort = Number(this.opts.routerPort ?? 0);
     const explicitToken = this.opts.routerToken ?? null;
-
-    if (this.cachedRouter) {
-      if (await this.#fetchLimits(this.cachedRouter)) return this.cachedRouter;
-      this.cachedRouter = null;
-    }
 
     const pairs = [];
     if (explicitPort) pairs.push({ port: explicitPort, token: explicitToken });
@@ -508,10 +466,8 @@ export class Engine {
     for (const d of discovered) if (!pairs.some((x) => x.port === d.port && (x.path ?? null) === (d.path ?? null))) pairs.push(d);
 
     for (const pair of pairs) {
-      if (await this.#fetchLimits(pair)) {
-        this.cachedRouter = pair;
-        return pair;
-      }
+      const limits = await this.#fetchLimits(pair);
+      if (limits) return { pair, limits };
     }
     return null;
   }
@@ -608,17 +564,15 @@ export class Engine {
     this.#pollBusy = true;
     try {
       if (!this.opts.forceOffline) {
-        const processes = await mirasimProcesses();
-        const channelPort = await this.#discoverChannelPort(processes);
-        const router = await this.#discoverRouter(processes, channelPort);
-        const limits = router ? await this.#fetchLimits(router) : null;
+        const limits = await this.#readLimits();
         if (limits) this.ingestLimits(limits, Date.now() / 1000);
       }
+      // fleet-dao 到点才读、不等它：它慢或挂了都不该拖住本机这一轮（读完经 onUpdate 叫面板重画）
+      this.fleet.maybeRefresh(Date.now() / 1000);
       if (!this.opts.noLocal) this.ledger.refresh();
       this.#speedRefresh();   // 必须在 #maybeSync 之前：分片要带这一轮的速度，否则首轮发出去的是空速度
       await this.#warmShards();
       this.#maybeSync();   // 账本刷新完再发分片，coverage.toSec 才是「本次刷新完成时刻」
-      this.#maybeQuotaPull(Date.now() / 1000);   // 本机没实测时，额度从还在跑的那台机器补
       this.pointsAttrib.settle(this.ledger, Date.now() / 1000);
       await this.#pushJournalDelta();
       return !!this.last;
@@ -630,10 +584,10 @@ export class Engine {
   #journalAt = 0;
 
   /**
-   * 把本机流水增量推给服务器（明细，供账号级对账与任务报表）。
+   * 把本机流水增量推给收件口（明细，供账号级对账与任务报表）。
    *
    * 三件事定成败：
-   *  1. **两条 HTTP 通道都收**（hub 与收件口各走各的端点，行格式同一套）；没配同步时不推；
+   *  1. **收件口在就推**（行格式与 `inbox/shared.mjs` 的判据同一套）；没配同步时不推；
    *  2. **按批推、推完再退水位**：水位存库里（重启不丢），失败就停在那批之前，下一轮重试。
    *     行的 `kh` 是主键，重推幂等，所以「宁可重推一段」是安全的；
    *  3. **不挡主流程**：失败只记一行日志，不抛——它不该让采集/展示跟着挂。
@@ -645,14 +599,15 @@ export class Engine {
     this.#journalAt = now;
     this.#journalBusy = true;
     try {
-      let since = this.ledger.journalWatermark();
-      if (since == null) since = Math.floor(now) - 8 * 86400;   // 新库：从保留窗起点补一次
+      const dest = this.sync.destination;                      // 水位按去处分开记，换去处从头补（见 journalWatermark）
+      let since = this.ledger.journalWatermark(dest);
+      if (since == null) since = Math.floor(now) - 8 * 86400;   // 新库或新去处：从保留窗起点补一次
       for (let i = 0; i < JOURNAL_MAX_BATCHES; i++) {
         const rows = this.ledger.journalSince(since);
         if (!rows.length) break;
         await this.sync.pushJournal(rows);
         since = rows[rows.length - 1].ts;                        // 按 ts 升序取的，最后一行就是水位
-        this.ledger.setJournalWatermark(since);
+        this.ledger.setJournalWatermark(since, dest);
         if (rows.length < JOURNAL_BATCH) break;
       }
     } catch (e) {
@@ -660,38 +615,89 @@ export class Engine {
     } finally { this.#journalBusy = false; }
   }
 
-  /** 契约 A 的 quota.json。只填有据可查的字段，控件对缺字段是容忍的。 */
+  /**
+   * 契约 A 的 quota.json。只填有据可查的字段，控件对缺字段是容忍的。
+   *
+   * 额度只有两个来源：本机 /v1/limits（本机实时来源）与 fleet-dao（同一个账号，谁读到都一样）。
+   * 判据只有一条——**谁更新用谁**，然后看它还算不算现值：本机 90 秒内算精确；fleet-dao 在它自己
+   * 声明的有效期（staleAfterMinutes）内、它自己没存疑、窗口没过清零时刻才算实读（见 #fleetLive）；
+   * 都算不上现值才推算，推算一律标 ≈。
+   */
   payload() {
     const now = Date.now() / 1000;
     const age = this.last ? now - this.last.at : Infinity;
 
-    if (this.last && age <= RECKON_AFTER) return this.#measuredPayload(now, age);
-    const remote = this.#remoteAnchors(now);
+    if (age <= STALE_AFTER) return this.#measuredPayload(now, this.last, 'exact');
+    const fleet = this.fleet.mirasimSnapshot();
+    const live = this.#fleetLive(now, fleet);
+    if (live && !(this.last?.at >= fleet.at)) return this.#fleetPayload(now, fleet, live);
+    if (age <= RECKON_AFTER) return this.#measuredPayload(now, this.last, 'stale');
+    const remote = this.#fleetAnchors(now, fleet);
     if (remote) return this.#reckonedPayload(now, remote);
     if (this.anchors.usable) return this.#reckonedPayload(now);
     return this.#localPayload(now);
   }
 
   /**
-   * 他机快照当锚点：只在它比本机锚点**更新**时才用。
-   *
-   * 两份锚点是同一个东西的两次读数（账号级额度），差别只在读的时刻与读的人，所以判据
-   * 只有一条——谁更近。本机刚断线时自己的锚点更近，走本机那条；断了半天而他机一直在跑，
-   * 走他机那条，连满额换了档位都跟着变。
+   * fleet-dao 那份能不能当现值，能就给出可当现值的窗口：
+   *  - fleet-dao 自己没判这个池没读成 / 过期（doubt）——它都不信的数，这边不许写成「fleet 实读」；
+   *  - 在它自己声明的有效期（staleAfterMinutes）内；
+   *  - 清零时刻已过的窗口丢掉：那格读数是清零前的（fleet-dao 的 windowState 同判 reset），
+   *    当现值会把清零前的 95% 印在一个刚清零的窗上。丢完一格不剩就不是现值。
+   * 判据用本机钟（resetAt 已校过钟差），缓存着的旧回包过了清零时刻也照样丢。
+   * @returns { windows, dropped: [label] } | null
    */
-  #remoteAnchors(now) {
-    const f = this.foreignLimits;
-    if (!f || now - f.capturedAt >= ANCHOR_MAX_AGE) return null;
-    if (this.anchors.usable && this.anchors.capturedAt >= f.capturedAt) return null;
-    const anchors = anchorsFrom(f.windows, f.capturedAt);
-    if (!anchors.length) return null;
-    return { anchors, capturedAt: f.capturedAt, machineId: f.machineId, account: f.account, from: f };
+  #fleetLive(now, fleet) {
+    if (!fleet || fleet.doubt || now - fleet.at > fleet.staleAfterSec) return null;
+    const windows = fleet.limits.windows.filter((w) => w.resetAt > now);
+    if (!windows.length) return null;
+    return { windows, dropped: fleet.limits.windows.filter((w) => w.resetAt <= now).map((w) => w.label) };
   }
 
-  #measuredPayload(now, age) {
-    const stale = age > STALE_AFTER;
-    const level = stale ? 'stale' : 'exact';
-    const limits = this.last.limits;
+  /**
+   * fleet-dao 读到的账号额度当现值：本机 Mirasim 没开，而 #fleetLive 判它还算现值。
+   * 这是实读（不标 ≈），但要说清是谁、多久前读的——本机 Mirasim 没开却显示实数，不说来源会被当成出错；
+   * 少了清零的那几格也要说，否则一张卡凭空消失。
+   */
+  #fleetPayload(now, fleet, live) {
+    const out = this.#measuredPayload(now, { at: fleet.at, limits: { ...fleet.limits, windows: live.windows } }, 'fleet');
+    const ageMin = Math.round((now - fleet.at) / 60);
+    out.detail = `本机 Mirasim 未运行：额度用 fleet-dao ${ageMin < 1 ? '刚刚' : `${ageMin} 分钟前`}读到的「${fleet.name}」`
+      + '（账号级，他人占用已计入）'
+      + (live.dropped.length ? `；${live.dropped.join('、')} 窗读到之后已清零，等 fleet-dao 下一次读数` : '');
+    out.limitsFrom = { source: 'fleet', poolId: fleet.poolId, name: fleet.name, readAt: fleet.at, ageSeconds: now - fleet.at };
+    return out;
+  }
+
+  /**
+   * fleet-dao 那份当不了现值（过了有效期、fleet-dao 自己存疑、或窗口全过了清零时刻），但比本机锚点新：
+   * 拿它当锚点推算（标 ≈；锚点库把过了清零时刻的窗滚到新窗口，从本机账本起算）。
+   * 两份锚点是同一个东西的两次读数，判据只有谁更近；两边都超过 30 天就都不采信。
+   */
+  #fleetAnchors(now, fleet) {
+    if (!fleet || now - fleet.at >= ANCHOR_MAX_AGE) return null;
+    if (this.anchors.usable && this.anchors.capturedAt >= fleet.at) return null;
+    const anchors = anchorsFrom(fleet.limits.windows, fleet.at);
+    if (!anchors.length) return null;
+    const why = fleet.doubt
+      ?? (now - fleet.at <= fleet.staleAfterSec && fleet.limits.windows.every((w) => w.resetAt <= now)
+        ? 'fleet-dao 读到之后窗口已清零' : 'fleet-dao 的读数也已过期');
+    return {
+      anchors, capturedAt: fleet.at,
+      detail: (ageText) => `本机 Mirasim 未运行，${why}：按它 ${ageText}前读到的账号额度推算；他人占用已计到那一刻`,
+      reckonFrom: { source: 'fleet', poolId: fleet.poolId, name: fleet.name },
+    };
+  }
+
+  /**
+   * 实测（或 fleet-dao 实读）那份额度的整份 payload。
+   * @param snap  { at, limits }——本机的 this.last，或 fleet-dao 替补的那份
+   * @param level 'exact' | 'stale' | 'fleet'
+   */
+  #measuredPayload(now, snap, level) {
+    const age = now - snap.at;
+    const stale = level === 'stale';
+    const limits = snap.limits;
     const coherence = evaluateCoherence(limits.windows, this.ledger, now, this.settings.groupPointCost);
     const rate = coherence.perPoint;
 
@@ -719,7 +725,8 @@ export class Engine {
         this.#fullOf(w.label, w.budget, group, this.#officialFull(w.budget, groupRatio));
       calibDropped += dropped;
       const pace = start != null && dur ? Math.min(100, Math.max(0, (now - start) / dur * 100)) : null;
-      const eta = this.#eta(w, now);
+      // 打满时刻靠本机近 1 小时的点数轨迹外推；fleet-dao 那份不进轨迹，拿本机旧轨迹套它的数会编出一个钟点
+      const eta = level === 'fleet' ? null : this.#eta(w, now);
       const exhaust = this.#exhaust(w, start, now, group);
       const breakdown = this.#familyBreakdown(start, now, group);
       return {
@@ -752,7 +759,7 @@ export class Engine {
       : limits.unmetered ? '账号不计量，额度上限不适用'
       : limits.degraded ? '上游降级运行中' : null;
 
-    const out = this.#base(level, this.last.at, windows);
+    const out = this.#base(level, snap.at, windows);
     out.unitPriceUSD = OFFICIAL_PER_POINT;
     if (rate != null) {
       out.ledgerPerPoint = rate;
@@ -780,7 +787,8 @@ export class Engine {
 
   /**
    * 锚点推算：窗口边界滚动 + 账本。同窗口期内以锚点百分比为基线（更准），滚动后纯账本口径。
-   * @param remote 他机送来的账号额度快照当锚点时传入（见 #remoteAnchors）；否则用本机锚点
+   * @param remote 别处读到的账号额度当锚点时传入：{ anchors, capturedAt, detail(ageText), reckonFrom }；
+   *   不传就用本机锚点
    */
   #reckonedPayload(now, remote = null) {
     const src = remote ?? { anchors: this.anchors.anchors, capturedAt: this.anchors.capturedAt };
@@ -832,22 +840,13 @@ export class Engine {
     if (pcRM) out.pointCostModels = pcRM;
     out.measured = false;
     if (remote) {
-      const who = remote.account && remote.account !== remote.machineId
-        ? `${remote.account}·${remote.machineId}` : (remote.machineId ?? '另一台机器');
-      // 他机读到的是**账号级**额度，他人占用已经计在里面了——这跟本机锚点那条不是一回事，
-      // 文案必须分开写，否则用户会以为这个数照样看不见别人。
-      out.detail = `本机 Mirasim 未运行，按「${who}」${ageText}前读到的账号额度推算；他人占用已计到那一刻`;
-      out.reckonFrom = {
-        machineId: remote.machineId, account: remote.account,
-        capturedAt: remote.capturedAt, ageSeconds: now - remote.capturedAt,
-      };
-      const n = remote.from.suspended ? '账号被暂停，额度数字仅供参考'
-        : remote.from.unmetered ? '账号不计量，额度上限不适用'
-        : remote.from.degraded ? '上游降级运行中' : null;
-      if (n) out.accountNotice = n;
+      // 别处读到的是**账号级**额度，他人占用已经计在里面了——这跟本机锚点那条不是一回事，
+      // 文案由来源自己给，否则用户会以为这个数照样看不见别人。
+      out.detail = remote.detail(ageText);
+      out.reckonFrom = { ...remote.reckonFrom, capturedAt: remote.capturedAt, ageSeconds: now - remote.capturedAt };
     } else if (this.opts.noLocal) {
-      // 服务端：那台机器上本来就没有 Mirasim，说「Mirasim 未运行」是在答非所问——
-      // 它等的是别的机器把额度推上来（这句会经 hub-client 合并后印在用户的面板上）。
+      // 服务端 hub（server/，停服前还在跑老版本客户端的数据）：那台机器上本来就没有 Mirasim，
+      // 说「Mirasim 未运行」是在答非所问——它等的是别的机器把额度推上来。
       out.detail = `没有机器推新的账号额度，按 ${ageText}前的快照推算`;
     } else {
       out.detail = `Mirasim 未运行，按 ${ageText}前的窗口锚点推算；他人占用不可见`;
@@ -1107,10 +1106,16 @@ export class Engine {
       speed: this.#speedWithCost(this.#speedReport(), Date.now() / 1000, windows),
       // 无同步配置时不出现该字段，显示面据此不画任何新 UI（硬性验收项）。
       ...(this.sync.enabled ? { sync: { ...this.sync.status(), ...this.#machineUsage(windows) } } : {}),
-      // 没同步时给登录入口（收件口地址可改）：没有 GitHub 的人从这里进（2026-09-02）
-      ...(!this.sync.enabled ? { syncLogin: { inbox: DEFAULT_INBOX, hub: DEFAULT_HUB } } : {}),
+      // 没同步时给登录入口（收件口地址可改）：没有 GitHub 的人从这里进（2026-09-02）。
+      // sync.json 配的是退役通道（git / hub）时带上 retired，登录卡据此说清「原来那条路没了」。
+      ...(!this.sync.enabled ? {
+        syncLogin: { inbox: DEFAULT_INBOX, ...(this.sync.retiredChannel ? { retired: this.sync.retiredChannel } : {}) },
+      } : {}),
       ...(this.#roster() ?? {}),
       ...this.#priceTrust(),
+      // fleet-dao 的账号池 × 窗口（「账号池」页画它）。每条 payload 路径都给、未配置也给
+      // { state: 'off' }：那一页要据此给「接上」那张卡。里面没有令牌。
+      fleet: this.fleet.status(),
       // 账目报表（任务/工作区/会话）：三条 payload 路径都给——它是本机账本的事实，
       // 不是「连上 Mirasim 才有」的东西。
       ...((r) => (r ? { ledger: r } : {}))(this.#ledgerReport(Date.now() / 1000)),

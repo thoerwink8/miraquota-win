@@ -10,7 +10,6 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 import { Engine } from '../provider/lib/engine.mjs';
-import { HubClient } from '../provider/lib/hub-client.mjs';
 import { startFeed, Injector } from '../provider/lib/injector.mjs';
 import { resolveVersion } from './version.mjs';
 import { createUpdater } from './updater.mjs';
@@ -28,7 +27,6 @@ if (!app.requestSingleInstanceLock()) {
   let win = null;
   let tray = null;
   let engine = null;
-  let hub = null;
   let updater = null;
   let ticks = 0;
 
@@ -101,7 +99,8 @@ if (!app.requestSingleInstanceLock()) {
   function trayTooltip(p) {
     const parts = (p.windows ?? []).slice(0, 3).map((w) => {
       const mark = w.inferred ? '≈' : '';
-      const usd = w.scaledSpentUSD != null ? ` $${w.scaledSpentUSD.toFixed(1)}` : '';
+      // 推算档的美元也是推出来的：与百分比同挂 ≈（面板主行同一条规矩）
+      const usd = w.scaledSpentUSD != null ? ` ${mark}$${w.scaledSpentUSD.toFixed(1)}` : '';
       return `${w.label} ${mark}${w.usedPercent.toFixed(1)}%${usd}`;
     });
     return ['MiraQuota · ' + (p.stateLabel ?? ''), ...parts].join('\n');
@@ -128,17 +127,7 @@ if (!app.requestSingleInstanceLock()) {
     tray.setContextMenu(menu);
   }
 
-  /**
-   * 这一帧要画的 payload。配了自建服务器就以它算的那份为准（它手里有全部机器的账本，
-   * 本机算不全），本机那份只贡献机器级字段——速度、模型清单、同步状态（见 hub-client 的
-   * LOCAL_FIELDS）。服务器不可用或数据过期时原样退回本机那份，行为与没配 hub 时一致。
-   */
-  function currentPayload() {
-    const local = engine.payload();
-    return hub?.enabled ? hub.merge(local) : local;
-  }
-
-  function pushFrame(p = currentPayload()) {
+  function pushFrame(p = engine.payload()) {
     if (win && !win.isDestroyed()) win.webContents.send('quota', p);
     if (tray) tray.setToolTip(trayTooltip(p));
   }
@@ -152,15 +141,16 @@ if (!app.requestSingleInstanceLock()) {
   }
 
   app.whenReady().then(async () => {
-    engine = new Engine({ forceOffline: process.argv.includes('--offline') });
+    engine = new Engine({
+      forceOffline: process.argv.includes('--offline'),
+      // fleet-dao 一读完（成败都算）就重画，不等 5 秒心跳：接上、断网、恢复都立刻看得见
+      fleetOpts: { onUpdate: () => { try { pushFrame(); } catch { /* 窗口还没建好 */ } } },
+    });
     await engine.loadSpeed();
-    // 服务器一有新数据就重画，不等 5 秒心跳——这是「随时同步」里的「随时」
-    hub = new HubClient({ onPayload: () => { try { pushFrame(); } catch { /* 窗口还没建好 */ } } });
-    hub.start();
     applyTheme(readUI().theme);   // 建窗前定主题，避免首帧闪一下另一套配色
     createWindow();
     createTray();
-    ipcMain.handle('quota:get', () => currentPayload());
+    ipcMain.handle('quota:get', () => engine.payload());
     // 与 dist 同一口径（见 app/version.mjs）；安装包无 .git 时回退 package.json（builder 已注入）
     ipcMain.handle('app:version', () => APP_VERSION);
     // 档位倍率：落盘成功才算改成功，改完立刻重画一帧，用户不用等下一次心跳。
@@ -175,14 +165,12 @@ if (!app.requestSingleInstanceLock()) {
       if (r?.ok) await tick().catch(() => {});
       return r;
     });
-    // 接自建服务器：写完配置要让 HubClient 重读并连上，否则要等下次重启才生效
-    ipcMain.handle('sync:hub', async (_e, opts) => {
-      const r = await engine.sync.connectHub(opts ?? {});
-      if (r?.ok) {
-        engine.pointsAttrib.relaxSettle(engine.sync.intervalSec);
-        hub?.reload();
-        await tick().catch(() => {});
-      }
+    // 接 fleet-dao：先按填的地址与只读令牌真读一次 /api/quota，读成了才写 ~/.miraquota/fleet.json。
+    // 返回值与 payload 里都没有令牌——它只进那个文件和请求头。
+    ipcMain.handle('fleet:connect', (_e, opts) => engine.fleet.connect(opts ?? {}));
+    ipcMain.handle('fleet:disconnect', () => {
+      const r = engine.fleet.disconnect();
+      try { pushFrame(); } catch { /* 窗口还没建好 */ }
       return r;
     });
     ipcMain.handle('theme:get', () => applyTheme(readUI().theme));
