@@ -24,7 +24,29 @@ export function feedToken() {
   return fresh;
 }
 
-/** 契约 A：回环 feed。`payload` 为取数函数；`onQuit` 不给则 /quit 不开。 */
+/**
+ * 控件读的那几个字段（契约 A 的必填四项 windows / capturedAt / state / stateLabel 之外，控件实际用到的）。
+ * 控件要新字段时加到这里——别图省事把整份 payload 放出去。
+ */
+const WIDGET_FIELDS = ['state', 'stateLabel', 'measured', 'capturedAt', 'mode', 'host', 'relayStatus', 'pricing',
+  'buckets', 'windows', 'speed', 'detail', 'accountNotice', 'unitPriceUSD', 'unitPriceNotice', 'ledgerPerPoint'];
+
+/**
+ * feed 对外的那一份：只留控件读的字段。
+ *
+ * feed 是 `Access-Control-Allow-Origin: *` 且 GET 不鉴权（控件跑在 Mirasim 的页面里跨域来取），
+ * 这台机器上**任何网页**都读得到它。所以 fleet-dao 的地址与账号池、账目报表（工作区路径、会话 id）、
+ * 收件口地址与名字这些，一律不进——控件用不上，放出去就是白送（审查 2026-09-25 指出）。
+ * 多机只留控件画「多机 ×N」要的状态与台数。
+ */
+export function widgetPayload(p) {
+  const out = {};
+  for (const k of WIDGET_FIELDS) if (p?.[k] !== undefined) out[k] = p[k];
+  if (p?.sync) out.sync = { state: p.sync.state, machines: (p.sync.machines ?? []).map((m) => ({ self: !!m.self })) };
+  return out;
+}
+
+/** 契约 A：回环 feed。`payload` 为取数函数（给整份，这里裁成控件那一份）；`onQuit` 不给则 /quit 不开。 */
 export function startFeed({ payload, onQuit = null, explicitPort = 0 }) {
   const token = feedToken();
   const server = createServer((req, res) => {
@@ -38,7 +60,7 @@ export function startFeed({ payload, onQuit = null, explicitPort = 0 }) {
     if (req.method === 'OPTIONS') { res.writeHead(204, head); return res.end(); }
     if (path === '/quota.json' && req.method === 'GET') {
       res.writeHead(200, { ...head, 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(payload()));
+      return res.end(JSON.stringify(widgetPayload(payload())));
     }
     if (path === '/quit' && req.method === 'POST' && onQuit) {
       if (req.headers['x-miraquota-token'] !== token) { res.writeHead(403, head); return res.end(); }

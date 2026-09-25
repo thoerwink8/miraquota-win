@@ -170,6 +170,13 @@ export class LedgerSync {
   get enabled() { return !!this.config; }
   get mode() { return this.config?.mode ?? null; }
   get intervalSec() { return this.config?.intervalSec ?? DEFAULT_INTERVAL; }
+  /**
+   * 推流水的去处（通道 + 地址 + 名字）。流水水位按它分开记：换了去处就从保留窗起点重推，
+   * 不沿用别处的进度（见 JournalLedger.journalWatermark）。没配同步时是 null。
+   */
+  get destination() {
+    return this.config?.mode === 'inbox' ? `inbox|${this.config.inbox}|${this.config.account}` : null;
+  }
   /** 分片上的身份：收件口模式带 account，都带 installId。 */
   get identity() {
     return { installId: this.installId, ...(this.config?.mode === 'inbox' ? { account: this.config.account } : {}) };

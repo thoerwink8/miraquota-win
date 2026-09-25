@@ -47,8 +47,7 @@ async function fleetAged(t, ageSec, mutate = (b) => b) {
       const b = sampleQuota(now);
       const at = new Date((now - ageSec) * 1000).toISOString();
       for (const p of b.pools) {
-        p.lastSuccessAt = at;
-        p.lastAttempt = { ...p.lastAttempt, at };
+        p.lastReadOkAt = at;
         for (const w of p.windows) w.readAt = at;
       }
       return mutate(b);
@@ -236,6 +235,51 @@ test('a known-good local route is read once per poll, without rediscovering Mira
   assert.deepEqual(hits, Array(3).fill('GET /v1/limits tok'), '一轮一次，不重读、不去探别的端口');
   assert.equal(engine.payload().state, 'exact');
   assert.equal(engine.payload().windows[0].points.used, 10);
+});
+
+test('with Mirasim off, the slow discovery backs off to once per 5 minutes, and runs at once when Mirasim comes up', async (t) => {
+  // 审查 2026-09-25 实测：Mirasim 关着时每轮仍起两个 PowerShell（进程枚举 + PEB 读令牌），每轮约 4 秒，
+  // 而这正是改走 fleet-dao 的场景。现在：发现失败就退避（15 秒起翻倍、封顶 5 分钟）；
+  // 退避期间只做不起进程的端口探测，Mirasim 一出现立刻发现。
+  const reset = Math.floor(Date.now() / 1000) + 3600;
+  const srv = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ windows: [{ name: '5h', used: 7, budget: 100, reset_at: reset }] }));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => srv.close());
+  let clock = 1_000_000; let up = false; let working = false;
+  const finds = [];
+  const engine = new Engine({
+    home: join(tmp, 'backoff-home'),
+    ledgerFile: join(tmp, 'backoff-ledger.json'), anchorFile: join(tmp, 'backoff-anchor.json'),
+    settingsFile: join(tmp, 'backoff-settings.json'), attribFile: join(tmp, 'backoff-attrib.json'),
+    calibratorFile: join(tmp, 'backoff-calibration.json'),
+    fleetOpts: { configFile: join(tmp, 'backoff-no-fleet.json') },
+    syncOpts: { configFile: join(tmp, 'none.json'), installId: '7e7e7e7e7e7e7e7e' },
+    discovery: {
+      now: () => clock,
+      probe: async () => up,
+      find: async () => {
+        finds.push(clock - 1_000_000);
+        return working ? { pair: { port: srv.address().port, path: null, token: 'tok' }, limits: { windows: [
+          { label: '5h', used: 7, budget: 100, resetAt: reset, modelScoped: false }] } } : null;
+      },
+    },
+  });
+  // 一小时、每 15 秒一轮、Mirasim 一直关着：从前 240 次完整发现
+  for (let i = 0; i < 240; i++) { await engine.poll(); clock += 15; }
+  assert.deepEqual(finds, [0, 15, 45, 105, 225, 465, 765, 1065, 1365, 1665, 1965, 2265, 2565, 2865, 3165, 3465]);
+  assert.equal(Math.max(...finds.slice(1).map((f, i) => f - finds[i])), 300, '封顶 5 分钟');
+
+  // Mirasim 起来了（默认端口有人答）：不等退避，下一轮就发现；认准后走快路，不再发现
+  up = true; working = true;
+  const before = finds.length;
+  await engine.poll();
+  assert.equal(finds.length, before + 1, '刚开就发现一次');
+  assert.equal(engine.payload().state, 'exact');
+  for (let i = 0; i < 5; i++) { clock += 15; await engine.poll(); }
+  assert.equal(finds.length, before + 1, '认准的路由读得通就不再起进程');
 });
 
 test('a fully injected engine writes nothing into the default state dir', () => {

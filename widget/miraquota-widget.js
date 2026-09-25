@@ -924,7 +924,10 @@
       // 所以主行给「官方点数 × 汇率」（= scaledSpentUSD），账本数退到副行并标明口径不同。
       const officialUsed = w.scaledSpentUSD;
       const headPoints = officialUsed == null && w.spentUSD == null && w.points;
-      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(officialUsed ?? w.spentUSD ?? 0));
+      // 推算档（w.inferred）的「账号级已用」是锚点加本机账本推出来的：与百分比同挂 ≈（桌面面板同一条规矩）。
+      // 退到本机账本那一支是实花的钱，不挂。
+      const approx = w.inferred && officialUsed != null ? '≈' : '';
+      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : approx + usd(officialUsed ?? w.spentUSD ?? 0));
       // 满额只给一个数（2026-09-02，与桌面面板同步）：原来的「官≈/预≈」两口径在
       // 改用总额比值后只差 fable 折算，摆两个数只会让人问哪个对。
       setText(c.full, w.fullUSD != null ? '/ 满额 ' + usd(w.fullUSD) : '/ 满额标定中');

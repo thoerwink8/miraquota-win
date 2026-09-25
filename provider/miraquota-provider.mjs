@@ -115,18 +115,20 @@ function printFleet(f) {
   console.log(`fleet-dao ${f.url} · ${f.state}${f.error ? ` · 这次没读到：${f.error.message}` : ''}`
     + (f.fetchedAt ? ` · 上次读到 ${ago(f.fetchedAt)}` : ''));
   for (const pool of f.pools ?? []) {
-    const la = pool.lastAttempt;
+    const err = pool.lastError && (pool.lastReadOkAt == null || pool.lastError.at == null || pool.lastError.at > pool.lastReadOkAt)
+      ? `（没读成：${pool.lastError.message}）` : '';
     const st = pool.problem ? `格式认不出：${pool.problem}`
-      : la && !la.ok ? `没读成：${la.error?.message ?? ''}` : pool.lastSuccessAt ? `读于 ${ago(pool.lastSuccessAt)}` : '还没读过';
-    console.log(`  ${pool.name}  ${st}`);
+      : pool.neverRead ? '从没读成过' : `${pool.readOverdue ? '读数过期 · ' : ''}读成于 ${ago(pool.lastReadOkAt)}`;
+    console.log(`  ${pool.name}  ${st}${err}`);
     for (const w of pool.windows ?? []) {
       const pct = w.utilization != null ? w.utilization * 100 : (w.used != null && w.limit > 0 ? w.used / w.limit * 100 : null);
-      const val = w.used == null || w.unit === 'percent' ? '' : ` ${w.unit === 'usd' ? '$' : ''}${w.used}/${w.limit ?? '?'}${w.unit === 'points' ? ' 点' : ''}`;
-      const marks = [w.reading === 'estimated' ? '估算' : null, w.inLatestRead ? null : '上游这次没报',
+      const val = w.used == null || w.unit === 'percent' ? ''
+        : ` ${w.unit === 'usd' ? '$' : ''}${w.used}/${w.limit ?? '?'}${w.unit === 'points' ? ' 点' : w.unit === 'tokens' ? ' tokens' : ''}`;
+      const marks = [w.reading === 'estimated' ? '估算' : null, w.staleSince != null ? '上游这次没报' : null,
         w.upstreamStatus && w.upstreamStatus !== 'allowed' ? w.upstreamStatus : null].filter(Boolean).join(' · ');
       console.log(`    ${w.label.padEnd(18)} ${pct != null ? (w.reading === 'estimated' ? '≈' : ' ') + pct.toFixed(1).padStart(5) + '%' : '     —'}${val}  ${fmtReset(w.resetsAt ?? null)}${marks ? '  ' + marks : ''}`);
     }
-    for (const x of pool.problems ?? []) console.log(`    认不出：${x}`);
+    for (const x of pool.notes ?? []) console.log(`    注意：${x}`);
   }
   if (f.mirasim?.skipped) console.log(`  ${f.mirasim.skipped}`);
 }

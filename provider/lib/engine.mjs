@@ -63,6 +63,9 @@ import { AnchorStore, anchorsFrom, ANCHOR_MAX_AGE } from './anchors.mjs';
 import { FleetSource } from './fleet-source.mjs';
 
 const CHANNEL_DEFAULT = 4970;
+// 本机 Mirasim 完整发现失败后的退避（秒）：与轮询同频起步、翻倍、封顶 5 分钟（见 #readLimits）
+const DISCOVER_BACKOFF_MIN = 15;
+const DISCOVER_BACKOFF_MAX = 300;
 const STALE_AFTER = 90;      // 秒；超过转 stale
 const RECKON_AFTER = 600;    // 秒；stale 超过此龄期转锚点推算
 // 流水增量推给收件口的节奏与批量：明细比聚合大得多（一批 2000 行 ≈ 300 KB），所以比同步轮
@@ -172,6 +175,7 @@ export class Engine {
    * @param opts.storeFile  流水库落点（默认 ~/.miraquota/store.db；给了 ledgerFile 就跟着它
    *   换个扩展名，测试注入的老参数照旧管用）
    * @param opts.fleetOpts  fleet-dao 额度表的注入（配置路径、fetch、读完回调；默认读 ~/.miraquota/fleet.json）
+   * @param opts.discovery  本机 Mirasim 探测与完整发现的替身 { now, probe, find }（测试用；默认起 PowerShell）
    *
    * **路径注入要覆盖每一个会落盘的模块。** 少一个，测试就会去改真机的状态：2026-09-23
    * 实咬过一次——quota-share 那条测试用默认路径跑 poll()，而账本正好在这一版升级 schema，
@@ -201,6 +205,13 @@ export class Engine {
     if (this.sync.enabled) this.pointsAttrib.relaxSettle(this.sync.intervalSec);
     this.speed = null;
     this.cachedRouter = null;
+    // 本机 Mirasim 的探测与完整发现（慢路起两个 PowerShell）。测试注入假的：不起进程、可拨钟、可计数。
+    this.discovery = {
+      now: () => Date.now() / 1000,
+      probe: () => this.#probeDefaultChannel(),
+      find: () => this.#findRouter(),
+      ...(opts.discovery ?? {}),
+    };
     this.last = null;           // { at, limits }
     this.pointsTrail = {};
     this.everConnected = false;
@@ -378,10 +389,17 @@ export class Engine {
     return { port: Number(m[1]), path: m[2]?.replace(/\/+$/, '') || null, token: process.env.ANTHROPIC_AUTH_TOKEN || null };
   }
 
+  #discoverAt = 0;                         // 下一次允许完整发现的时刻（秒）
+  #discoverDelay = DISCOVER_BACKOFF_MIN;   // 下一次失败后要等多久
+  #mirasimUp = false;                      // 上一轮探测时默认通道端口上有没有 Mirasim
+
   /**
-   * 读一次本机 /v1/limits。快路：上一轮认准的路由还通就直接读，读不通（Mirasim 重启、换了令牌）
-   * 才走完整发现。从前每一轮（15 秒）都先起一次 PowerShell 枚举全部进程（实测 1.4 秒）、探一遍
-   * 通道端口，再把缓存的路由读两遍——托盘常驻一天要起五千多次 PowerShell。
+   * 读一次本机 /v1/limits。
+   *
+   * 快路：上一轮认准的路由还通就直接读。读不通才走完整发现——它要起两个 PowerShell（进程枚举 +
+   * PEB 读令牌，本机实测每轮约 4 秒）。**Mirasim 关着时这正是常态**（额度改走 fleet-dao），所以慢路
+   * 失败就退避：15 秒起翻倍、封顶 5 分钟。退避期间只做一件不起进程的事——探一下默认通道端口；
+   * 它从「没人」变「有 Mirasim」（刚开），立刻发现一次，不等退避。端口改过的 Mirasim 最迟 5 分钟被发现。
    */
   async #readLimits() {
     if (this.cachedRouter) {
@@ -389,6 +407,31 @@ export class Engine {
       if (limits) return limits;
       this.cachedRouter = null;
     }
+    const now = this.discovery.now();
+    const up = await this.discovery.probe();
+    if (up && !this.#mirasimUp) this.#discoverAt = 0;
+    this.#mirasimUp = up;
+    if (now < this.#discoverAt) return null;
+    const found = await this.discovery.find();
+    if (found?.limits) {
+      this.cachedRouter = found.pair;
+      this.#discoverAt = 0;
+      this.#discoverDelay = DISCOVER_BACKOFF_MIN;
+      return found.limits;
+    }
+    this.#discoverAt = now + this.#discoverDelay;
+    this.#discoverDelay = Math.min(this.#discoverDelay * 2, DISCOVER_BACKOFF_MAX);
+    return null;
+  }
+
+  /** 不起进程：默认通道端口上有没有 Mirasim 在听。没人听时连接当场被拒，毫秒级。 */
+  async #probeDefaultChannel() {
+    const j = await getJSON(`http://127.0.0.1:${CHANNEL_DEFAULT}/api/health`, 800);
+    return j?.name === 'mirasim';
+  }
+
+  /** 完整发现（慢路）：进程枚举 → 通道端口 → 路由与令牌。 */
+  async #findRouter() {
     const processes = await mirasimProcesses();
     const channelPort = await this.#discoverChannelPort(processes);
     return this.#discoverRouter(processes, channelPort);
@@ -396,7 +439,7 @@ export class Engine {
 
   /**
    * 路由端口与令牌：显式参数 → 本进程环境 → PEB 自动发现 → 免认证（旧版）。
-   * 认准的那一对记进 cachedRouter，返回它读到的那份额度（不再让调用方重读一遍）。
+   * 返回认准的那一对与它读到的那份额度（{ pair, limits }），调用方不必再读一遍。
    */
   async #discoverRouter(processes, channelPort) {
     const explicitPort = Number(this.opts.routerPort ?? 0);
@@ -424,10 +467,7 @@ export class Engine {
 
     for (const pair of pairs) {
       const limits = await this.#fetchLimits(pair);
-      if (limits) {
-        this.cachedRouter = pair;
-        return limits;
-      }
+      if (limits) return { pair, limits };
     }
     return null;
   }
@@ -559,14 +599,15 @@ export class Engine {
     this.#journalAt = now;
     this.#journalBusy = true;
     try {
-      let since = this.ledger.journalWatermark();
-      if (since == null) since = Math.floor(now) - 8 * 86400;   // 新库：从保留窗起点补一次
+      const dest = this.sync.destination;                      // 水位按去处分开记，换去处从头补（见 journalWatermark）
+      let since = this.ledger.journalWatermark(dest);
+      if (since == null) since = Math.floor(now) - 8 * 86400;   // 新库或新去处：从保留窗起点补一次
       for (let i = 0; i < JOURNAL_MAX_BATCHES; i++) {
         const rows = this.ledger.journalSince(since);
         if (!rows.length) break;
         await this.sync.pushJournal(rows);
         since = rows[rows.length - 1].ts;                        // 按 ts 升序取的，最后一行就是水位
-        this.ledger.setJournalWatermark(since);
+        this.ledger.setJournalWatermark(since, dest);
         if (rows.length < JOURNAL_BATCH) break;
       }
     } catch (e) {

@@ -1,22 +1,24 @@
 /**
  * fleet-dao 额度表：所有账号池 × 窗口的唯一来源，MiraQuota 是它的桌面窗口（2026-09-24）。
  *
- * 接口约定（全文与语义见 https://github.com/thoerwink8/miraquota-win/pull/3 正文，后端照它实现；
- * 后端落地后以 fleet-dao 仓 packages/shared 的 schema 为准，两边不一致就回来改这里）：
+ * 接口约定（全文与语义见 https://github.com/thoerwink8/miraquota-win/pull/3 正文，后端照它实现）：
  *   GET <地址>/api/quota
  *   Authorization: Bearer <只读令牌>        ← 只能读额度，别的接口一律不认它
- *   200 → { schema: 1, asOf, staleAfterMinutes, pools: [...] }（逐字段见 parseQuotaReport）
- *   401 令牌不对/已吊销 · 403 令牌没有读额度的权限 · 404 这个地址上没有该接口 · 5xx 后端出错
+ *   200 → { schema: 1, asOf, staleAfterMinutes, pools: [...] }
+ * `pools` 的每一行就是 fleet-dao 仓 `packages/db/src/queries/quota.ts` 里 `quotaTable()` 的一行
+ * （QuotaTablePool / QuotaTableWindow，时间转成 ISO 字符串）——字段名、取值、「上游这次没报」
+ * （staleSince）、「从没读成」（neverRead）都照它，两边不一致就回来改这里。多出来的字段不看。
  * 配置：~/.miraquota/fleet.json { url, token }，面板「账号池」页填，存本机、不进仓库。
  *
  * 改这里之前要知道的三条：
- *  1. **没读成就说没读成**：连不上、401、回包认不出，都是带 code 与人话的明确失败，不许用空列表
- *     冒充「查了没事」。上一份好数据留着（只进不退），但状态里写清它是多久以前的；
+ *  1. **没读成就说没读成**：连不上、401、回包认不出、fleet.json 坏了，都是带 code 与人话的明确失败，
+ *     不许用空列表冒充「查了没事」。上一份好数据留着（只进不退），但状态里写清它是多久以前的；
  *     「上游明说 0 个池 / 0 个窗口」与「没读成」是两回事，形状上就分得开。
  *  2. **时间一律换成本机钟**：按「本机收到时刻 − 服务端 asOf」校一次钟差，龄期与清零倒计时
  *     才不被两台机器的时钟差带偏。
  *  3. **令牌不出这个模块**：状态、payload、报错里都没有它；它只在 fleet.json 与请求头里。
- *     跳转一律不跟（redirect: manual）——跟过去就是把令牌带给另一台主机。
+ *     读配置时就验它只含可见字符（带换行的令牌会让 fetch 把整个请求头连令牌一起写进报错）；
+ *     报错文本再按令牌原文脱敏一遍兜底。跳转一律不跟（redirect: manual）——跟过去就是把令牌带给别的主机。
  */
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -31,10 +33,13 @@ const FETCH_TIMEOUT_MS = 10_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 const MAX_TEXT = 300;
 
-const UNITS = new Set(['percent', 'points', 'usd']);
+/** fleet-dao 的 QuotaUnit（只增不改）。认不出的单位不丢窗口，只显示百分比并点名。 */
+const UNITS = new Set(['percent', 'usd', 'tokens', 'points']);
 const READINGS = new Set(['measured', 'estimated']);
 const STATUSES = new Set(['allowed', 'warning', 'limit_reached']);
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+/** 令牌只许可见 ASCII：空白、换行、控制字符进了请求头，fetch 会把整行连令牌写进报错。 */
+const TOKEN_RE = /^[\x21-\x7e]{8,512}$/;
 
 const clip = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_TEXT);
 const isObj = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
@@ -44,6 +49,16 @@ const isoSec = (v) => {
   return Number.isFinite(ms) ? ms / 1000 : null;
 };
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+/** null 与缺席同义（quotaTable 给 null，手写的回包常省略）。 */
+const given = (v) => v !== undefined && v !== null;
+
+/** 令牌格式对不对；不对时给一句不回显令牌本身的原因。 */
+export function tokenProblem(token) {
+  if (typeof token !== 'string' || !token) return '令牌是空的';
+  if (TOKEN_RE.test(token)) return null;
+  if (/\s/.test(token)) return '令牌里有空白或换行，多半是粘多了';
+  return '令牌里有不可见字符或长度不对';
+}
 
 /**
  * 用户填的地址 → 规整成接口根（去掉末尾斜杠、顺手去掉多粘的 /api 或 /api/quota）。
@@ -63,7 +78,9 @@ export function normalizeBaseUrl(raw) {
 }
 
 /**
- * 一个窗口 → 本机形状。认不出就返回 { problem }，调用方把它记进池的 problems，不静默丢。
+ * 一个窗口（QuotaTableWindow）→ 本机形状。
+ * 认不出身份（label / readAt / reading）就整格丢并返回 { problem }；只是某个可选字段认不出
+ * （新单位、新状态字）就留下这一格、把那一项拿掉，并在 notes 里点名——都不静默。
  * @param skew 本机钟 − 服务端钟（秒），所有时刻都加上它
  */
 function parseWindow(w, skew) {
@@ -72,99 +89,113 @@ function parseWindow(w, skew) {
   if (!label) return { problem: '窗口缺 label' };
   const bad = (why) => ({ problem: `窗口 ${clip(label)}：${why}` });
   if (typeof w.window !== 'string' || !w.window) return bad('缺 window');
-  if (!UNITS.has(w.unit)) return bad(`unit 只认 percent / points / usd，收到 ${clip(w.unit)}`);
   if (!READINGS.has(w.reading)) return bad(`reading 只认 measured / estimated，收到 ${clip(w.reading)}`);
   const readAt = isoSec(w.readAt);
   if (readAt == null) return bad('readAt 不是时间');
-  if (typeof w.inLatestRead !== 'boolean') return bad('缺 inLatestRead');
   for (const k of ['utilization', 'used', 'limit']) {
-    if (w[k] != null && !finite(w[k])) return bad(`${k} 不是数`);
+    if (given(w[k]) && !finite(w[k])) return bad(`${k} 不是数`);
   }
+  const notes = [];
   let resetsAt = null;
-  if (w.resetsAt != null) {
+  if (given(w.resetsAt)) {
     resetsAt = isoSec(w.resetsAt);
-    if (resetsAt == null) return bad('resetsAt 不是时间');
+    if (resetsAt == null) notes.push(`窗口 ${clip(label)}：resetsAt 不是时间，不给倒计时`);
   }
-  if (w.upstreamStatus != null && !STATUSES.has(w.upstreamStatus)) return bad(`upstreamStatus 认不出：${clip(w.upstreamStatus)}`);
-  if (w.utilization == null && w.used == null && w.upstreamStatus == null) {
+  let staleSince = null;
+  if (given(w.staleSince)) {
+    staleSince = isoSec(w.staleSince);
+    if (staleSince == null) return bad('staleSince 不是时间');
+  }
+  const unitKnown = UNITS.has(w.unit);
+  if (!unitKnown) notes.push(`窗口 ${clip(label)}：单位 ${clip(w.unit)} 这个客户端还不认，只显示百分比`);
+  const statusKnown = !given(w.upstreamStatus) || STATUSES.has(w.upstreamStatus);
+  if (!statusKnown) notes.push(`窗口 ${clip(label)}：上游状态 ${clip(w.upstreamStatus)} 认不出，原字放在悬停里`);
+  const utilization = given(w.utilization) ? w.utilization
+    : unitKnown && given(w.used) && finite(w.limit) && w.limit > 0 ? w.used / w.limit : null;
+  if (utilization == null && !(statusKnown && given(w.upstreamStatus))) {
     return bad('既没有用量也没有上游状态，这一格什么都说明不了');
   }
   return {
+    notes,
     window: {
       label, window: w.window,
       ...(typeof w.scope === 'string' && w.scope ? { scope: w.scope } : {}),
-      ...(w.utilization != null ? { utilization: w.utilization } : {}),
-      ...(w.used != null ? { used: w.used } : {}),
-      ...(w.limit != null ? { limit: w.limit } : {}),
-      unit: w.unit,
+      ...(utilization != null ? { utilization } : {}),
+      // 单位认不出时数字没法说清是什么，只留百分比
+      ...(unitKnown && given(w.used) ? { used: w.used } : {}),
+      ...(unitKnown && given(w.limit) ? { limit: w.limit } : {}),
+      unit: unitKnown ? w.unit : 'unknown',
       ...(resetsAt != null ? { resetsAt: resetsAt + skew } : {}),
-      ...(w.upstreamStatus != null ? { upstreamStatus: w.upstreamStatus } : {}),
-      ...(typeof w.statusRaw === 'string' && w.statusRaw ? { statusRaw: clip(w.statusRaw) } : {}),
+      ...(statusKnown && given(w.upstreamStatus) ? { upstreamStatus: w.upstreamStatus } : {}),
+      ...(typeof w.statusRaw === 'string' && w.statusRaw ? { statusRaw: clip(w.statusRaw) }
+        : !statusKnown ? { statusRaw: clip(w.upstreamStatus) } : {}),
       reading: w.reading,
       source: typeof w.source === 'string' ? w.source : '',
       readAt: readAt + skew,
-      inLatestRead: w.inLatestRead,
+      ...(staleSince != null ? { staleSince: staleSince + skew } : {}),
     },
   };
 }
 
-/** 一个池 → 本机形状。池本身认不出时保留一行 { poolId?, name, problem }，界面照样给它一格。 */
-function parsePool(p, skew, index) {
-  if (!isObj(p)) return { poolId: `#${index + 1}`, name: `第 ${index + 1} 个池`, problem: '池不是对象', windows: [], notes: [], problems: [] };
+/**
+ * 一个池（QuotaTablePool）→ 本机形状。池本身认不出时保留一行 { poolId?, name, problem }，界面照样给它一格。
+ * 展示名：回包给了 name 用 name；否则用渠道名，同渠道有好几个池时后面挂上池编号（两个 Claude 组织）。
+ */
+function parsePool(p, skew, index, sameChannel) {
+  const fallback = `第 ${index + 1} 个池`;
+  if (!isObj(p)) return { poolId: `#${index + 1}`, name: fallback, problem: '池不是对象', windows: [], notes: [] };
   const poolId = typeof p.poolId === 'string' && p.poolId ? p.poolId : null;
-  const name = typeof p.name === 'string' && p.name.trim() ? clip(p.name) : (poolId ?? `第 ${index + 1} 个池`);
-  const shell = { poolId: poolId ?? `#${index + 1}`, name, windows: [], notes: [], problems: [] };
+  const channelName = typeof p.channelName === 'string' && p.channelName.trim() ? clip(p.channelName) : '';
+  const name = typeof p.name === 'string' && p.name.trim() ? clip(p.name)
+    : channelName ? (sameChannel(p.channelId) > 1 && poolId ? `${channelName} · ${poolId}` : channelName)
+      : (poolId ?? fallback);
+  const shell = { poolId: poolId ?? `#${index + 1}`, name, windows: [], notes: [] };
   if (!poolId) return { ...shell, problem: '池缺 poolId' };
   if (!Array.isArray(p.windows)) return { ...shell, problem: 'windows 不是数组' };
-
-  let lastAttempt = null;
-  if (p.lastAttempt != null) {
-    const at = isoSec(p.lastAttempt?.at);
-    if (!isObj(p.lastAttempt) || at == null || typeof p.lastAttempt.ok !== 'boolean') {
-      return { ...shell, problem: 'lastAttempt 认不出（要 { at, ok, error? }）' };
-    }
-    const e = p.lastAttempt.error;
-    lastAttempt = {
-      at: at + skew, ok: p.lastAttempt.ok,
-      ...(!p.lastAttempt.ok ? { error: { code: clip(e?.code) || 'unknown', message: clip(e?.message) || '后端没说原因' } } : {}),
-    };
+  if (typeof p.neverRead !== 'boolean') return { ...shell, problem: '缺 neverRead（从没读成过要明说，不能用空窗口冒充）' };
+  let lastReadOkAt = null;
+  if (given(p.lastReadOkAt)) {
+    lastReadOkAt = isoSec(p.lastReadOkAt);
+    if (lastReadOkAt == null) return { ...shell, problem: 'lastReadOkAt 不是时间' };
+    lastReadOkAt += skew;
   }
-  let lastSuccessAt = null;
-  if (p.lastSuccessAt != null) {
-    lastSuccessAt = isoSec(p.lastSuccessAt);
-    if (lastSuccessAt == null) return { ...shell, problem: 'lastSuccessAt 不是时间' };
-    lastSuccessAt += skew;
+  let lastError = null;
+  if (isObj(p.lastError)) {
+    const at = isoSec(p.lastError.at);
+    lastError = {
+      code: clip(p.lastError.code) || 'unknown', message: clip(p.lastError.message) || '后端没说原因',
+      ...(at != null ? { at: at + skew } : {}),
+    };
   }
 
   const windows = [];
-  const problems = [];
+  const notes = [];
   const seen = new Set();
   for (const raw of p.windows) {
     const r = parseWindow(raw, skew);
-    if (r.problem) { problems.push(r.problem); continue; }
-    if (seen.has(r.window.label)) { problems.push(`窗口 ${clip(r.window.label)} 出现了两次，只留第一条`); continue; }
+    if (r.problem) { notes.push(r.problem); continue; }
+    if (seen.has(r.window.label)) { notes.push(`窗口 ${clip(r.window.label)} 出现了两次，只留第一条`); continue; }
     seen.add(r.window.label);
     windows.push(r.window);
+    notes.push(...r.notes);
   }
-  const sub = isObj(p.subscription) ? p.subscription : null;
-  const expiresAt = sub ? isoSec(sub.expiresAt) : null;
+  const expiresAt = given(p.expiresAt) ? isoSec(p.expiresAt) : null;
   return {
     poolId, name,
     channelId: typeof p.channelId === 'string' ? p.channelId : '',
-    reader: typeof p.reader === 'string' ? p.reader : '',
-    lastAttempt, lastSuccessAt,
-    ...(sub && (sub.plan || expiresAt != null) ? {
-      subscription: { ...(sub.plan ? { plan: clip(sub.plan) } : {}), ...(expiresAt != null ? { expiresAt: expiresAt + skew } : {}) },
-    } : {}),
-    notes: Array.isArray(p.notes) ? p.notes.filter((n) => typeof n === 'string' && n).map(clip) : [],
-    problems,
+    neverRead: p.neverRead,
+    readOverdue: p.readOverdue === true,
+    lastReadOkAt,
+    ...(lastError ? { lastError } : {}),
+    ...(expiresAt != null ? { expiresAt: expiresAt + skew } : {}),
+    notes,
     windows,
   };
 }
 
 /**
  * GET /api/quota 的回包 → 本机形状。顶层认不出（不是对象、版本不对、缺 asOf / pools）整份拒收；
- * 单个池或窗口认不出只影响它自己，并记进 problem / problems 给界面说出来。
+ * 单个池或窗口认不出只影响它自己，并记进 problem / notes 给界面说出来。
  * @param receivedAt 本机收到回包的时刻（秒），用来校钟差
  * @returns { ok: true, report } | { ok: false, error }
  */
@@ -180,6 +211,9 @@ export function parseQuotaReport(body, receivedAt = Date.now() / 1000) {
   if (!finite(body.staleAfterMinutes) || body.staleAfterMinutes <= 0) return { ok: false, error: '回包缺 staleAfterMinutes' };
   if (!Array.isArray(body.pools)) return { ok: false, error: '回包缺 pools 数组' };
   const skew = receivedAt - asOf;
+  const perChannel = new Map();
+  for (const p of body.pools) if (isObj(p)) perChannel.set(p.channelId, (perChannel.get(p.channelId) ?? 0) + 1);
+  const sameChannel = (id) => perChannel.get(id) ?? 0;
   return {
     ok: true,
     report: {
@@ -187,12 +221,12 @@ export function parseQuotaReport(body, receivedAt = Date.now() / 1000) {
       asOf: receivedAt,
       skewSec: skew,
       staleAfterSec: body.staleAfterMinutes * 60,
-      pools: body.pools.map((p, i) => parsePool(p, skew, i)),
+      pools: body.pools.map((p, i) => parsePool(p, skew, i, sameChannel)),
     },
   };
 }
 
-/** 一次 HTTP 读取的失败 → { code, message }。人话在前，原文截断附后。 */
+/** 一次 HTTP 读取的失败 → { code, message }。人话在前，服务端原文截断附后。 */
 async function httpFailure(r) {
   let msg = '';
   try { const j = await r.json(); msg = clip(j?.error?.message ?? j?.error ?? ''); } catch { /* 非 JSON */ }
@@ -209,9 +243,13 @@ async function httpFailure(r) {
 
 /**
  * 读一次。永不抛：成功返回 { ok: true, report }，失败返回 { ok: false, error: { code, message } }。
+ * 失败的 message 按令牌原文脱敏：网络层、服务端回的原文里万一带了它，也不往外送。
  * @param fetchImpl 测试注入
  */
 export async function fetchQuota(base, token, { fetchImpl = globalThis.fetch, timeoutMs = FETCH_TIMEOUT_MS, now = () => Date.now() / 1000 } = {}) {
+  const scrub = (e) => ({ ...e, message: token ? e.message.split(token).join('***') : e.message });
+  const tp = tokenProblem(token);
+  if (tp) return { ok: false, error: { code: 'config', message: tp } };
   let r;
   try {
     r = await fetchImpl(`${base}/api/quota`, {
@@ -225,13 +263,13 @@ export async function fetchQuota(base, token, { fetchImpl = globalThis.fetch, ti
       return { ok: false, error: { code: 'timeout', message: `连 fleet-dao 超时（${Math.round(timeoutMs / 1000)} 秒没回）` } };
     }
     const why = clip(e?.cause?.code ?? e?.cause?.message ?? e?.message ?? e);
-    return { ok: false, error: { code: 'unreachable', message: `连不上 fleet-dao${why ? '：' + why : ''}` } };
+    return { ok: false, error: scrub({ code: 'unreachable', message: `连不上 fleet-dao${why ? '：' + why : ''}` }) };
   }
-  if (!r.ok) return { ok: false, error: await httpFailure(r) };
+  if (!r.ok) return { ok: false, error: scrub(await httpFailure(r)) };
   let body;
   try { body = await r.json(); } catch { return { ok: false, error: { code: 'bad_response', message: '回包不是 JSON' } }; }
   const parsed = parseQuotaReport(body, now());
-  if (!parsed.ok) return { ok: false, error: { code: 'bad_response', message: `回包不符合约定：${parsed.error}` } };
+  if (!parsed.ok) return { ok: false, error: scrub({ code: 'bad_response', message: `回包不符合约定：${parsed.error}` }) };
   return parsed;
 }
 
@@ -264,22 +302,29 @@ export class FleetSource {
     this.failStreak = 0;
   }
 
-  /** fleet.json 读不出或不完整 ⇒ 当未配置（不抛：设置读不出来不该拖垮取数主流程）。 */
+  /**
+   * fleet.json → { url, token } | { broken, url? }（文件在但坏了）| null（没配）。
+   * 坏了不当「没配」：那样用户只看见「接上」那张卡，不知道原来的配置哪去了。原因里不回显令牌。
+   */
   #readConfig() {
-    try {
-      const c = JSON.parse(readFileSync(this.configFile, 'utf8'));
-      const u = normalizeBaseUrl(c?.url);
-      const token = typeof c?.token === 'string' ? c.token.trim() : '';
-      return u.ok && token ? { url: u.url, token } : null;
-    } catch { return null; }
+    let c;
+    try { c = JSON.parse(readFileSync(this.configFile, 'utf8')); } catch (e) {
+      return e?.code === 'ENOENT' ? null : { broken: `${this.configFile} 读不出来（不是 JSON？）——在「账号池」页重新填` };
+    }
+    const u = normalizeBaseUrl(c?.url);
+    if (!u.ok) return { broken: `fleet.json 里的地址不对：${u.error}` };
+    const token = typeof c?.token === 'string' ? c.token.trim() : '';
+    const tp = tokenProblem(token);
+    if (tp) return { broken: `fleet.json 里的${tp}——在「账号池」页重新填`, url: u.url };
+    return { url: u.url, token };
   }
 
-  get enabled() { return !!this.#config; }
+  get enabled() { return !!this.#config && !this.#config.broken; }
   get url() { return this.#config?.url ?? null; }
 
-  /** 真读一次；同一时刻只有一个在路上（重复调用拿到同一个 Promise）。未配置返回 null。 */
+  /** 真读一次；同一时刻只有一个在路上（重复调用拿到同一个 Promise）。没配或配坏了返回 null。 */
   refresh() {
-    if (!this.#config) return Promise.resolve(null);
+    if (!this.enabled) return Promise.resolve(null);
     if (this.#inflight) return this.#inflight;
     const { url, token } = this.#config;
     this.lastAttemptAt = Date.now() / 1000;
@@ -307,7 +352,7 @@ export class FleetSource {
 
   /** 到点才读（poll 每跳都会调，不等它）。 */
   maybeRefresh(nowSec = Date.now() / 1000) {
-    if (!this.#config || this.#inflight) return;
+    if (!this.enabled || this.#inflight) return;
     if (this.lastAttemptAt != null && nowSec - this.lastAttemptAt < this.intervalSec) return;
     this.refresh().catch(() => { /* fetchQuota 不抛，这里兜底防未处理拒绝 */ });
   }
@@ -321,8 +366,8 @@ export class FleetSource {
     const u = normalizeBaseUrl(url);
     if (!u.ok) return { ok: false, code: 'config', error: u.error };
     const t = typeof token === 'string' ? token.trim() : '';
-    if (!t) return { ok: false, code: 'config', error: '令牌是空的' };
-    if (/\s/.test(t)) return { ok: false, code: 'config', error: '令牌里有空白字符，多半是粘多了' };
+    const tp = tokenProblem(t);
+    if (tp) return { ok: false, code: 'config', error: tp };
     const r = await fetchQuota(u.url, t, { fetchImpl: this.fetchImpl, timeoutMs: Math.max(this.timeoutMs, CONNECT_TIMEOUT_MS) });
     if (!r.ok) return { ok: false, code: r.error.code, error: r.error.message };
     try {
@@ -347,29 +392,31 @@ export class FleetSource {
   }
 
   /**
-   * 哪个池替补本机 Mirasim：reader 是 mirasim-relay 的池**恰好一个**才用。
-   * 额度点是账号级的，同一个账号谁读到都一样；有两个就认不出哪个是本机这个账号，宁可不用。
+   * 哪个池替补本机 Mirasim：窗口由 mirasim-relay 读出来的池**恰好一个**才用（回包里没有「读法」
+   * 这一列，窗口的 source 就是读法）。额度点是账号级的，同一个账号谁读到都一样；有两个就认不出
+   * 哪个是本机这个账号，宁可不用。
    */
   #mirasimPick() {
-    const pools = (this.report?.pools ?? []).filter((p) => p.reader === 'mirasim-relay' && !p.problem);
+    const pools = (this.report?.pools ?? [])
+      .filter((p) => !p.problem && p.windows.some((w) => w.source === 'mirasim-relay'));
     if (pools.length === 1) return { pool: pools[0] };
     return {
       skipped: pools.length
         ? `fleet-dao 里有 ${pools.length} 个 Mirasim 池，认不出哪个是本机这个账号，不拿来替补`
-        : 'fleet-dao 里没有 Mirasim 池',
+        : 'fleet-dao 里没有读成过的 Mirasim 池',
     };
   }
 
   /**
    * 替补本机 Mirasim 的那份账号额度，形状与本机 /v1/limits 解析后一致（Engine 走同一条路算）。
-   * 只收：这一轮上游报了的（inLatestRead）、实读的、点数单位、数字齐全的窗口。
+   * 只收：上游这次报了的（没有 staleSince）、实读的、点数单位、数字齐全的窗口。
    * at 取这些窗口里最早的 readAt——龄期按最旧的那格算，不替它说新。
    * @returns { at, poolId, name, staleAfterSec, limits: { windows } } | null
    */
   mirasimSnapshot() {
     const { pool } = this.#mirasimPick();
     if (!pool) return null;
-    const wins = pool.windows.filter((w) => w.inLatestRead && w.reading === 'measured' && w.unit === 'points'
+    const wins = pool.windows.filter((w) => w.staleSince == null && w.reading === 'measured' && w.unit === 'points'
       && finite(w.used) && finite(w.limit) && w.limit > 0 && w.resetsAt != null);
     if (!wins.length) return null;
     return {
@@ -388,6 +435,12 @@ export class FleetSource {
   /** payload 的 fleet 块。没有令牌；未配置时只有 { state: 'off' }（面板据此给「接上」那张卡）。 */
   status() {
     if (!this.#config) return { state: 'off' };
+    if (this.#config.broken) {
+      return {
+        state: 'error', ...(this.#config.url ? { url: this.#config.url } : {}),
+        intervalSec: this.intervalSec, error: { code: 'config', message: this.#config.broken },
+      };
+    }
     const pick = this.report ? this.#mirasimPick() : null;
     return {
       state: this.lastError ? 'error' : this.report ? 'ok' : 'connecting',

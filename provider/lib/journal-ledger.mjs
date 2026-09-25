@@ -116,18 +116,23 @@ export class JournalLedger {
   // MARK: 流水增量（推给收件口：账号级对账与任务报表要明细，不能只有聚合分片）
 
   /**
-   * 推流水用的水位：本机已经推上去的最大 ts。缺省（新库）返回 null，调用方从保留窗起点开始。
-   * 存 meta 里，重启不丢——否则每次重启都把 8 天流水重推一遍（幂等，但白费带宽）。
+   * 推流水用的水位：本机已经推到**这个去处**的最大 ts。缺省（新库、新去处）返回 null，调用方从保留窗起点开始。
+   * 存 meta 里（键 `journal_pushed_to|<去处>`），重启不丢——否则每次重启都把 8 天流水重推一遍。
+   *
+   * **按去处分开记**：从前只有一个 `journal_pushed_to`，从 hub 换到收件口的机器会接着 hub 的进度往下推，
+   * 之前 8 天的明细收件口一行都收不到（审查 2026-09-25 指出）。那个老键不再读；代价是原来就在收件口的
+   * 机器升级后重推一次保留窗——行以 kh 为主键，读的一方重收是幂等的。
+   * @param dest 去处（LedgerSync.destination：通道 + 地址 + 名字）
    */
-  journalWatermark() {
-    const v = this.store.db.prepare("SELECT v FROM meta WHERE k = 'journal_pushed_to'").get()?.v;
+  journalWatermark(dest) {
+    const v = this.store.db.prepare('SELECT v FROM meta WHERE k = ?').get(`journal_pushed_to|${dest ?? ''}`)?.v;
     const n = Number(v);
     return Number.isFinite(n) && n > 0 ? n : null;
   }
 
-  setJournalWatermark(ts) {
-    this.store.db.prepare("INSERT INTO meta (k,v) VALUES ('journal_pushed_to',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v")
-      .run(String(Math.floor(ts)));
+  setJournalWatermark(ts, dest) {
+    this.store.db.prepare('INSERT INTO meta (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v')
+      .run(`journal_pushed_to|${dest ?? ''}`, String(Math.floor(ts)));
   }
 
   /**

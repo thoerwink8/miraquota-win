@@ -216,7 +216,9 @@ test('账号池页把 fleet-dao 的每个池 × 窗口都画出来，不是现�
   assert.match(renderer, /读数超过有效期/);
   assert.match(renderer, /w\.resetsAt != null \? fmtReset\(w\.resetsAt\)/, '清零倒计时');
   // 没读成要说原因，不许装成「没有池」；「上游明说 0 个池」另有一句
-  assert.match(renderer, /这次没读成：/);
+  assert.match(renderer, /p\.neverRead \? '没读成' : '这次没读成'/);
+  assert.match(renderer, /不是「没有额度」/, '从没读成过不许画成「没有额度」');
+  assert.match(renderer, /w\.staleSince != null/, '「上游这次没报」照 fleet-dao 的 staleSince');
   assert.match(renderer, /这次没读到 fleet-dao：/);
   assert.match(renderer, /fleet-dao 说它没有配置任何账号池/);
   // 设置：地址 + 只读令牌（密码框）；令牌不回显、不进浏览器存储
@@ -226,4 +228,36 @@ test('账号池页把 fleet-dao 的每个池 × 窗口都画出来，不是现�
   const preload = readFileSync(new URL('../app/preload.cjs', import.meta.url), 'utf8');
   assert.match(preload, /fleetConnect: \(opts\) => ipcRenderer\.invoke\('fleet:connect', opts\)/);
   assert.match(preload, /fleetDisconnect: \(\) => ipcRenderer\.invoke\('fleet:disconnect'\)/);
+});
+
+test('hub 模式的机器升级后，页脚用红字说「hub 已下线」，口径页说明美元只算本机', () => {
+  // 审查 2026-09-25：多机合并停了、美元从全机合计变成只算本机，却一句提示都没有。
+  assert.match(renderer, /else if \(p\.syncLogin\?\.retired\) \{/);
+  assert.match(renderer, /class="go bad" id="footSync">\$\{p\.syncLogin\.retired === 'hub' \? 'hub 已下线'/);
+  assert.match(renderer, /美元只算本机 →/);
+  assert.match(renderer, /美元现在只算本机账本/);
+});
+
+test('内嵌控件的推算金额也挂 ≈', () => {
+  assert.match(widget, /const approx = w\.inferred && officialUsed != null \? '≈' : '';/);
+  assert.match(widget, /approx \+ usd\(officialUsed \?\? w\.spentUSD \?\? 0\)/);
+});
+
+test('跨域可读的本机 feed 只给控件要的字段：fleet-dao 地址、账号池、账目报表一律不出去', async () => {
+  const { widgetPayload } = await import('../provider/lib/injector.mjs');
+  const full = {
+    state: 'fleet', stateLabel: 'fleet 实读', capturedAt: 1, windows: [{ label: '5h', usedPercent: 3 }], detail: 'd',
+    fleet: { state: 'ok', url: 'https://fleet.example.invalid', pools: [{ poolId: 'x' }] },
+    ledger: { workspaces: [{ ws: 'D:/secret/path' }] }, syncLogin: { inbox: 'https://inbox.example.invalid' },
+    limitsFrom: { source: 'fleet' },
+    sync: { state: 'ok', inbox: 'https://inbox.example.invalid', account: 'someone', machines: [{ id: 'pc', self: true, account: 'someone' }, { id: 'vps', self: false }] },
+  };
+  const out = widgetPayload(full);
+  assert.deepEqual(Object.keys(out).sort(), ['capturedAt', 'detail', 'state', 'stateLabel', 'sync', 'windows']);
+  assert.deepEqual(out.sync, { state: 'ok', machines: [{ self: true }, { self: false }] }, '多机只留控件画「多机 ×N」要的');
+  for (const leak of ['fleet.example.invalid', 'secret/path', 'inbox.example.invalid', 'someone']) {
+    assert.ok(!JSON.stringify(out).includes(leak), leak);
+  }
+  const injector = readFileSync(new URL('../provider/lib/injector.mjs', import.meta.url), 'utf8');
+  assert.match(injector, /res\.end\(JSON\.stringify\(widgetPayload\(payload\(\)\)\)\)/, 'feed 出口只有这一处，必须过白名单');
 });

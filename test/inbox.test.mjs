@@ -275,13 +275,19 @@ test('an inbox-mode engine actually pushes its journal on poll', async () => {
       i: 10, o: 0, cr: 0, cw: 0, priced: 1, billable: 1, machine: 'laptop',
     }]);
     engine.ledger.invalidate();
+    // 这台原来走 hub、已经把这笔推给 hub 了：老的、不分去处的水位停在「现在」。
+    // 换到收件口后不许接着这个进度往下推——收件口一行都还没收到过（审查 2026-09-25 指出会漏 8 天）。
+    engine.ledger.store.db.prepare("INSERT INTO meta (k,v) VALUES ('journal_pushed_to',?)").run(String(now + 60));
 
     await engine.poll();
     const pushed = [...box.journals.values()].find((j) => j.installId === 'cccc0000cccc0000');
     assert.ok(pushed, '收件口模式下 poll() 要把流水推上去（死代码 = 这一条红）');
-    assert.equal(pushed.rows.length, 1);
+    assert.equal(pushed.rows.length, 1, '别处（hub）的水位不算收件口的进度');
     assert.equal(pushed.rows[0].usd, 2);
-    assert.ok(engine.ledger.journalWatermark() >= now, '推完要退水位，否则每轮重推 8 天');
+    const dest = engine.sync.destination;
+    assert.equal(dest, `inbox|${box.url}|fxc`);
+    assert.ok(engine.ledger.journalWatermark(dest) >= now, '推完要退这个去处的水位，否则每轮重推 8 天');
+    assert.equal(engine.ledger.journalWatermark(`inbox|${box.url}|someone-else`), null, '换个名字就是另一个去处，从头补');
   } finally { box.close(); }
 });
 

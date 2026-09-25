@@ -125,6 +125,7 @@
   .chip.bad { background: var(--badbg); color: var(--bad); }
   .pool-why { font-size: 10.5px; color: var(--bad); margin-top: 4px; line-height: 1.5; }
   .pool-note { font-size: 10.5px; color: var(--ink3); margin-top: 4px; line-height: 1.5; }
+  .pool-warn { font-size: 10.5px; color: var(--warn); margin-top: 4px; line-height: 1.5; }
   #fleetConnectCard .cfg { margin-top: 6px; }
   #fleetConnectCard .cfg .k { flex: none; min-width: 56px; }
   #fleetConnectCard input.wide { flex: 1; width: auto; min-width: 0; text-align: left; }
@@ -942,9 +943,9 @@
     // 账号池一行摘要：有池没读成就红，点一下去「账号池」页看是哪个、为什么
     const fl = p.fleet;
     if (fl && fl.state !== 'off') {
-      const bad = (fl.pools ?? []).filter((x) => x.problem || x.lastAttempt?.ok === false).length;
+      const bad = (fl.pools ?? []).filter((x) => x.problem || x.neverRead || x.readOverdue).length;
       const txt = !fl.pools ? (fl.state === 'error' ? 'fleet-dao 没读到' : 'fleet-dao 读取中')
-        : `账号池 ×${fl.pools.length}${bad ? ` · ${bad} 个没读成` : ''}${fl.state === 'error' ? ' · 这次没读到' : ''}`;
+        : `账号池 ×${fl.pools.length}${bad ? ` · ${bad} 个没读成或过期` : ''}${fl.state === 'error' ? ' · 这次没读到' : ''}`;
       foot.push(`<span class="go${bad || fl.state === 'error' ? ' bad' : ''}" id="footPools">${txt} →</span>`);
     }
     if (p.unitPriceUSD != null) foot.push(`单价 ${p.unitPriceUSD.toFixed(4)} $/点`);
@@ -957,6 +958,10 @@
         : sy.state === 'warn' ? (sy.pushOk ? '读不到他机' : '重试中')
         : '连接中';
       foot.push(`<span class="go${sy.state === 'error' ? ' bad' : ''}" id="footSync">多机 ×${(sy.machines ?? []).length} · ${mark} →</span>`);
+    } else if (p.syncLogin?.retired) {
+      // 原来走 hub（或 git）的机器升级后：多机合并停了，美元从「全机合计」变回「只算本机」。
+      // 不写这一行，用户看到的只是「多机已接入」没了、数字变小了（审查 2026-09-25 指出）。点一下去多机页看怎么接回来。
+      foot.push(`<span class="go bad" id="footSync">${p.syncLogin.retired === 'hub' ? 'hub 已下线' : 'git 通道已退役'} · 美元只算本机 →</span>`);
     }
     foot.push(`采集 ${ago(p.capturedAt)}`);
     $('foot').innerHTML = foot.join(' · ');
@@ -987,6 +992,10 @@
     if (p.calibDropped > 0) st2.push(`<b>标定防线</b> 检测到他机同时使用，已剔除 ${p.calibDropped} 段受污染观测`);
     // 同步现状不在这里重复（明细全在「多机」页），只交代它对美元口径的影响。
     if (p.sync?.state === 'ok') st2.push(`<b>多机</b> 已合并 ${p.sync.machines.length} 台机器的账本，美元支出为全机合计`);
+    else if (p.syncLogin?.retired) {
+      st2.push(`<b>多机</b> 原来的${p.syncLogin.retired === 'hub' ? ' hub 通道已下线' : ' git 通道已退役'}：美元现在只算本机账本；`
+        + '要合并各机账本，在「多机」页用收件口登录');
+    }
     if (p.accountNotice) st2.push(`<b>账号</b> ${p.accountNotice}`);
     // 已启用模型对表价目表：无价的模型一旦经 relay 用到，账本只能记 token——提前点名，别等漏了才发现
     if (p.roster) {
@@ -1153,7 +1162,8 @@
     if (w.used == null) return '';
     if (w.unit === 'usd') return `$${fmtUsd(w.used)}${w.limit != null ? ` / $${fmtUsd(w.limit)}` : ''}`;
     if (w.unit === 'points') return `${fmtK(w.used)}${w.limit != null ? ` / ${fmtK(w.limit)}` : ''} 点`;
-    return '';   // percent：右边那个百分比就是它
+    if (w.unit === 'tokens') return `${fmtK(w.used)}${w.limit != null ? ` / ${fmtK(w.limit)}` : ''} tokens`;
+    return '';   // percent（或客户端还不认的单位）：右边那个百分比就是它
   }
   const poolPct = (w) => (w.utilization != null ? w.utilization * 100
     : w.used != null && w.limit > 0 ? w.used / w.limit * 100 : null);
@@ -1167,8 +1177,8 @@
     const est = w.reading === 'estimated';
     const chips = [];
     if (est) chips.push('<span class="chip est" title="按用量记录估算，不是上游报的数">估算</span>');
-    if (!w.inLatestRead) {
-      chips.push(`<span class="chip stale" title="最近一次读取里上游没报这个窗口；数字是 ${ago(w.readAt)}那次的">上游这次没报</span>`);
+    if (w.staleSince != null) {
+      chips.push(`<span class="chip stale" title="上游从 ${ago(w.staleSince)}起没再报这个窗口；数字是 ${ago(w.readAt)}那次的">上游这次没报</span>`);
     } else if (staleAfter && Date.now() / 1000 - w.readAt > staleAfter) {
       chips.push(`<span class="chip stale" title="读数超过有效期，不能当现值用">${ago(w.readAt)}读的</span>`);
     }
@@ -1187,34 +1197,37 @@
     </div>`;
   }
 
-  /** 一个池一张卡：头上一行「实读/估算 · 多久前」或「没读成」，失败原因原样写出来，不藏。 */
+  /**
+   * 一个池一张卡：头上一行「实读/估算 · 多久前」「读数过期」或「从没读成过」，失败原因原样写出来，不藏。
+   * 判据照 fleet-dao 的额度表：neverRead＝一次都没读成（不是「没有额度」），readOverdue＝读数过期。
+   */
   function poolCard(p, staleAfter) {
     if (p.problem) {
       return `<div class="card pool"><div class="head"><span class="label">${esc(p.name)}</span>
         <span class="pool-state bad">格式认不出</span></div>
         <div class="pool-why">回包里这个池认不出：${esc(p.problem)}</div></div>`;
     }
-    const la = p.lastAttempt;
-    let state = '还没读过', cls = '';
-    if (la && !la.ok) {
-      state = p.lastSuccessAt != null ? `没读成 · ${ago(la.at)}` : '从没读到过';
-      cls = 'bad';
-    } else if (la || p.lastSuccessAt != null) {
-      const at = p.lastSuccessAt ?? la.at;
+    const err = p.lastError;
+    let state, cls;
+    if (p.neverRead) { state = '从没读成过'; cls = 'bad'; }
+    else if (p.readOverdue) { state = `读数过期 · ${p.lastReadOkAt != null ? ago(p.lastReadOkAt) + '读成' : '—'}`; cls = 'warn'; }
+    else {
       const allEst = p.windows.length > 0 && p.windows.every((w) => w.reading === 'estimated');
-      state = `${allEst ? '估算' : '实读'} · ${ago(at)}`;
-      cls = staleAfter && Date.now() / 1000 - at > staleAfter ? 'warn' : 'ok';
+      state = `${allEst ? '估算' : '实读'} · ${p.lastReadOkAt != null ? ago(p.lastReadOkAt) : '—'}`;
+      cls = 'ok';
     }
-    const why = la && !la.ok
-      ? `<div class="pool-why">这次没读成：${esc(la.error?.message ?? '')}${p.lastSuccessAt != null && p.windows.length
-        ? `；下面是 ${ago(p.lastSuccessAt)}那次的读数` : ''}</div>` : '';
+    // 失败原因：只写比最近一次读成还新的那次（读成之后就不是「这次没读成」了）
+    const failedSince = err && (p.lastReadOkAt == null || err.at == null || err.at > p.lastReadOkAt);
+    const why = failedSince
+      ? `<div class="pool-why">${p.neverRead ? '没读成' : '这次没读成'}：${esc(err.message)}${!p.neverRead && p.windows.length
+        ? `；下面是 ${ago(p.lastReadOkAt)}那次的读数` : ''}</div>`
+      : p.neverRead ? '<div class="pool-why">fleet-dao 还一次都没读成这个池（不是「没有额度」）</div>' : '';
     const rows = p.windows.length ? p.windows.map((w) => poolWindowRow(w, staleAfter)).join('')
-      : (la?.ok ? '<div class="pool-note">上游说这个池没有额度窗口</div>' : '');
+      : (!p.neverRead ? '<div class="pool-note">上游说这个池没有额度窗口</div>' : '');
     const extra = [
-      ...(p.problems ?? []).map((x) => `<div class="pool-why">回包里有一格认不出：${esc(x)}</div>`),
-      ...(p.notes ?? []).map((x) => `<div class="pool-note">${esc(x)}</div>`),
-      ...(p.subscription?.expiresAt != null
-        ? [`<div class="pool-note">${esc(p.subscription.plan ?? '套餐')} 付到 ${new Date(p.subscription.expiresAt * 1000).toLocaleDateString()}</div>`] : []),
+      // 回包里认不出的格子与字段：点名，不静默丢（也是给后端对约定的线索）
+      ...(p.notes ?? []).map((x) => `<div class="pool-warn">${esc(x)}</div>`),
+      ...(p.expiresAt != null ? [`<div class="pool-note">付到 ${new Date(p.expiresAt * 1000).toLocaleDateString()}</div>`] : []),
     ];
     return `<div class="card pool"><div class="head"><span class="label">${esc(p.name)}</span>
       <span class="pool-state ${cls}">${state}</span></div>${why}${rows}${extra.join('')}</div>`;

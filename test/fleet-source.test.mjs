@@ -1,6 +1,6 @@
 /**
  * fleet-dao 额度表（provider/lib/fleet-source.mjs）：接口约定的客户端一侧。
- * 后端上线之前，拿本地假服务器（scripts/fake-fleet.mjs）把约定里每一条都走一遍。
+ * 后端上线之前，拿本地假服务器（scripts/fake-fleet.mjs，形状照 fleet-dao 的 quotaTable()）把约定走一遍。
  *
  * 按 fleet-dao 的底线：读不到、没跑成、格式认不出，都必须是**明确的失败**——每条这样的路径
  * 下面都有一条故意造出来的样本，且断言「上一份好数据还在，但状态说清楚它不是这一次的」。
@@ -12,7 +12,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { FleetSource, fetchQuota, normalizeBaseUrl, parseQuotaReport, QUOTA_SCHEMA } from '../provider/lib/fleet-source.mjs';
+import { FleetSource, fetchQuota, normalizeBaseUrl, parseQuotaReport, QUOTA_SCHEMA, tokenProblem } from '../provider/lib/fleet-source.mjs';
 import { startFakeFleet, sampleQuota } from '../scripts/fake-fleet.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mq-fleet-'));
@@ -27,6 +27,7 @@ function sourceFor(fake, extra = {}) {
 }
 
 const NOW = Math.floor(Date.now() / 1000);
+const pool = (body, id) => body.pools.find((p) => p.poolId === id);
 
 test('the sample report parses, and every server time lands on the local clock', () => {
   const body = sampleQuota(NOW);
@@ -37,22 +38,30 @@ test('the sample report parses, and every server time lands on the local clock',
   assert.equal(r.report.skewSec, 120);
   assert.equal(r.report.staleAfterSec, 30 * 60);
   assert.equal(r.report.pools.length, 6);
-  const mira = r.report.pools.find((p) => p.poolId === 'mirasim');
+  const mira = pool(r.report, 'mirasim');
+  assert.equal(mira.name, 'Mirasim 中转', '一个渠道一个池：直接用渠道名');
+  assert.equal(pool(r.report, 'claude-solo').name, 'Claude 订阅 · claude-solo', '同渠道两个池：渠道名后挂池编号，分得开');
   const w7 = mira.windows.find((w) => w.label === '7d');
   // 回包里的 readAt 是「服务端的 NOW − 180」，校钟差后是本机的 NOW − 60
   assert.equal(w7.readAt, NOW - 180 + 120);
-  assert.equal(w7.used, 285_511);
-  assert.equal(w7.limit, 512_600);
-  assert.equal(w7.inLatestRead, true);
+  assert.deepEqual([w7.used, w7.limit, w7.unit, w7.source], [285_511, 512_600, 'points', 'mirasim-relay']);
+  assert.equal(w7.staleSince, undefined);
   assert.equal(mira.windows.find((w) => w.label === '7d_fable').scope, 'fable');
-  // 没读成的池：失败原因原样带过来，旧读数还在
-  const car = r.report.pools.find((p) => p.poolId === 'claude-carpool');
-  assert.deepEqual(car.lastAttempt.error, { code: 'not_current', message: '这台机器当前挂的不是这个组织，没读' });
+  assert.equal(mira.lastReadOkAt, NOW - 180 + 120);
+  // 读数过期、最近一次没读成的池：原因原样带过来，旧读数还在
+  const car = pool(r.report, 'claude-carpool');
+  assert.deepEqual([car.neverRead, car.readOverdue], [false, true]);
+  assert.equal(car.lastError.code, 'not_current');
+  assert.equal(car.lastError.message, '这台机器当前挂的不是这个组织，没读');
   assert.equal(car.windows.length, 1);
-  // 上游这次没报的窗口：标记原样保留，界面据此注明
-  const api = r.report.pools.find((p) => p.poolId === 'cursor').windows.find((w) => w.label === 'api_percent');
-  assert.equal(api.inLatestRead, false);
-  assert.equal(r.report.pools.find((p) => p.poolId === 'jev').windows[0].reading, 'estimated');
+  // 上游这次没报的窗口：带 staleSince，界面据此注明
+  const api = pool(r.report, 'cursor').windows.find((w) => w.label === 'api_percent');
+  assert.equal(api.staleSince, NOW - 1800 + 120);
+  // fleet-dao 的单位里有 tokens：认，不当坏格子
+  const jev = pool(r.report, 'jev');
+  assert.deepEqual(jev.windows.map((w) => [w.label, w.unit, w.reading]), [['month_usd', 'usd', 'estimated'], ['daily_tokens', 'tokens', 'estimated']]);
+  assert.deepEqual(jev.notes, []);
+  assert.equal(pool(r.report, 'cursor').expiresAt, NOW + 9 * 86400 + 120);
 });
 
 test('top-level contract breaks are refused outright, with the reason', () => {
@@ -73,26 +82,38 @@ test('top-level contract breaks are refused outright, with the reason', () => {
 
 test('a broken pool or window is named, never silently dropped', () => {
   const body = sampleQuota(NOW);
-  body.pools.push({ channelId: 'x', name: '缺编号的池', windows: [] });
-  const mira = body.pools.find((p) => p.poolId === 'mirasim');
-  mira.windows.push({ ...mira.windows[0], label: '5h' });                        // 重复 label
-  mira.windows.push({ ...mira.windows[0], label: 'weird', unit: 'tokens' });     // 单位认不出
-  mira.windows.push({ label: 'empty', window: 'other', unit: 'percent', reading: 'measured', readAt: body.asOf, inLatestRead: true });
+  body.pools.push({ channelId: 'x', channelName: '缺编号的池', neverRead: false, windows: [] });
+  body.pools.push({ poolId: 'no-flag', channelId: 'y', channelName: '不说读没读成', windows: [] });
+  const mira = pool(body, 'mirasim');
+  const base = mira.windows[0];
+  mira.windows.push({ ...base, label: '5h' });                                                     // 重复 label
+  mira.windows.push({ ...base, label: 'weird', unit: 'furlongs' });                                // 单位不认
+  mira.windows.push({ ...base, label: 'moody', upstreamStatus: 'grumpy' });                        // 状态字不认
+  mira.windows.push({ ...base, label: 'empty', utilization: null, used: null, limit: null });      // 什么都没有
+  mira.windows.push({ ...base, label: 'when', readAt: 'soonish' });                                // 时刻认不出
   const r = parseQuotaReport(body, NOW);
   assert.equal(r.ok, true, '一个池坏了不该把整页拖垮');
-  const broken = r.report.pools.at(-1);
-  assert.equal(broken.problem, '池缺 poolId');
-  assert.equal(broken.name, '缺编号的池');
-  const m = r.report.pools.find((p) => p.poolId === 'mirasim');
-  assert.equal(m.windows.length, 4, '好的四格照收');
-  assert.equal(m.problems.length, 3);
-  assert.match(m.problems.join('\n'), /5h 出现了两次/);
-  assert.match(m.problems.join('\n'), /weird：unit 只认/);
-  assert.match(m.problems.join('\n'), /empty：既没有用量也没有上游状态/);
+  assert.equal(r.report.pools.at(-2).problem, '池缺 poolId');
+  assert.equal(r.report.pools.at(-2).name, '缺编号的池');
+  assert.match(r.report.pools.at(-1).problem, /缺 neverRead/, '从没读成要明说，不能拿空窗口冒充');
+  const m = pool(r.report, 'mirasim');
+  assert.deepEqual(m.windows.map((w) => w.label), ['5h', '7d', '7d_claude', '7d_fable', 'weird', 'moody'],
+    '新单位、新状态字只拿掉那一项，窗口留下');
+  const weird = m.windows.find((w) => w.label === 'weird');
+  assert.deepEqual([weird.unit, weird.used, weird.limit, weird.utilization], ['unknown', undefined, undefined, base.utilization],
+    '单位说不清的数字不给，只留百分比');
+  const moody = m.windows.find((w) => w.label === 'moody');
+  assert.deepEqual([moody.upstreamStatus, moody.statusRaw], [undefined, 'grumpy'], '认不出的状态字挪进原字，不当成已知状态');
+  const notes = m.notes.join('\n');
+  assert.match(notes, /5h 出现了两次/);
+  assert.match(notes, /weird：单位 furlongs 这个客户端还不认/);
+  assert.match(notes, /moody：上游状态 grumpy 认不出/);
+  assert.match(notes, /empty：既没有用量也没有上游状态/);
+  assert.match(notes, /when：readAt 不是时间/);
 });
 
-test('addresses are normalized, and plain http is only for this machine', () => {
-  assert.deepEqual(normalizeBaseUrl(' http://127.0.0.1:4988/api/quota/ '), { ok: true, url: 'http://127.0.0.1:4988' });
+test('addresses and tokens are checked before anything is sent', () => {
+  assert.deepEqual(normalizeBaseUrl(' http://127.0.0.1:4960/api/quota/ '), { ok: true, url: 'http://127.0.0.1:4960' });
   assert.deepEqual(normalizeBaseUrl('https://fleet.example.com/api'), { ok: true, url: 'https://fleet.example.com' });
   assert.deepEqual(normalizeBaseUrl('https://example.com/fleet/'), { ok: true, url: 'https://example.com/fleet' });
   assert.match(normalizeBaseUrl('http://fleet.example.com').error, /https:\/\//, '令牌是 Bearer，明文 http 等于裸奔');
@@ -100,6 +121,40 @@ test('addresses are normalized, and plain http is only for this machine', () => 
   assert.match(normalizeBaseUrl('https://fleet.example.com/?token=1').error, /\?/);
   assert.equal(normalizeBaseUrl('fleet.example.com').ok, false);
   assert.equal(normalizeBaseUrl('ftp://fleet.example.com').ok, false);
+  assert.equal(tokenProblem('fdq_0123456789abcdef'), null);
+  assert.match(tokenProblem('fdq_0123\n456789abcdef'), /空白或换行/);
+  assert.match(tokenProblem('fdq_0123\u0000456789'), /不可见字符/);
+  assert.match(tokenProblem(''), /空的/);
+});
+
+test('a token that would break the request header never reaches fetch, and never shows up in a message', async () => {
+  // 审查 2026-09-25 实测：fleet.json 里的令牌带着转义换行时，fetch 会把整个请求头连令牌写进报错，
+  // 报错又原样进了状态与面板。现在读配置时就拦下，原因里不回显令牌。
+  const secret = 'fdq_leakme0123456789';
+  let fetched = 0;
+  const file = cfgPath();
+  writeFileSync(file, JSON.stringify({ url: 'https://fleet.example.com', token: `${secret}\nX-Evil: 1` }));
+  const src = new FleetSource({ configFile: file, fetchImpl: async () => { fetched++; throw new Error('不该走到这'); } });
+  assert.equal(src.enabled, false);
+  assert.equal(await src.refresh(), null);
+  assert.equal(fetched, 0, '坏令牌一个请求都不发');
+  const st = src.status();
+  assert.equal(st.state, 'error', '配置坏了要明说，不当成「没配」');
+  assert.equal(st.error.code, 'config');
+  assert.match(st.error.message, /令牌里有空白或换行/);
+  assert.ok(!JSON.stringify(st).includes(secret), '状态里不许有令牌');
+
+  // 兜底：就算哪一层的报错把令牌带出来了（服务端回显、网络层原文），message 也按原文脱敏
+  const echo = async (_url, init) => ({ ok: false, status: 500, headers: new Map(), url: _url,
+    json: async () => ({ error: { message: `bad header ${init.headers.authorization}` } }) });
+  const r = await fetchQuota('https://fleet.example.com', secret, { fetchImpl: echo });
+  assert.equal(r.error.code, 'upstream');
+  assert.ok(!r.error.message.includes(secret), r.error.message);
+  assert.match(r.error.message, /Bearer \*\*\*/);
+  const thrower = async (_url, init) => { throw new TypeError(`invalid header value: ${init.headers.authorization}`); };
+  const r2 = await fetchQuota('https://fleet.example.com', secret, { fetchImpl: thrower });
+  assert.equal(r2.error.code, 'unreachable');
+  assert.ok(!r2.error.message.includes(secret), r2.error.message);
 });
 
 test('a good read lands in status, with no token anywhere in it', async (t) => {
@@ -112,7 +167,7 @@ test('a good read lands in status, with no token anywhere in it', async (t) => {
   assert.equal(st.state, 'ok');
   assert.equal(st.url, fake.url);
   assert.equal(st.pools.length, 6);
-  assert.deepEqual(st.mirasim, { poolId: 'mirasim', name: 'Mirasim 中转' });
+  assert.deepEqual(st.mirasim, { poolId: 'mirasim', name: 'Mirasim 中转' }, '按窗口的读法认出 Mirasim 池');
   assert.equal(fake.requests.at(-1).authorization, `Bearer ${fake.token}`, '令牌走请求头');
   assert.ok(!JSON.stringify(st).includes(fake.token), '状态里不许有令牌');
 });
@@ -162,7 +217,7 @@ test('a wrong token and a dead port are failures too, before any report exists',
   assert.equal(wrong.status().pools, undefined, '从没读成过就没有池——不是「0 个池」');
 
   const deadCfg = cfgPath();
-  writeFileSync(deadCfg, JSON.stringify({ url: 'http://127.0.0.1:9', token: 'x' }));
+  writeFileSync(deadCfg, JSON.stringify({ url: 'http://127.0.0.1:9', token: 'dead-port-token' }));
   const dead = await new FleetSource({ configFile: deadCfg }).refresh();
   assert.equal(dead.error.code, 'unreachable');
   assert.match(dead.error.message, /连不上 fleet-dao/);
@@ -195,8 +250,8 @@ test('connect checks with a real read before writing, and disconnect forgets eve
   // 地址不对、令牌不对：都不写文件，并说清错在哪一步
   assert.match((await src.connect({ url: 'http://fleet.example.com', token: fake.token })).error, /https:\/\//);
   assert.equal((await src.connect({ url: fake.url, token: '' })).code, 'config');
-  assert.match((await src.connect({ url: fake.url, token: 'a b' })).error, /空白字符/);
-  const wrong = await src.connect({ url: fake.url, token: 'nope' });
+  assert.match((await src.connect({ url: fake.url, token: 'abcd efgh ijkl' })).error, /空白或换行/);
+  const wrong = await src.connect({ url: fake.url, token: 'nope-nope-nope' });
   assert.equal(wrong.code, 'auth');
   assert.equal(existsSync(file), false, '没验过的令牌不落盘');
   assert.equal(src.enabled, false);
@@ -207,8 +262,7 @@ test('connect checks with a real read before writing, and disconnect forgets eve
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { url: fake.url, token: fake.token });
   assert.equal(src.status().state, 'ok');
   assert.ok(updates.length >= 1, '接上就叫面板重画，不等心跳');
-  // 返回值里也没有令牌
-  assert.ok(!JSON.stringify(ok).includes(fake.token));
+  assert.ok(!JSON.stringify(ok).includes(fake.token), '返回值里也没有令牌');
 
   assert.deepEqual(src.disconnect(), { ok: true });
   assert.equal(existsSync(file), false);
@@ -226,11 +280,12 @@ test('only the single Mirasim pool stands in for local Mirasim, and only its fre
   assert.deepEqual(snap.limits.windows.map((w) => [w.label, w.budget, !!w.modelScoped]),
     [['5h', 143_528, false], ['7d', 512_600, false], ['7d_claude', 512_600, true], ['7d_fable', 271_678, true]]);
 
-  // 上游这次没报的窗口不当现值；有一格旧，龄期就按最旧的那格算
+  // 上游这次没报（staleSince）的窗口不当现值；有一格旧，龄期就按最旧的那格算
   const body = sampleQuota(NOW);
-  const m = body.pools.find((p) => p.poolId === 'mirasim');
-  m.windows[3] = { ...m.windows[3], inLatestRead: false, readAt: new Date((NOW - 7200) * 1000).toISOString() };
-  m.windows[0] = { ...m.windows[0], readAt: new Date((NOW - 900) * 1000).toISOString() };
+  const m = pool(body, 'mirasim');
+  const isoAgo = (s) => new Date((NOW - s) * 1000).toISOString();
+  m.windows[3] = { ...m.windows[3], readAt: isoAgo(7200), staleSince: isoAgo(3600) };
+  m.windows[0] = { ...m.windows[0], readAt: isoAgo(900) };
   fake.set({ body });
   await src.refresh();
   const s2 = src.mirasimSnapshot();
@@ -239,7 +294,7 @@ test('only the single Mirasim pool stands in for local Mirasim, and only its fre
 
   // 两个 Mirasim 池：认不出哪个是本机这个账号，宁可不用，并说出来
   const two = sampleQuota(NOW);
-  two.pools.push({ ...two.pools.find((p) => p.poolId === 'mirasim'), poolId: 'mirasim-2', name: '另一个 Mirasim' });
+  two.pools.push({ ...pool(two, 'mirasim'), poolId: 'mirasim-2' });
   fake.set({ body: two });
   await src.refresh();
   assert.equal(src.mirasimSnapshot(), null);
